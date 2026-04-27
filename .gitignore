@@ -1,0 +1,3 @@
+exampleoutputs/*
+examples/stdlibtest.lb.c
+.vscode/*
