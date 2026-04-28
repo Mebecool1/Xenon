@@ -9,6 +9,8 @@ Also, you can find the build system, lbmake, for luaBase at: https://github.com/
 
 The precompiled binary of lcc (name of luabase compiler) can be found in the main tree only.
 
+You can use ./install.sh, ./remove.sh, and ./build.sh for convenience.
+
 
 
 
