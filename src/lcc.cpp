@@ -135,7 +135,8 @@ enum class TT {
   TRY_KW,
   EXCEPT_KW,
   THROW_KW,
-  GLOBAL_KW
+  GLOBAL_KW,
+  
 };
 
 static std::string tt_name(TT t) {
@@ -250,6 +251,7 @@ static std::string tt_name(TT t) {
     C(EXCEPT_KW);
     C(THROW_KW);
     C(GLOBAL_KW);
+    
 #undef C
   default:
     return "UNKNOWN";
@@ -361,6 +363,7 @@ class Lexer {
         {"except", TT::EXCEPT_KW},
         {"throw", TT::THROW_KW},
         {"global", TT::GLOBAL_KW},
+        
     };
     return kw;
   }
@@ -628,7 +631,7 @@ class CTranspiler {
         "unsigned", "signed",   "extern",   "goto",     "sizeof",   "enum",
         "union",    "continue", "register", "volatile", "auto",     "bool",
         "true",     "false",    "NULL",     "uint8_t",  "uint32_t", "uint64_t",
-        "inline",
+        "inline", "auto"
     };
     return c_keywords.count(name) ? "var_" + name : name;
   }
@@ -763,6 +766,7 @@ class CTranspiler {
       return "scanf(\"%lf\",&" + name + ");";
     if (vt == "char")
       return "scanf(\" %c\",&" + name + ");";
+    
     if (vt == "bool")
       return "{int _lb_t;scanf(\"%d\",&_lb_t);" + name + "=(bool)_lb_t;}";
     if (vt == "__m256" || vt == "__m256i")
@@ -1285,6 +1289,7 @@ class CTranspiler {
         TT::INT,     TT::FLOAT,   TT::STR,  TT::PTR,  TT::LONG,
         TT::SHORT,   TT::DOUBLE,  TT::VOID, TT::M256, TT::M256I,
         TT::BOOL_KW, TT::CHAR_KW, TT::U8,   TT::U32,  TT::U64};
+        
     if (type_decl_toks.count(t.type) || is_custom) {
       std::string vtype_raw = advance().value;
       std::string vtype;
@@ -1348,6 +1353,7 @@ class CTranspiler {
         return "char " + name + " = '\\0';";
       if (vtype_raw == "bool")
         return "bool " + name + " = false;";
+      
       if (umap.count(vtype_raw))
         return vtype + " " + name + " = 0;";
       return vtype + " " + name + ";";
@@ -2323,6 +2329,11 @@ int main(int argc, char **argv) {
     clang_args.push_back("-O3");
     clang_args.push_back("-fuse-ld=lld");
     clang_args.push_back("-mavx2");
+    clang_args.push_back("-funroll-loops");
+    
+    clang_args.push_back("-fvectorize");
+    
+
     if (!getasm)
       clang_args.push_back("-flto");
   }
