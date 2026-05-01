@@ -1074,7 +1074,7 @@ class CTranspiler {
       if (expr_str.find('.') != std::string::npos ||
           expr_str.find('e') != std::string::npos ||
           expr_str.find('E') != std::string::npos)
-        return "double";
+        return "float";
       return "int";
     }
 

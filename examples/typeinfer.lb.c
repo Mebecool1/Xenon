@@ -35,31 +35,9 @@ static inline void _lb_throw(const char* msg) {
 }
 #endif /* __LUABASE_RUNTIME__ */
 
-#line 1 "/home/mebecool/Coding/lbreal/luaBase-Language/examples/typeinfer.lb"
-typedef struct {
-    float x;
-    float y;
-    float z;
-} vec3;
-
-#line 7 "/home/mebecool/Coding/lbreal/luaBase-Language/examples/typeinfer.lb"
-vec3 v3(float x, float y, float z) {
-#line 9 "/home/mebecool/Coding/lbreal/luaBase-Language/examples/typeinfer.lb"
-    vec3 v;
-#line 10 "/home/mebecool/Coding/lbreal/luaBase-Language/examples/typeinfer.lb"
-    v.x = x;
-#line 11 "/home/mebecool/Coding/lbreal/luaBase-Language/examples/typeinfer.lb"
-    v.y = y;
-#line 12 "/home/mebecool/Coding/lbreal/luaBase-Language/examples/typeinfer.lb"
-    v.z = z;
-}
 
 int main(int argc, char** argv) {
-    #line 14 "/home/mebecool/Coding/lbreal/luaBase-Language/examples/typeinfer.lb"
-vec3 x = v3(1, 2, 3);
-    #line 15 "/home/mebecool/Coding/lbreal/luaBase-Language/examples/typeinfer.lb"
-printf("%s",TO_STR("vec3")); printf("\n");
-    #line 16 "/home/mebecool/Coding/lbreal/luaBase-Language/examples/typeinfer.lb"
-printf("its: %f, %f, %f\n", x.x, x.y, x.z);
+    #line 1 "/home/mebecool/Coding/lbreal/luaBase-Language/examples/typeinfer.lb"
+int x = ((int)(malloc((100*4))));
     return 0;
 }
