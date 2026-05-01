@@ -1,1 +1,4 @@
-let x = cast(int, malloc(100*4))
+link "MathGraphic.lh"
+link "Math.lh"
+let x = v4(1,2,3,5)
+println(sizeof(x), ", ", typeof(x))

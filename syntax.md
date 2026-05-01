@@ -6,6 +6,12 @@ $$
 \text{bash terminal} \to \text{install.sh}
 \\
 \text{exact command} \to \text{"./install.sh"}
+\\
+\text{for uninstalling} \to \text{"./remove.sh"}
+\\
+\text{for rebuilding, uninstalling, reinstalling} \to \text{"./reload.sh"}
+\\
+\text{to rebuild} \to \text{"./build.sh"}
 $$
 ---
 ## 2. Core Data Types and Prints.

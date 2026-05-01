@@ -594,6 +594,62 @@ static std::string join(const std::vector<std::string> &v,
 }
 
 // ===========================================================================
+// TypeInfo — rich type representation used by the inference engine
+// ===========================================================================
+struct TypeInfo {
+  std::string base;   // "int", "float", "double", "char*", "bool", "void", etc.
+  int ptr_depth{0};   // extra pointer indirections beyond what's in base
+  bool is_array{false};
+  bool is_const{false};
+
+  static TypeInfo of(std::string b, int pd = 0) {
+    TypeInfo t; t.base = std::move(b); t.ptr_depth = pd; return t;
+  }
+  static TypeInfo unknown() { return TypeInfo::of("int"); }
+
+  // Render to a C declaration type string
+  std::string c_type() const {
+    std::string r = base;
+    for (int i = 0; i < ptr_depth; i++) r += "*";
+    return r;
+  }
+
+  bool is_ptr()     const { return ptr_depth > 0 || base.size() > 0 && base.back() == '*'; }
+  bool is_float()   const { return base == "float" || base == "double"; }
+  bool is_integer() const {
+    return base == "int" || base == "long" || base == "short" ||
+           base == "char" || base == "bool" || base == "uint8_t" ||
+           base == "uint32_t" || base == "uint64_t";
+  }
+  bool is_numeric() const { return is_float() || is_integer(); }
+};
+
+// Arithmetic promotion: widest numeric type wins (mirrors C's usual arithmetic conversions)
+static TypeInfo promote(const TypeInfo &a, const TypeInfo &b) {
+  // pointer arithmetic: ptr ± int → ptr
+  if (a.is_ptr() && b.is_integer()) return a;
+  if (b.is_ptr() && a.is_integer()) return b;
+
+  // float > double? No — double > float
+  if (a.base == "double" || b.base == "double") return TypeInfo::of("double");
+  if (a.base == "float"  || b.base == "float")  return TypeInfo::of("float");
+
+  // integer promotion: pick the wider one
+  auto rank = [](const std::string &s) -> int {
+    if (s == "bool")      return 0;
+    if (s == "char")      return 1;
+    if (s == "uint8_t")   return 1;
+    if (s == "short")     return 2;
+    if (s == "int")       return 3;
+    if (s == "uint32_t")  return 4;
+    if (s == "long")      return 5;
+    if (s == "uint64_t")  return 6;
+    return 3; // unknown → int
+  };
+  return rank(a.base) >= rank(b.base) ? a : b;
+}
+
+// ===========================================================================
 // CTranspiler
 // ===========================================================================
 class CTranspiler {
@@ -606,6 +662,10 @@ class CTranspiler {
   std::vector<std::string> main_body;
   std::map<std::string, std::string> var_types;
   std::map<std::string, std::string> func_return_types; // fname → raw return type
+  // struct_name → {field_name → c_type}
+  std::map<std::string, std::map<std::string, std::string>> struct_field_types;
+  // fname → vector of param c_types (for argument-position inference)
+  std::map<std::string, std::vector<std::string>> func_param_types;
   std::set<std::string> _handle_declared;
   std::set<std::string> _lh_included;
   std::set<std::string> _enum_names;
@@ -747,6 +807,28 @@ class CTranspiler {
     }
     expect(TT::RBRACE, false);
     var_types[struct_name] = "STRUCT";
+    // Register field types for member-access inference
+    auto &field_map = struct_field_types[struct_name];
+    for (const auto &fd : fields) {
+      // fd looks like "int foo;" or "char* bar;" or "float baz[4];"
+      // Extract type and name naively: last word before ; or [ is the field name
+      std::string fd2 = fd;
+      // strip trailing ;
+      if (!fd2.empty() && fd2.back() == ';') fd2.pop_back();
+      // strip array suffix
+      size_t lb = fd2.find('[');
+      if (lb != std::string::npos) fd2 = fd2.substr(0, lb);
+      // trim
+      while (!fd2.empty() && std::isspace((unsigned char)fd2.back())) fd2.pop_back();
+      // split at last space
+      size_t sp = fd2.rfind(' ');
+      if (sp != std::string::npos) {
+        std::string fname2 = fd2.substr(sp+1);
+        std::string ftype2 = fd2.substr(0, sp);
+        while (!ftype2.empty() && std::isspace((unsigned char)ftype2.back())) ftype2.pop_back();
+        field_map[fname2] = ftype2;
+      }
+    }
     return "typedef struct {\n    " + join(fields, "\n    ") + "\n} " +
            struct_name + ";\n";
   }
@@ -1066,82 +1148,414 @@ class CTranspiler {
   }
 
   // -----------------------------------------------------------------------
-  // Type inference from RHS expression
+  // Type Inference Engine — Rust/TypeScript-grade
   // -----------------------------------------------------------------------
-  std::string infer_type_from_rhs(const Token &expr_tok, const std::string &expr_str) {
-    // NUMBER literal → int or double
-    if (expr_tok.type == TT::NUMBER) {
-      if (expr_str.find('.') != std::string::npos ||
-          expr_str.find('e') != std::string::npos ||
-          expr_str.find('E') != std::string::npos)
-        return "float";
-      return "int";
+
+  // Map a raw LuaBase type keyword to its canonical C type string
+  std::string raw_to_c(const std::string &raw) const {
+    if (raw == "str")      return "char*";
+    if (raw == "ptr")      return "void*";
+    if (raw == "bool")     return "bool";
+    if (raw == "char")     return "char";
+    if (raw == "u8")       return "uint8_t";
+    if (raw == "u32")      return "uint32_t";
+    if (raw == "u64")      return "uint64_t";
+    return raw; // int, float, double, long, short, void, custom structs
+  }
+
+  // Look up a variable's TypeInfo from var_types
+  TypeInfo lookup_var(const std::string &name) const {
+    auto it = var_types.find(name);
+    if (it == var_types.end()) return TypeInfo::unknown();
+    std::string raw = it->second;
+    // strip _ARRAY suffix
+    bool is_arr = false;
+    if (raw.size() > 6 && raw.substr(raw.size()-6) == "_ARRAY") {
+      raw = raw.substr(0, raw.size()-6);
+      is_arr = true;
+    }
+    TypeInfo ti;
+    // handle "ptr X" stored as "X*" in var_types
+    if (!raw.empty() && raw.back() == '*') {
+      ti.base = raw.substr(0, raw.size()-1);
+      ti.ptr_depth = 1;
+    } else {
+      ti.base = raw_to_c(raw);
+      ti.ptr_depth = 0;
+    }
+    ti.is_array = is_arr;
+    return ti;
+  }
+
+  // Look up a function's return TypeInfo
+  TypeInfo lookup_func_ret(const std::string &fname) const {
+    auto it = func_return_types.find(fname);
+    if (it == func_return_types.end()) return TypeInfo::unknown();
+    const std::string &raw = it->second;
+    TypeInfo ti;
+    if (!raw.empty() && raw.back() == '*') {
+      ti.base = raw.substr(0, raw.size()-1);
+      ti.ptr_depth = 1;
+    } else {
+      ti.base = raw_to_c(raw);
+    }
+    return ti;
+  }
+
+  // Infer TypeInfo for a NUMBER token value string
+  TypeInfo infer_number_literal(const std::string &s) const {
+    // hex → int (unsigned if large, but keep simple)
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+      return TypeInfo::of("int");
+    // float suffix
+    if (!s.empty() && (s.back() == 'f' || s.back() == 'F'))
+      return TypeInfo::of("float");
+    // double suffix or decimal point or exponent
+    if (s.find('.') != std::string::npos ||
+        s.find('e') != std::string::npos ||
+        s.find('E') != std::string::npos)
+      return TypeInfo::of("double");
+    // long suffix
+    if (!s.empty() && (s.back() == 'l' || s.back() == 'L'))
+      return TypeInfo::of("long");
+    return TypeInfo::of("int");
+  }
+
+  // Core inference: walk token stream starting at `start_pos` (peek, no mutation)
+  // and compute the TypeInfo of the expression.
+  // This is a *pure lookahead* — it does NOT advance `pos`.
+  // We snapshot and restore pos internally.
+  TypeInfo infer_expr_type_at(size_t start_pos) {
+    size_t saved = pos;
+    pos = start_pos;
+    TypeInfo result = infer_ti_ternary();
+    pos = saved;
+    return result;
+  }
+
+  TypeInfo infer_ti_ternary() {
+    TypeInfo cond = infer_ti_logical();
+    if (pos < tokens.size() && tokens[pos].type == TT::QUESTION) {
+      pos++;
+      TypeInfo t = infer_ti_logical();
+      if (pos < tokens.size() && tokens[pos].type == TT::COLON) pos++;
+      TypeInfo e = infer_ti_logical();
+      // ternary: promote the two branches (like Rust/TS — both arms must unify)
+      return promote(t, e);
+    }
+    return cond;
+  }
+
+  TypeInfo infer_ti_logical() {
+    TypeInfo left = infer_ti_bitwise_or();
+    while (pos < tokens.size() &&
+           (tokens[pos].type == TT::AND || tokens[pos].type == TT::OR)) {
+      pos++;
+      infer_ti_bitwise_or(); // consume, discard — result is always bool
+      left = TypeInfo::of("bool");
+    }
+    return left;
+  }
+
+  TypeInfo infer_ti_bitwise_or() {
+    TypeInfo left = infer_ti_bitwise_xor();
+    while (pos < tokens.size() && tokens[pos].type == TT::BITOR) {
+      pos++;
+      TypeInfo right = infer_ti_bitwise_xor();
+      left = promote(left, right);
+    }
+    return left;
+  }
+
+  TypeInfo infer_ti_bitwise_xor() {
+    TypeInfo left = infer_ti_bitwise_and();
+    while (pos < tokens.size() && tokens[pos].type == TT::BITXOR) {
+      pos++;
+      TypeInfo right = infer_ti_bitwise_and();
+      left = promote(left, right);
+    }
+    return left;
+  }
+
+  TypeInfo infer_ti_bitwise_and() {
+    TypeInfo left = infer_ti_comparison();
+    while (pos < tokens.size() && tokens[pos].type == TT::ADDRESS_OF) {
+      pos++;
+      TypeInfo right = infer_ti_comparison();
+      left = promote(left, right);
+    }
+    return left;
+  }
+
+  TypeInfo infer_ti_comparison() {
+    TypeInfo left = infer_ti_shift();
+    static const std::set<TT> cmp_ops = {
+      TT::EQ, TT::NE, TT::LT, TT::GT, TT::LE, TT::GE};
+    while (pos < tokens.size() && cmp_ops.count(tokens[pos].type)) {
+      pos++;
+      infer_ti_shift(); // consume RHS — comparison always yields bool
+      left = TypeInfo::of("bool");
+    }
+    return left;
+  }
+
+  TypeInfo infer_ti_shift() {
+    TypeInfo left = infer_ti_additive();
+    while (pos < tokens.size() &&
+           (tokens[pos].type == TT::SHL || tokens[pos].type == TT::SHR)) {
+      pos++;
+      TypeInfo right = infer_ti_additive();
+      left = promote(left, right);
+    }
+    return left;
+  }
+
+  TypeInfo infer_ti_additive() {
+    TypeInfo left = infer_ti_multiplicative();
+    while (pos < tokens.size() &&
+           (tokens[pos].type == TT::PLUS || tokens[pos].type == TT::MINUS)) {
+      pos++;
+      TypeInfo right = infer_ti_multiplicative();
+      // pointer arithmetic: ptr + int → ptr (C semantics)
+      if (left.is_ptr() && right.is_integer())  { /* left stays ptr */ }
+      else if (right.is_ptr() && left.is_integer()) left = right;
+      // ptr - ptr → ptrdiff_t (treat as long)
+      else if (left.is_ptr() && right.is_ptr()) left = TypeInfo::of("long");
+      else left = promote(left, right);
+    }
+    return left;
+  }
+
+  TypeInfo infer_ti_multiplicative() {
+    TypeInfo left = infer_ti_unary();
+    while (pos < tokens.size() &&
+           (tokens[pos].type == TT::MULTIPLY ||
+            tokens[pos].type == TT::DIVIDE ||
+            tokens[pos].type == TT::MOD)) {
+      pos++;
+      TypeInfo right = infer_ti_unary();
+      left = promote(left, right);
+    }
+    return left;
+  }
+
+  TypeInfo infer_ti_unary() {
+    if (pos >= tokens.size()) return TypeInfo::unknown();
+    TT tt = tokens[pos].type;
+
+    // logical NOT → bool
+    if (tt == TT::NOT) { pos++; infer_ti_unary(); return TypeInfo::of("bool"); }
+    // bitwise NOT → same type as operand
+    if (tt == TT::BITNOT) { pos++; return infer_ti_unary(); }
+    // unary minus → promote to at least int
+    if (tt == TT::MINUS) { pos++; TypeInfo inner = infer_ti_unary(); return inner.is_float() ? inner : promote(inner, TypeInfo::of("int")); }
+    // dereference *p → strip one pointer level
+    if (tt == TT::MULTIPLY) {
+      pos++;
+      if (pos < tokens.size() && tokens[pos].type == TT::IDENTIFIER) {
+        std::string n = safe_name(tokens[pos++].value);
+        TypeInfo ti = lookup_var(n);
+        if (ti.ptr_depth > 0) { ti.ptr_depth--; return ti; }
+        if (!ti.base.empty() && ti.base.back() == '*') {
+          ti.base.pop_back(); return ti;
+        }
+        return TypeInfo::of("int");
+      }
+      return TypeInfo::unknown();
+    }
+    // prefix ++ / -- → same type as operand
+    if (tt == TT::INCR || tt == TT::DECR) {
+      pos++;
+      if (pos < tokens.size() && tokens[pos].type == TT::IDENTIFIER) {
+        std::string n = safe_name(tokens[pos++].value);
+        return lookup_var(n);
+      }
+      return TypeInfo::of("int");
+    }
+    return infer_ti_power();
+  }
+
+  TypeInfo infer_ti_power() {
+    TypeInfo base = infer_ti_primary();
+    if (pos < tokens.size() && tokens[pos].type == TT::POW) {
+      pos++;
+      infer_ti_unary();
+      return TypeInfo::of("double"); // pow() always returns double
+    }
+    return base;
+  }
+
+  // Skip over a balanced paren/bracket group without interpreting
+  void skip_balanced(TT open, TT close) {
+    if (pos < tokens.size() && tokens[pos].type == open) {
+      pos++;
+      int depth = 1;
+      while (pos < tokens.size() && depth > 0) {
+        if (tokens[pos].type == open) depth++;
+        else if (tokens[pos].type == close) depth--;
+        pos++;
+      }
+    }
+  }
+
+  TypeInfo infer_ti_primary() {
+    if (pos >= tokens.size()) return TypeInfo::unknown();
+    Token &t = tokens[pos];
+
+    // typeof(x) → char* (it returns a string)
+    if (t.type == TT::TYPEOF) {
+      pos++;
+      skip_balanced(TT::LPAREN, TT::RPAREN);
+      return TypeInfo::of("char*");
     }
 
-    // STRING literal → char*
-    if (expr_tok.type == TT::STRING)
-      return "char*";
+    // sizeof(...) → size_t (use unsigned long / int)
+    if (t.type == TT::SIZEOF_KW) {
+      pos++;
+      skip_balanced(TT::LPAREN, TT::RPAREN);
+      return TypeInfo::of("long");
+    }
 
-    // CHAR literal → char
-    if (expr_tok.type == TT::CHAR_LIT)
-      return "char";
+    // cast(T, expr) → the cast target type
+    if (t.type == TT::CAST) {
+      pos++;
+      if (pos < tokens.size() && tokens[pos].type == TT::LPAREN) {
+        pos++;
+        std::string tn;
+        if (pos < tokens.size()) tn = raw_to_c(tokens[pos++].value);
+        // skip comma + expr + rparen
+        if (pos < tokens.size() && tokens[pos].type == TT::COMMA) pos++;
+        infer_ti_ternary(); // consume inner expr
+        if (pos < tokens.size() && tokens[pos].type == TT::RPAREN) pos++;
+        // build TypeInfo from tn
+        TypeInfo ti;
+        if (!tn.empty() && tn.back() == '*') {
+          ti.base = tn.substr(0, tn.size()-1); ti.ptr_depth = 1;
+        } else { ti.base = tn; }
+        return ti;
+      }
+      return TypeInfo::unknown();
+    }
 
-    // true/false → bool
-    if (expr_tok.type == TT::TRUE_KW || expr_tok.type == TT::FALSE_KW)
-      return "bool";
+    // strlen → int
+    if (t.type == TT::STRLEN_KW) {
+      pos++;
+      skip_balanced(TT::LPAREN, TT::RPAREN);
+      return TypeInfo::of("int");
+    }
 
-    // NULL → void*
-    if (expr_tok.type == TT::NULL_KW)
-      return "void*";
+    // exit → int (expression form returns 0)
+    if (t.type == TT::EXIT_KW) {
+      pos++;
+      skip_balanced(TT::LPAREN, TT::RPAREN);
+      return TypeInfo::of("int");
+    }
 
-    if (expr_tok.type == TT::IDENTIFIER) {
-      std::string vname = safe_name(expr_tok.value);
+    // parenthesised expression — propagate inner type
+    if (t.type == TT::LPAREN) {
+      pos++;
+      TypeInfo inner = infer_ti_ternary();
+      if (pos < tokens.size() && tokens[pos].type == TT::RPAREN) pos++;
+      return inner;
+    }
 
-      // peek: if token AFTER expr_tok is LPAREN, this is a function call
-      // pos was already advanced past the whole expr by parse_expr,
-      // so we use the raw token value to look up the func return type
-      auto fit = func_return_types.find(vname);
-      if (fit != func_return_types.end()) {
-        // it's a known function — check if expr_str looks like a call
-        // (contains '(' ) to be sure
-        if (expr_str.find('(') != std::string::npos) {
-          std::string raw = fit->second;
-          // map raw return type to C type
-          if (raw == "str")   return "char*";
-          if (raw == "ptr")   return "void*";
-          if (raw == "bool")  return "bool";
-          if (raw == "char")  return "char";
-          // struct / custom type → use as-is
-          return raw;
+    // address-of &x → pointer to x's type
+    if (t.type == TT::ADDRESS_OF) {
+      pos++;
+      if (pos < tokens.size() && tokens[pos].type == TT::IDENTIFIER) {
+        std::string n = safe_name(tokens[pos++].value);
+        TypeInfo inner = lookup_var(n);
+        inner.ptr_depth++;
+        return inner;
+      }
+      return TypeInfo::of("void*");
+    }
+
+    Token tok = tokens[pos++];
+
+    // Literals
+    if (tok.type == TT::NUMBER)   return infer_number_literal(tok.value);
+    if (tok.type == TT::STRING)   return TypeInfo::of("char*");
+    if (tok.type == TT::CHAR_LIT) return TypeInfo::of("char");
+    if (tok.type == TT::TRUE_KW || tok.type == TT::FALSE_KW)
+      return TypeInfo::of("bool");
+    if (tok.type == TT::NULL_KW)  return TypeInfo::of("void*");
+
+    if (tok.type == TT::IDENTIFIER) {
+      std::string name = safe_name(tok.value);
+
+      // Function call: name(...)
+      if (pos < tokens.size() && tokens[pos].type == TT::LPAREN) {
+        skip_balanced(TT::LPAREN, TT::RPAREN);
+        return lookup_func_ret(name);
+      }
+
+      // Base type from var_types
+      TypeInfo ti = lookup_var(name);
+      std::string struct_base = ti.base; // save for field lookup
+
+      // Postfix chains: [idx], .field, ->field
+      while (pos < tokens.size() &&
+             (tokens[pos].type == TT::LSBRACKET ||
+              tokens[pos].type == TT::DOT ||
+              tokens[pos].type == TT::ARROW)) {
+        if (tokens[pos].type == TT::LSBRACKET) {
+          // array subscript → element type (strip one array level)
+          pos++;
+          infer_ti_ternary(); // skip index expr
+          if (pos < tokens.size() && tokens[pos].type == TT::RSBRACKET) pos++;
+          // element type: if we know it was an array, strip _ARRAY tag
+          // The element type is the same as the base type stored
+          ti.is_array = false;
+        } else {
+          // .field or ->field
+          bool is_arrow = (tokens[pos].type == TT::ARROW);
+          pos++;
+          if (pos < tokens.size() && tokens[pos].type == TT::IDENTIFIER) {
+            std::string field = tokens[pos++].value;
+            // Try struct_field_types for precise field type
+            auto sit = struct_field_types.find(struct_base);
+            if (sit != struct_field_types.end()) {
+              auto fit2 = sit->second.find(field);
+              if (fit2 != sit->second.end()) {
+                std::string ft = fit2->second;
+                TypeInfo fti;
+                if (!ft.empty() && ft.back() == '*') {
+                  fti.base = ft.substr(0, ft.size()-1); fti.ptr_depth = 1;
+                } else { fti.base = ft; }
+                ti = fti;
+                struct_base = ti.base;
+                continue;
+              }
+            }
+            ti = TypeInfo::unknown();
+          }
         }
       }
 
-      // plain variable → look up var_types
-      auto vit = var_types.find(vname);
-      if (vit != var_types.end()) {
-        std::string raw = vit->second;
-        if (raw == "str")   return "char*";
-        if (raw == "ptr")   return "void*";
-        if (raw == "bool")  return "bool";
-        if (raw == "char")  return "char";
-        return raw;
-      }
+      // Postfix ++ / --  → same type
+      if (pos < tokens.size() &&
+          (tokens[pos].type == TT::INCR || tokens[pos].type == TT::DECR))
+        pos++;
 
-      return "int"; // unknown identifier, default
+      return ti;
     }
 
-    // unary minus on number → check expr_str
-    if (expr_tok.type == TT::MINUS) {
-      if (expr_str.find('.') != std::string::npos)
-        return "double";
-      return "int";
-    }
+    return TypeInfo::unknown();
+  }
 
-    // paren-grouped expr → fallback int
-    if (expr_tok.type == TT::LPAREN)
-      return "int";
+  // Public entry point: infer the type of the expression whose first token
+  // is at `start_pos` in the token stream. Does NOT consume tokens.
+  TypeInfo infer_type_at(size_t start_pos) {
+    return infer_expr_type_at(start_pos);
+  }
 
-    return "int";
+  // Legacy compatibility shim used by the let/var handler
+  // (kept so the rest of the code compiles unchanged)
+  std::string infer_type_from_rhs(const Token &/*expr_tok*/, const std::string &/*expr_str*/,
+                                   size_t rhs_start_pos) {
+    TypeInfo ti = infer_type_at(rhs_start_pos);
+    return ti.c_type();
   }
 
   // -----------------------------------------------------------------------
@@ -1371,11 +1785,15 @@ class CTranspiler {
       advance();
       std::string name = safe_name(expect(TT::IDENTIFIER, false).value);
       expect(TT::ASSIGN, false);
+      size_t rhs_start = pos;          // capture RHS start BEFORE parse_expr consumes it
       Token expr_start = current();
       std::string val = parse_expr();
-      
-      // infer type from RHS
-      std::string inferred_type = infer_type_from_rhs(expr_start, val);
+
+      // Full Rust/TS-style type inference: walk the token stream at rhs_start
+      std::string inferred_type = infer_type_from_rhs(expr_start, val, rhs_start);
+
+      // Store normalised form in var_types for downstream inference
+      // (strip trailing * for the raw form, keep ptr_depth info via c_type)
       var_types[name] = inferred_type;
       return inferred_type + " " + name + " = " + val + ";";
     }
@@ -1920,6 +2338,19 @@ class CTranspiler {
         advance();
     }
     expect(TT::RPAREN, false);
+    // Register param types for call-site argument inference
+    {
+      std::vector<std::string> ptypes;
+      for (const auto &p : params) {
+        // p is "type name" — extract type (everything before last space)
+        size_t sp = p.rfind(' ');
+        if (sp != std::string::npos)
+          ptypes.push_back(p.substr(0, sp));
+        else
+          ptypes.push_back("int");
+      }
+      func_param_types[fname] = ptypes;
+    }
     expect(TT::LBRACE, false);
 
     std::vector<std::string> body;
@@ -2136,6 +2567,8 @@ class CTranspiler {
     lh._lh_included = _lh_included;
     lh.var_types = var_types;
     lh.func_return_types = func_return_types;
+    lh.struct_field_types = struct_field_types;
+    lh.func_param_types = func_param_types;
     lh._handle_declared = _handle_declared;
 
     while (lh.current().type != TT::TEOF) {
