@@ -1147,9 +1147,7 @@ class CTranspiler {
                        tok.line, tok.col);
   }
 
-  // -----------------------------------------------------------------------
-  // Type Inference Engine — Rust/TypeScript-grade
-  // -----------------------------------------------------------------------
+  
 
   // Map a raw LuaBase type keyword to its canonical C type string
   std::string raw_to_c(const std::string &raw) const {
