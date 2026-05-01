@@ -5,3 +5,4 @@ reload.sh
 typeinfer_debug.c
 hexamplesh/*
 examples/.*
+typeinfer_debug.c.sig
