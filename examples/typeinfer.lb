@@ -1,0 +1,4 @@
+link "MathGraphic.lh"
+let x = v3(1,2,3)
+println(typeof(x))
+printfmt("its: %.2f, %.2f, %.2f\n", x.x, x.y, x.z)

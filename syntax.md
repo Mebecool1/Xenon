@@ -32,6 +32,16 @@ $$
 \text{Pointers} & \text{ptr } \langle type \rangle & \text{Type-safe pointers } \\ \hline
 \end{array}
 $$
+### Let/var keywords
+$$
+\text{let x = 10 // infers type of x to int}
+\\
+\text{var x = 10 // same}
+\\
+\text{let x = vec3(1,2,3) // infers x to vector3 if vec3 returns vector3}
+\\
+$$
+If you use let/var, you probably don't need to use manual data types. You might need to in some scenarios, though, so it is better to learn them anyway.
 
 
 
@@ -179,4 +189,5 @@ $$
 \text{MathGraphic.lh} & \text{Provide Graphical Math functions} \\ \hline
 \end{array}
 
-$$ 
+$$
+

@@ -1,3 +1,6 @@
 exampleoutputs/*
 examples/stdlibtest.lb.c
 .vscode/*
+reload.sh
+typeinfer_debug.c
+

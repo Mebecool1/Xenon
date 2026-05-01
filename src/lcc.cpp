@@ -136,6 +136,8 @@ enum class TT {
   EXCEPT_KW,
   THROW_KW,
   GLOBAL_KW,
+  LET_KW,
+  VAR_KW,
   
 };
 
@@ -251,6 +253,8 @@ static std::string tt_name(TT t) {
     C(EXCEPT_KW);
     C(THROW_KW);
     C(GLOBAL_KW);
+    C(LET_KW);
+    C(VAR_KW);
     
 #undef C
   default:
@@ -363,6 +367,8 @@ class Lexer {
         {"except", TT::EXCEPT_KW},
         {"throw", TT::THROW_KW},
         {"global", TT::GLOBAL_KW},
+        {"let", TT::LET_KW},
+        {"var", TT::VAR_KW},
         
     };
     return kw;
@@ -599,6 +605,7 @@ class CTranspiler {
   std::vector<std::string> functions;
   std::vector<std::string> main_body;
   std::map<std::string, std::string> var_types;
+  std::map<std::string, std::string> func_return_types; // fname → raw return type
   std::set<std::string> _handle_declared;
   std::set<std::string> _lh_included;
   std::set<std::string> _enum_names;
@@ -1059,6 +1066,85 @@ class CTranspiler {
   }
 
   // -----------------------------------------------------------------------
+  // Type inference from RHS expression
+  // -----------------------------------------------------------------------
+  std::string infer_type_from_rhs(const Token &expr_tok, const std::string &expr_str) {
+    // NUMBER literal → int or double
+    if (expr_tok.type == TT::NUMBER) {
+      if (expr_str.find('.') != std::string::npos ||
+          expr_str.find('e') != std::string::npos ||
+          expr_str.find('E') != std::string::npos)
+        return "double";
+      return "int";
+    }
+
+    // STRING literal → char*
+    if (expr_tok.type == TT::STRING)
+      return "char*";
+
+    // CHAR literal → char
+    if (expr_tok.type == TT::CHAR_LIT)
+      return "char";
+
+    // true/false → bool
+    if (expr_tok.type == TT::TRUE_KW || expr_tok.type == TT::FALSE_KW)
+      return "bool";
+
+    // NULL → void*
+    if (expr_tok.type == TT::NULL_KW)
+      return "void*";
+
+    if (expr_tok.type == TT::IDENTIFIER) {
+      std::string vname = safe_name(expr_tok.value);
+
+      // peek: if token AFTER expr_tok is LPAREN, this is a function call
+      // pos was already advanced past the whole expr by parse_expr,
+      // so we use the raw token value to look up the func return type
+      auto fit = func_return_types.find(vname);
+      if (fit != func_return_types.end()) {
+        // it's a known function — check if expr_str looks like a call
+        // (contains '(' ) to be sure
+        if (expr_str.find('(') != std::string::npos) {
+          std::string raw = fit->second;
+          // map raw return type to C type
+          if (raw == "str")   return "char*";
+          if (raw == "ptr")   return "void*";
+          if (raw == "bool")  return "bool";
+          if (raw == "char")  return "char";
+          // struct / custom type → use as-is
+          return raw;
+        }
+      }
+
+      // plain variable → look up var_types
+      auto vit = var_types.find(vname);
+      if (vit != var_types.end()) {
+        std::string raw = vit->second;
+        if (raw == "str")   return "char*";
+        if (raw == "ptr")   return "void*";
+        if (raw == "bool")  return "bool";
+        if (raw == "char")  return "char";
+        return raw;
+      }
+
+      return "int"; // unknown identifier, default
+    }
+
+    // unary minus on number → check expr_str
+    if (expr_tok.type == TT::MINUS) {
+      if (expr_str.find('.') != std::string::npos)
+        return "double";
+      return "int";
+    }
+
+    // paren-grouped expr → fallback int
+    if (expr_tok.type == TT::LPAREN)
+      return "int";
+
+    return "int";
+  }
+
+  // -----------------------------------------------------------------------
   // Statement parser
   // -----------------------------------------------------------------------
   std::string parse_statement() {
@@ -1278,6 +1364,20 @@ class CTranspiler {
       std::string val = parse_expr();
       var_types[name] = inner_raw;
       return "const " + inner_c + " " + name + " = " + val + ";";
+    }
+
+    // let / var — type inference (same semantics, mutable by default)
+    if (t.type == TT::LET_KW || t.type == TT::VAR_KW) {
+      advance();
+      std::string name = safe_name(expect(TT::IDENTIFIER, false).value);
+      expect(TT::ASSIGN, false);
+      Token expr_start = current();
+      std::string val = parse_expr();
+      
+      // infer type from RHS
+      std::string inferred_type = infer_type_from_rhs(expr_start, val);
+      var_types[name] = inferred_type;
+      return inferred_type + " " + name + " = " + val + ";";
     }
 
     // Type declarations (var decl)
@@ -1777,6 +1877,8 @@ class CTranspiler {
       ret_type = "static inline " + ret_type;
 
     std::string fname = safe_name(expect(TT::IDENTIFIER, false).value);
+    // register for type inference on call sites
+    func_return_types[fname] = raw_ret;
     expect(TT::LPAREN, false);
 
     auto saved_var_types = var_types;
@@ -1836,6 +1938,120 @@ class CTranspiler {
     var_types = saved_var_types;
     return ret_type + " " + fname + "(" + join(params, ", ") + ") {\n" +
            join(body, "\n") + "\n}\n";
+  }
+
+  // -----------------------------------------------------------------------
+  // Scan a .h file for function signatures via clang -ast-dump=json
+  // Extracts every FunctionDecl: name + return type, no hardcoding.
+  // Falls back silently if clang not available or file unreadable.
+  // -----------------------------------------------------------------------
+  void scan_h_for_funcs(const std::string &path) {
+    if (!fs::exists(path)) return;
+
+    // build clang command — dump AST as JSON, suppress system header noise
+    std::string cmd = "clang -Xclang -ast-dump=json -fsyntax-only "
+                      "-fno-color-diagnostics \"" + path + "\" 2>/dev/null";
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (!pipe) return;
+
+    // read all output
+    std::string json;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe))
+      json += buf;
+    pclose(pipe);
+
+    if (json.empty()) return;
+
+    // -------------------------------------------------------------------
+    // Minimal JSON walk — no external lib needed.
+    // We look for the pattern:
+    //   "kind": "FunctionDecl"   (anywhere in an object)
+    //   "name": "<fname>"        (in same object)
+    //   "type": { "qualType": "<rettype> (<params>)" }
+    //
+    // Strategy: scan for "kind":"FunctionDecl", then within the same
+    // brace-scope grab "name" and "qualType".
+    // -------------------------------------------------------------------
+    auto json_str_val = [&](const std::string &src, size_t from,
+                             const std::string &key) -> std::string {
+      // find "key" : "value" starting at from, return value or ""
+      std::string needle = "\"" + key + "\"";
+      size_t k = src.find(needle, from);
+      if (k == std::string::npos) return "";
+      size_t colon = src.find(':', k + needle.size());
+      if (colon == std::string::npos) return "";
+      size_t q1 = src.find('"', colon + 1);
+      if (q1 == std::string::npos) return "";
+      size_t q2 = q1 + 1;
+      while (q2 < src.size() && !(src[q2] == '"' && src[q2-1] != '\\'))
+        q2++;
+      return src.substr(q1 + 1, q2 - q1 - 1);
+    };
+
+    // find matching closing brace for object starting at `open` (which is '{')
+    auto find_close = [&](const std::string &src, size_t open) -> size_t {
+      int depth = 0;
+      bool in_str = false;
+      for (size_t i = open; i < src.size(); i++) {
+        if (in_str) {
+          if (src[i] == '\\') { i++; continue; }
+          if (src[i] == '"') in_str = false;
+        } else {
+          if (src[i] == '"') { in_str = true; continue; }
+          if (src[i] == '{') depth++;
+          else if (src[i] == '}') { if (--depth == 0) return i; }
+        }
+      }
+      return std::string::npos;
+    };
+
+    const std::string kind_needle = "\"kind\":\"FunctionDecl\"";
+    // normalised search: clang may emit spaces around colon
+    // so also try with spaces
+    size_t search = 0;
+    while (search < json.size()) {
+      // find next FunctionDecl
+      size_t kpos = json.find("\"FunctionDecl\"", search);
+      if (kpos == std::string::npos) break;
+
+      // walk back to find the opening '{' of this object
+      size_t obj_start = json.rfind('{', kpos);
+      if (obj_start == std::string::npos) { search = kpos + 1; continue; }
+
+      size_t obj_end = find_close(json, obj_start);
+      if (obj_end == std::string::npos) { search = kpos + 1; continue; }
+
+      std::string obj = json.substr(obj_start, obj_end - obj_start + 1);
+
+      // extract name
+      std::string fname = json_str_val(obj, 0, "name");
+      // extract qualType — looks like "vec3 (float, float, float)"
+      std::string qual_type = json_str_val(obj, 0, "qualType");
+
+      if (!fname.empty() && !qual_type.empty()) {
+        // return type is everything before the first '('
+        size_t paren = qual_type.find('(');
+        if (paren != std::string::npos) {
+          std::string ret = qual_type.substr(0, paren);
+          // trim trailing spaces and pointer stars into clean base type
+          while (!ret.empty() && (ret.back() == ' ' || ret.back() == '\t'))
+            ret.pop_back();
+          // keep pointer stars as part of type (e.g. "char *" → "char*")
+          // normalise: remove spaces before *
+          std::string norm;
+          for (size_t i = 0; i < ret.size(); i++) {
+            if (ret[i] == ' ' && i + 1 < ret.size() && ret[i+1] == '*')
+              continue;
+            norm += ret[i];
+          }
+          if (!norm.empty() && fname != "operator")
+            func_return_types[fname] = norm;
+        }
+      }
+
+      search = obj_end + 1;
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -1919,6 +2135,7 @@ class CTranspiler {
     lh._source_file = canonical;
     lh._lh_included = _lh_included;
     lh.var_types = var_types;
+    lh.func_return_types = func_return_types;
     lh._handle_declared = _handle_declared;
 
     while (lh.current().type != TT::TEOF) {
@@ -1950,8 +2167,16 @@ class CTranspiler {
         if (!nt.value.empty()) {
           if (ends_with(nt.value, ".lh"))
             transpile_lh(nt.value, nt);
-          else
+          else {
             headers.push_back("#include \"" + nt.value + "\"");
+            // scan for type inference
+            for (const auto &ipath : _include_paths) {
+              std::string candidate = (fs::path(ipath) / nt.value).string();
+              if (fs::exists(candidate)) { scan_h_for_funcs(candidate); break; }
+            }
+            std::string local = (fs::path(_source_dir) / nt.value).string();
+            if (fs::exists(local)) scan_h_for_funcs(local);
+          }
         }
       } else {
         lh.parse_statement();
@@ -1964,6 +2189,9 @@ class CTranspiler {
 
     for (auto const &[name, type_str] : lh.var_types) {
       this->var_types[name] = type_str;
+    }
+    for (auto const &[name, type_str] : lh.func_return_types) {
+      this->func_return_types[name] = type_str;
     }
 
     this->_lh_included = lh._lh_included;
@@ -2072,8 +2300,16 @@ public:
                                tok.col);
           if (ends_with(ft.value, ".lh"))
             transpile_lh(ft.value, ft);
-          else
+          else {
             headers.push_back("#include \"" + ft.value + "\"");
+            // scan for type inference
+            std::string local = (fs::path(_source_dir) / ft.value).string();
+            if (fs::exists(local)) scan_h_for_funcs(local);
+            for (const auto &ipath : _include_paths) {
+              std::string candidate = (fs::path(ipath) / ft.value).string();
+              if (fs::exists(candidate)) { scan_h_for_funcs(candidate); break; }
+            }
+          }
         } else {
           tok = current();
           std::string stmt = parse_statement();
