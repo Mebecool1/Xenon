@@ -13,6 +13,12 @@ type vec4f {
     float z
     float w
 }
+type vec3fv {
+    float x
+    float y
+    float z
+    float w
+}
 type mat4f {
     vec4f x
     vec4f y
@@ -100,8 +106,16 @@ function vec4f v4(float x, float y, float z, float w) {
     v.w = w
     return v
 }
-function vec4f promote3f(vec3f v) {
-    return v4(v.x, v.y, v.z, 1.0)
+function vec3fv v4v(float x, float y, float z) {
+    vec3fv v 
+    v.x = x 
+    v.y = y 
+    v.z = z 
+    v.w = 0
+    return v
+}
+function vec3fv promote3f(vec3f v) {
+    return v4v(v.x, v.y, v.z)
 }
 function vec2f vec2Add (vec2f a, vec2f b) {
     return v2(a.x + b.x, a.y + b.y)

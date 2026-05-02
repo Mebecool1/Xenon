@@ -109,8 +109,8 @@ function int cube_i(int n) {
 }
 
 function int pow_i(int base, int exp) {
-    int result = 1
-    int i = 0
+    let result = 1
+    let i = 0
     while i < exp do
         result = result * base
         i = i + 1
@@ -119,8 +119,8 @@ function int pow_i(int base, int exp) {
 }
 
 function int gcd(int a, int b) {
-    int ta = abs_i(a)
-    int tb = abs_i(b)
+    let ta = abs_i(a)
+    var tb = abs_i(b)
     while tb != 0 do
         int tmp = tb
         tb = ta % tb
@@ -159,8 +159,8 @@ function int is_prime(int n) {
             if is_even(n) == 1 then
                 return 0
             else
-                int i = 3
-                int found = 0
+                let i = 3
+                let found = 0
                 while (i * i) <= n do
                     if (n % i) == 0 then
                         found = 1
@@ -581,10 +581,6 @@ function int arr_fill(int arr[256], int len, int val) {
 # IO
 # ============================================================
 
-function int println(str s) {
-    printf("%s\n", s)
-    return 1
-}
 
 function int print_int(int n) {
     printf("%d\n", n)
@@ -606,15 +602,6 @@ function int print_banner(str title) {
     return 1
 }
 
-function int file_exists(str path) {
-    FILE* f = fopen(path, "r")
-    if f != 0 then
-        fclose(f)
-        return 1
-    else
-        return 0
-    end
-}
 
 # ============================================================
 # SYSTEM

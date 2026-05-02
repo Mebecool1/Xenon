@@ -23,7 +23,7 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-
+bool line;
 // ===========================================================================
 // TokenType
 // ===========================================================================
@@ -630,7 +630,7 @@ static TypeInfo promote(const TypeInfo &a, const TypeInfo &b) {
   if (a.is_ptr() && b.is_integer()) return a;
   if (b.is_ptr() && a.is_integer()) return b;
 
-  // float > double? No — double > float
+  
   if (a.base == "double" || b.base == "double") return TypeInfo::of("double");
   if (a.base == "float"  || b.base == "float")  return TypeInfo::of("float");
 
@@ -666,6 +666,21 @@ class CTranspiler {
   std::map<std::string, std::map<std::string, std::string>> struct_field_types;
   // fname → vector of param c_types (for argument-position inference)
   std::map<std::string, std::vector<std::string>> func_param_types;
+
+  // Monomorphization support ------------------------------------------------
+  struct TemplateFunc {
+    size_t tok_start; // index of return-type token (first token after 'function')
+    size_t tok_end;   // index just past closing '}'
+    bool   inl;
+    std::string raw_ret; // "let","var","int","float",...
+    struct ParamSlot { std::string raw; bool infer; bool is_array; };
+    std::vector<ParamSlot> param_slots;
+  };
+  std::map<std::string, TemplateFunc>                        template_funcs;
+  std::map<std::string, std::map<std::string,std::string>>   mono_registry;
+  // prevent re-entrant instantiation of same specialization
+  std::set<std::string> _mono_in_progress;
+
   std::set<std::string> _handle_declared;
   std::set<std::string> _lh_included;
   std::set<std::string> _enum_names;
@@ -704,7 +719,7 @@ class CTranspiler {
   }
 
   std::string line_directive(const Token &tok) {
-    if (tok.line == 0)
+    if (tok.line == 0 || !line)
       return "";
     return "#line " + std::to_string(tok.line) + " \"" + c_path(_source_file) +
            "\"\n";
@@ -756,10 +771,12 @@ class CTranspiler {
     std::string struct_name = expect(TT::IDENTIFIER, false).value;
     expect(TT::LBRACE, false);
     std::vector<std::string> fields;
+    auto &field_map = struct_field_types[struct_name]; // declared early for inline registration
     static const std::set<TT> valid_field_types = {
         TT::INT,        TT::FLOAT,   TT::STR,     TT::LONG, TT::SHORT,
         TT::DOUBLE,     TT::VOID,    TT::PTR,     TT::M256, TT::M256I,
-        TT::IDENTIFIER, TT::BOOL_KW, TT::CHAR_KW,
+        TT::IDENTIFIER, TT::BOOL_KW, TT::CHAR_KW, TT::U8,   TT::U32,
+        TT::U64,
     };
     while (current().type != TT::RBRACE) {
       if (current().type == TT::TEOF)
@@ -799,36 +816,16 @@ class CTranspiler {
           sz = expect(TT::NUMBER, false).value; // triggers proper error
         expect(TT::RSBRACKET, false);
         fields.push_back(f_type + " " + f_name + "[" + sz + "];");
+        field_map[f_name] = f_type + "[" + sz + "]"; // preserve array info
       } else {
         fields.push_back(f_type + " " + f_name + ";");
+        field_map[f_name] = f_type;
       }
       if (current().type == TT::SEMICOLON)
         advance();
     }
     expect(TT::RBRACE, false);
     var_types[struct_name] = "STRUCT";
-    // Register field types for member-access inference
-    auto &field_map = struct_field_types[struct_name];
-    for (const auto &fd : fields) {
-      // fd looks like "int foo;" or "char* bar;" or "float baz[4];"
-      // Extract type and name naively: last word before ; or [ is the field name
-      std::string fd2 = fd;
-      // strip trailing ;
-      if (!fd2.empty() && fd2.back() == ';') fd2.pop_back();
-      // strip array suffix
-      size_t lb = fd2.find('[');
-      if (lb != std::string::npos) fd2 = fd2.substr(0, lb);
-      // trim
-      while (!fd2.empty() && std::isspace((unsigned char)fd2.back())) fd2.pop_back();
-      // split at last space
-      size_t sp = fd2.rfind(' ');
-      if (sp != std::string::npos) {
-        std::string fname2 = fd2.substr(sp+1);
-        std::string ftype2 = fd2.substr(0, sp);
-        while (!ftype2.empty() && std::isspace((unsigned char)ftype2.back())) ftype2.pop_back();
-        field_map[fname2] = ftype2;
-      }
-    }
     return "typedef struct {\n    " + join(fields, "\n    ") + "\n} " +
            struct_name + ";\n";
   }
@@ -1090,18 +1087,7 @@ class CTranspiler {
       std::string name = safe_name(tok.value);
       if (current().type == TT::LPAREN) {
         advance();
-        std::vector<std::string> args;
-        while (current().type != TT::RPAREN) {
-          if (current().type == TT::TEOF)
-            throw LuaBaseError("SyntaxError",
-                               "Unterminated args in call to '" + name + "'",
-                               tok.line, tok.col);
-          args.push_back(parse_expr());
-          if (current().type == TT::COMMA)
-            advance();
-        }
-        expect(TT::RPAREN, false);
-        return name + "(" + join(args, ", ") + ")";
+        return emit_call(name, tok);
       }
       while (current().type == TT::LSBRACKET || current().type == TT::DOT ||
              current().type == TT::ARROW) {
@@ -1190,6 +1176,7 @@ class CTranspiler {
     auto it = func_return_types.find(fname);
     if (it == func_return_types.end()) return TypeInfo::unknown();
     const std::string &raw = it->second;
+    if (raw == "__infer__") return TypeInfo::unknown(); // not yet resolved
     TypeInfo ti;
     if (!raw.empty() && raw.back() == '*') {
       ti.base = raw.substr(0, raw.size()-1);
@@ -1212,7 +1199,7 @@ class CTranspiler {
     if (s.find('.') != std::string::npos ||
         s.find('e') != std::string::npos ||
         s.find('E') != std::string::npos)
-      return TypeInfo::of("double");
+      return TypeInfo::of("float");
     // long suffix
     if (!s.empty() && (s.back() == 'l' || s.back() == 'L'))
       return TypeInfo::of("long");
@@ -1484,6 +1471,46 @@ class CTranspiler {
 
       // Function call: name(...)
       if (pos < tokens.size() && tokens[pos].type == TT::LPAREN) {
+        // For template functions with inferred return types, compute the mangled
+        // specialization name from arg types so we look up the correct return type.
+        auto tmpl_it = template_funcs.find(name);
+        if (tmpl_it != template_funcs.end() &&
+            (tmpl_it->second.raw_ret == "let" || tmpl_it->second.raw_ret == "var")) {
+          const TemplateFunc &tmpl = tmpl_it->second;
+          // Peek at argument types (pos is at LPAREN)
+          size_t scan = pos + 1; // skip LPAREN
+          std::vector<std::string> concrete;
+          size_t ci = 0;
+          while (scan < tokens.size() && tokens[scan].type != TT::RPAREN) {
+            if (tokens[scan].type == TT::TEOF) break;
+            // skip leading commas between args
+            if (tokens[scan].type == TT::COMMA) { scan++; continue; }
+            // find start of this arg, then find its end (next comma/rparen at depth 0)
+            size_t arg_start = scan;
+            int d2 = 0;
+            while (scan < tokens.size()) {
+              TT tt2 = tokens[scan].type;
+              if (tt2 == TT::LPAREN || tt2 == TT::LBRACE || tt2 == TT::LSBRACKET) d2++;
+              else if (tt2 == TT::RPAREN || tt2 == TT::RBRACE || tt2 == TT::RSBRACKET) {
+                if (d2 == 0) break; d2--;
+              } else if (tt2 == TT::COMMA && d2 == 0) break;
+              scan++;
+            }
+            bool slot_infer = (ci < tmpl.param_slots.size()) ? tmpl.param_slots[ci].infer : true;
+            if (slot_infer) {
+              concrete.push_back(infer_type_at(arg_start).c_type());
+            } else if (ci < tmpl.param_slots.size()) {
+              concrete.push_back(param_raw_to_c(tmpl.param_slots[ci].raw));
+            }
+            ci++;
+          }
+          // Look up or instantiate the mangled specialization to get its return type
+          std::string mangled = mono_mangle(name, concrete);
+          if (!func_return_types.count(mangled) || func_return_types[mangled] == "__infer__")
+            instantiate_template(name, concrete);
+          skip_balanced(TT::LPAREN, TT::RPAREN);
+          return lookup_func_ret(mangled);
+        }
         skip_balanced(TT::LPAREN, TT::RPAREN);
         return lookup_func_ret(name);
       }
@@ -1518,9 +1545,14 @@ class CTranspiler {
               if (fit2 != sit->second.end()) {
                 std::string ft = fit2->second;
                 TypeInfo fti;
+                // strip array suffix "[N]" if present — field access yields element type
+                size_t lb = ft.find('[');
+                bool is_arr_field = (lb != std::string::npos);
+                if (is_arr_field) ft = ft.substr(0, lb);
                 if (!ft.empty() && ft.back() == '*') {
                   fti.base = ft.substr(0, ft.size()-1); fti.ptr_depth = 1;
                 } else { fti.base = ft; }
+                fti.is_array = is_arr_field;
                 ti = fti;
                 struct_base = ti.base;
                 continue;
@@ -1549,11 +1581,226 @@ class CTranspiler {
   }
 
   // Legacy compatibility shim used by the let/var handler
-  // (kept so the rest of the code compiles unchanged)
   std::string infer_type_from_rhs(const Token &/*expr_tok*/, const std::string &/*expr_str*/,
                                    size_t rhs_start_pos) {
     TypeInfo ti = infer_type_at(rhs_start_pos);
     return ti.c_type();
+  }
+
+  // -----------------------------------------------------------------------
+  // Monomorphization: build a type-signature key from a vector of c-type strings
+  // -----------------------------------------------------------------------
+  static std::string mono_key(const std::vector<std::string> &types) {
+    std::string k;
+    for (size_t i = 0; i < types.size(); i++) {
+      if (i) k += ',';
+      k += types[i];
+    }
+    return k;
+  }
+
+  // Mangle a specialization name: foo<int,double> → foo__int__double
+  static std::string mono_mangle(const std::string &fname,
+                                  const std::vector<std::string> &types) {
+    std::string r = fname;
+    for (const auto &t : types) {
+      r += "__";
+      for (char c : t)
+        r += (c == '*' || c == ' ') ? '_' : c;
+    }
+    return r;
+  }
+
+  // Given a c_type string, produce the raw keyword for var_types registration
+  std::string c_type_to_raw(const std::string &ct) const {
+    if (ct == "char*")    return "str";
+    if (ct == "bool")     return "bool";
+    if (ct == "char")     return "char";
+    if (ct == "uint8_t")  return "u8";
+    if (ct == "uint32_t") return "u32";
+    if (ct == "uint64_t") return "u64";
+    return ct; // int, float, double, long, short, void, struct names
+  }
+
+  // -----------------------------------------------------------------------
+  // Instantiate a template function with concrete arg types.
+  // Saves/restores pos; re-parses the template token range with param
+  // var_types pre-seeded to the concrete types.
+  // Returns the mangled function name.
+  // -----------------------------------------------------------------------
+  std::string instantiate_template(const std::string &fname,
+                                    const std::vector<std::string> &concrete_types) {
+    auto tit = template_funcs.find(fname);
+    if (tit == template_funcs.end()) return fname; // not a template, identity
+
+    const TemplateFunc &tmpl = tit->second;
+    std::string key = mono_key(concrete_types);
+
+    // Already instantiated?
+    auto &reg = mono_registry[fname];
+    auto rit = reg.find(key);
+    if (rit != reg.end()) return rit->second;
+
+    // Re-entrancy guard (recursive templates would loop)
+    std::string guard_key = fname + "@" + key;
+    if (_mono_in_progress.count(guard_key)) return fname;
+    _mono_in_progress.insert(guard_key);
+
+    std::string mangled = mono_mangle(fname, concrete_types);
+    reg[key] = mangled; // register early to handle recursion
+
+    // Save current parser state
+    size_t saved_pos = pos;
+    auto saved_var_types = var_types;
+
+    // Seek to template body start
+    pos = tmpl.tok_start;
+
+    // Pre-seed param types in var_types so body-scan inference sees concrete types.
+    // We'll replay the param list, substituting concrete types for let/var slots.
+    // Skip past return type token(s)
+    // (tok_start points at the return-type token; we re-parse from there)
+
+    // Build a mapping: param_name → concrete_type  by peeking at param list
+    // We need to advance past ret-type to get to fname, then LPAREN, then params.
+    {
+      // parse ret type (skip, we'll use infer_ret logic below)
+      size_t scan = pos;
+      // skip return type (may be "ptr X" = 2 tokens, or 1 token)
+      std::string raw_r = tokens[scan].value; scan++;
+      if (raw_r == "let" || raw_r == "var") { /* inferred */ }
+      else if (raw_r == "ptr") { scan++; } // ptr X
+      // optional [N] on return type
+      if (scan < tokens.size() && tokens[scan].type == TT::LSBRACKET) {
+        scan++;
+        while (scan < tokens.size() && tokens[scan].type != TT::RSBRACKET) scan++;
+        if (scan < tokens.size()) scan++;
+      }
+      // fname
+      scan++; // skip fname
+      // LPAREN
+      if (scan < tokens.size() && tokens[scan].type == TT::LPAREN) scan++;
+      // params
+      size_t ci = 0;
+      while (scan < tokens.size() && tokens[scan].type != TT::RPAREN) {
+        if (tokens[scan].type == TT::TEOF) break;
+        // param type token(s)
+        std::string p_raw = tokens[scan++].value;
+        if (p_raw == "ptr" && scan < tokens.size()) scan++; // ptr X
+        // optional [N]
+        if (scan < tokens.size() && tokens[scan].type == TT::LSBRACKET) {
+          scan++;
+          while (scan < tokens.size() && tokens[scan].type != TT::RSBRACKET) scan++;
+          if (scan < tokens.size()) scan++;
+        }
+        // param name
+        if (scan < tokens.size() && tokens[scan].type == TT::IDENTIFIER) {
+          std::string p_name = safe_name(tokens[scan++].value);
+          // If this slot is infer, seed with the concrete type
+          if (ci < tmpl.param_slots.size() && tmpl.param_slots[ci].infer &&
+              ci < concrete_types.size()) {
+            var_types[p_name] = c_type_to_raw(concrete_types[ci]);
+          } else if (ci < tmpl.param_slots.size()) {
+            var_types[p_name] = tmpl.param_slots[ci].raw;
+          }
+        }
+        if (scan < tokens.size() && tokens[scan].type == TT::COMMA) scan++;
+        ci++;
+      }
+    }
+
+    // Now re-parse parse_function_body from tok_start.
+    // We need to trick it into using `mangled` as the function name.
+    // Strategy: parse normally, it will read fname from tokens — but we need it
+    // to emit `mangled`. So we temporarily patch the fname token.
+    // The fname token is at tok_start + (1 or 2 for ret) + (1 for [N]?) tokens.
+    // Simpler: find the IDENTIFIER token that is the function name.
+    {
+      size_t scan = tmpl.tok_start;
+      // skip ret type
+      std::string raw_r2 = tokens[scan].value; scan++;
+      if (raw_r2 == "ptr") scan++;
+      if (scan < tokens.size() && tokens[scan].type == TT::LSBRACKET) {
+        scan++;
+        while (scan < tokens.size() && tokens[scan].type != TT::RSBRACKET) scan++;
+        if (scan < tokens.size()) scan++;
+      }
+      // tokens[scan] should be the fname identifier — patch it
+      if (scan < tokens.size() && tokens[scan].type == TT::IDENTIFIER) {
+        std::string orig_fname = tokens[scan].value;
+        tokens[scan].value = mangled; // temporarily rename
+        pos = tmpl.tok_start;
+        std::string code = parse_function_body(tokens[scan], tmpl.inl);
+        tokens[scan].value = orig_fname; // restore
+        functions.push_back(code);
+      }
+    }
+
+    // Restore parser state
+    pos = saved_pos;
+    var_types = saved_var_types;
+    _mono_in_progress.erase(guard_key);
+    return mangled;
+  }
+
+  // -----------------------------------------------------------------------
+  // Compute concrete arg types for a function call whose args start just
+  // after the LPAREN.  `arg_start_positions[i]` = token index of ith arg.
+  // Returns vector of c_type strings (one per arg).
+  // -----------------------------------------------------------------------
+  std::vector<std::string> compute_arg_types(const std::vector<size_t> &arg_starts) {
+    std::vector<std::string> types;
+    for (size_t sp : arg_starts) {
+      TypeInfo ti = infer_type_at(sp);
+      types.push_back(ti.c_type());
+    }
+    return types;
+  }
+
+  // -----------------------------------------------------------------------
+  // emit_call: parse argument list (pos is JUST AFTER the LPAREN).
+  // If fname is a template, instantiate/look up specialization and rewrite.
+  // Returns "mangled_name(arg1, arg2, ...)" — no trailing semicolon.
+  // -----------------------------------------------------------------------
+  std::string emit_call(const std::string &fname, const Token &call_tok) {
+    // Collect arg start positions BEFORE consuming them
+    bool is_tmpl = template_funcs.count(fname) > 0;
+    std::vector<size_t>      arg_starts;
+    std::vector<std::string> args;
+    int depth = 0;
+    while (current().type != TT::RPAREN) {
+      if (current().type == TT::TEOF)
+        throw LuaBaseError("SyntaxError",
+                           "Unterminated args in call to '" + fname + "'",
+                           call_tok.line, call_tok.col);
+      if (is_tmpl) arg_starts.push_back(pos);
+      args.push_back(parse_expr());
+      if (current().type == TT::COMMA) advance();
+    }
+    expect(TT::RPAREN, false);
+
+    std::string call_name = fname;
+    if (is_tmpl && !args.empty()) {
+      // Determine which params are infer slots
+      const TemplateFunc &tmpl = template_funcs[fname];
+      std::vector<std::string> concrete;
+      for (size_t i = 0; i < tmpl.param_slots.size(); i++) {
+        if (i < arg_starts.size()) {
+          if (tmpl.param_slots[i].infer) {
+            TypeInfo ti = infer_type_at(arg_starts[i]);
+            concrete.push_back(ti.c_type());
+          } else {
+            // concrete type from the slot's declared type
+            concrete.push_back(param_raw_to_c(tmpl.param_slots[i].raw));
+          }
+        }
+      }
+      call_name = instantiate_template(fname, concrete);
+    } else if (is_tmpl && args.empty()) {
+      // zero-arg template — instantiate with empty specialization
+      call_name = instantiate_template(fname, {});
+    }
+    return call_name + "(" + join(args, ", ") + ")";
   }
 
   // -----------------------------------------------------------------------
@@ -1763,7 +2010,7 @@ class CTranspiler {
                            "'inline' must be followed by 'function'", t.line,
                            t.col);
       advance();
-      return parse_function_body(t, true);
+      return emit_function(t, true);
     }
 
     // const
@@ -1783,6 +2030,26 @@ class CTranspiler {
       advance();
       std::string name = safe_name(expect(TT::IDENTIFIER, false).value);
       expect(TT::ASSIGN, false);
+
+      // Array initializer: let x = {1, 2, 3}  — infer element type from first element
+      if (current().type == TT::LBRACE) {
+        advance();
+        std::vector<std::string> items;
+        size_t first_elem_pos = pos;
+        TypeInfo elem_ti = TypeInfo::of("int");
+        bool first = true;
+        while (current().type != TT::RBRACE && current().type != TT::TEOF) {
+          if (first) { elem_ti = infer_type_at(pos); first = false; }
+          items.push_back(parse_expr());
+          if (current().type == TT::COMMA) advance();
+        }
+        expect(TT::RBRACE, false);
+        std::string elem_c = elem_ti.c_type();
+        var_types[name] = elem_c + "_ARRAY";
+        std::string sz = std::to_string(items.size());
+        return elem_c + " " + name + "[" + sz + "] = {" + join(items, ", ") + "};";
+      }
+
       size_t rhs_start = pos;          // capture RHS start BEFORE parse_expr consumes it
       Token expr_start = current();
       std::string val = parse_expr();
@@ -1791,7 +2058,6 @@ class CTranspiler {
       std::string inferred_type = infer_type_from_rhs(expr_start, val, rhs_start);
 
       // Store normalised form in var_types for downstream inference
-      // (strip trailing * for the raw form, keep ptr_depth info via c_type)
       var_types[name] = inferred_type;
       return inferred_type + " " + name + " = " + val + ";";
     }
@@ -2212,15 +2478,9 @@ class CTranspiler {
         return name + "--;";
       }
       if (current().type == TT::LPAREN) {
+        Token call_tok = current();
         advance();
-        std::vector<std::string> args;
-        while (current().type != TT::RPAREN) {
-          args.push_back(parse_expr());
-          if (current().type == TT::COMMA)
-            advance();
-        }
-        expect(TT::RPAREN, false);
-        return name + "(" + join(args, ", ") + ");";
+        return emit_call(name, call_tok) + ";";
       }
       return "";
     }
@@ -2262,11 +2522,203 @@ class CTranspiler {
   // -----------------------------------------------------------------------
   // Function parsing
   // -----------------------------------------------------------------------
+  // -----------------------------------------------------------------------
+  // Infer param type by scanning body token range [body_start, body_end)
+  // for usage patterns of `param_name`.  Returns best TypeInfo guess.
+  //
+  // Patterns recognised (in order of confidence):
+  //   1. param assigned to a typed variable:  typed_var = param
+  //   2. param assigned FROM a typed rhs that also involves param:
+  //      e.g.  x = param + 1.0  → param appears on RHS of typed assign
+  //   3. param passed as Nth arg to a known function: look up func_param_types[N]
+  //   4. param used in arithmetic with a typed operand → promote
+  //   5. param compared (==,!=,<,>,<=,>=) with a typed value
+  // Fallback: int
+  // -----------------------------------------------------------------------
+  TypeInfo infer_param_type_from_body(const std::string &param_name,
+                                       size_t body_start, size_t body_end) {
+    // Walk body_start..body_end looking for any token == param_name (IDENTIFIER)
+    // and examine surrounding context.
+    TypeInfo best = TypeInfo::of("int");
+    bool found = false;
+
+    for (size_t i = body_start; i < body_end; i++) {
+      if (tokens[i].type != TT::IDENTIFIER || tokens[i].value != param_name)
+        continue;
+
+      // Pattern 1 & 2: something = ... param ...
+      // Walk left to find an assignment: look for ASSIGN preceded by IDENTIFIER
+      // This is expensive in general; instead, when param appears on RHS of =,
+      // the LHS var has a known type — infer expr type of the full RHS.
+      // Find the enclosing statement's = if any by scanning left.
+      {
+        // Find the start of this statement by scanning back to prior ; or {
+        size_t stmt_start = i;
+        while (stmt_start > body_start) {
+          TT tt = tokens[stmt_start-1].type;
+          if (tt == TT::SEMICOLON || tt == TT::LBRACE || tt == TT::RBRACE)
+            break;
+          stmt_start--;
+        }
+        // Find = in this statement range
+        for (size_t j = stmt_start; j < i && j < body_end; j++) {
+          if (tokens[j].type == TT::ASSIGN) {
+            // LHS is before j, RHS starts at j+1
+            // If param is on RHS (which it is since i > j), infer full RHS type
+            TypeInfo rhs_ti = infer_type_at(j + 1);
+            if (rhs_ti.base != "int" || rhs_ti.ptr_depth > 0) {
+              best = found ? promote(best, rhs_ti) : rhs_ti;
+              found = true;
+            }
+            // Also: if LHS is a simple known-typed var, use that directly
+            if (j > stmt_start && tokens[j-1].type == TT::IDENTIFIER) {
+              TypeInfo lhs_ti = lookup_var(safe_name(tokens[j-1].value));
+              if (lhs_ti.base != "int" || lhs_ti.ptr_depth > 0) {
+                best = found ? promote(best, lhs_ti) : lhs_ti;
+                found = true;
+              }
+            }
+            break;
+          }
+        }
+      }
+
+      // Pattern 3: param is Nth arg in a function call  foo(..., param, ...)
+      // Look right for comma/rparen context, and left for the call opener
+      {
+        // scan left to find LPAREN of call
+        int depth = 0;
+        size_t call_lp = std::string::npos;
+        for (int j = (int)i - 1; j >= (int)body_start; j--) {
+          if (tokens[j].type == TT::RPAREN) depth++;
+          else if (tokens[j].type == TT::LPAREN) {
+            if (depth == 0) { call_lp = (size_t)j; break; }
+            else depth--;
+          }
+        }
+        if (call_lp != std::string::npos && call_lp > 0 &&
+            tokens[call_lp-1].type == TT::IDENTIFIER) {
+          std::string callee = safe_name(tokens[call_lp-1].value);
+          auto pit = func_param_types.find(callee);
+          if (pit != func_param_types.end()) {
+            // count which arg position param is at
+            int arg_idx = 0;
+            int d2 = 0;
+            for (size_t j = call_lp + 1; j < i; j++) {
+              if (tokens[j].type == TT::LPAREN || tokens[j].type == TT::LSBRACKET) d2++;
+              else if (tokens[j].type == TT::RPAREN || tokens[j].type == TT::RSBRACKET) d2--;
+              else if (tokens[j].type == TT::COMMA && d2 == 0) arg_idx++;
+            }
+            if (arg_idx < (int)pit->second.size()) {
+              std::string ptype_c = pit->second[arg_idx];
+              TypeInfo pti;
+              if (!ptype_c.empty() && ptype_c.back() == '*') {
+                pti.base = ptype_c.substr(0, ptype_c.size()-1); pti.ptr_depth = 1;
+              } else { pti.base = raw_to_c(ptype_c); }
+              if (pti.base != "int" || pti.ptr_depth > 0) {
+                best = found ? promote(best, pti) : pti;
+                found = true;
+              }
+            }
+          }
+        }
+      }
+
+      // Pattern 4 & 5: param in arithmetic/comparison with a typed peer
+      // Check the token immediately to the right of an operator adjacent to param
+      {
+        size_t peer_pos = std::string::npos;
+        static const std::set<TT> arith = {
+          TT::PLUS, TT::MINUS, TT::MULTIPLY, TT::DIVIDE, TT::MOD,
+          TT::EQ, TT::NE, TT::LT, TT::GT, TT::LE, TT::GE,
+          TT::SHL, TT::SHR, TT::BITOR, TT::BITXOR, TT::ADDRESS_OF
+        };
+        // param OP expr
+        if (i + 1 < body_end && arith.count(tokens[i+1].type) && i + 2 < body_end)
+          peer_pos = i + 2;
+        // expr OP param
+        if (i >= 2 && arith.count(tokens[i-1].type))
+          peer_pos = i - 2; // two-token lookahead left for literals/identifiers
+        if (peer_pos != std::string::npos && peer_pos < body_end) {
+          TypeInfo peer_ti = infer_type_at(peer_pos);
+          // only use if peer is more specific than int
+          if (peer_ti.is_float() || peer_ti.is_ptr() ||
+              peer_ti.base == "double" || peer_ti.base == "long" ||
+              peer_ti.base == "char*" || peer_ti.base == "bool") {
+            best = found ? promote(best, peer_ti) : peer_ti;
+            found = true;
+          }
+        }
+      }
+    }
+    return best;
+  }
+
+  // -----------------------------------------------------------------------
+  // Infer return type by scanning body token range [body_start, body_end)
+  // for every RETURN token and running infer_type_at on the expression.
+  // Promotes across all return sites.
+  // -----------------------------------------------------------------------
+  TypeInfo infer_return_type_from_body(size_t body_start, size_t body_end,
+                                        const std::map<std::string,std::string> &local_var_types) {
+    TypeInfo best = TypeInfo::of("void");
+    bool found = false;
+
+    // Temporarily install local var_types so infer_type_at sees function-scope vars
+    auto saved = var_types;
+    // merge local_var_types into var_types
+    for (auto const &kv : local_var_types)
+      var_types[kv.first] = kv.second;
+
+    for (size_t i = body_start; i < body_end; i++) {
+      if (tokens[i].type != TT::RETURN) continue;
+      // next token: if it's END/RBRACE/TEOF/SEMICOLON → void return
+      if (i + 1 >= body_end) continue;
+      TT next = tokens[i+1].type;
+      if (next == TT::RBRACE || next == TT::TEOF || next == TT::SEMICOLON)
+        continue; // void return, don't override non-void if already found
+      TypeInfo ti = infer_type_at(i + 1);
+      best = found ? promote(best, ti) : ti;
+      found = true;
+    }
+
+    var_types = saved;
+    return found ? best : TypeInfo::of("void");
+  }
+
+  // Convert raw param type keyword to C type string (shared helper)
+  std::string param_raw_to_c(const std::string &raw) const {
+    if (raw == "str")    return "char*";
+    if (raw == "bool")   return "bool";
+    if (raw == "char")   return "char";
+    if (raw == "u8")     return "uint8_t";
+    if (raw == "u32")    return "uint32_t";
+    if (raw == "u64")    return "uint64_t";
+    return raw;
+  }
+
+  // Wraps parse_function_body: records tok_start (= pos before we call, which
+  // points at the return-type token) and patches it into template_funcs if the
+  // function turned out to be a template.
+  std::string emit_function(const Token &fn_tok, bool inl) {
+    size_t tok_start = pos; // ret-type token is current()
+    std::string code = parse_function_body(fn_tok, inl);
+    if (code.size() > 14 && code.substr(0, 12) == "__TEMPLATE__") {
+      std::string tname = code.substr(12);
+      auto tit = template_funcs.find(tname);
+      if (tit != template_funcs.end())
+        tit->second.tok_start = tok_start;
+      return ""; // don't emit anything for a template
+    }
+    return code;
+  }
+
   std::string parse_function_body(const Token &fn_tok, bool inl) {
     static const std::set<TT> valid_ret = {
         TT::INT,     TT::FLOAT,   TT::STR,  TT::LONG,  TT::SHORT,
         TT::DOUBLE,  TT::VOID,    TT::M256, TT::M256I, TT::IDENTIFIER,
-        TT::BOOL_KW, TT::CHAR_KW, TT::PTR,
+        TT::BOOL_KW, TT::CHAR_KW, TT::PTR,  TT::U8,    TT::U32,
+        TT::U64,     TT::LET_KW,  TT::VAR_KW,
     };
     Token &rt = current();
     if (!valid_ret.count(rt.type))
@@ -2275,34 +2727,73 @@ class CTranspiler {
                              rt.value + "'",
                          rt.line, rt.col);
     std::string raw_ret = advance().value;
+    bool infer_ret = (raw_ret == "let" || raw_ret == "var");
     std::string ret_type;
-    if (raw_ret == "ptr") {
-      std::string inner = advance().value;
-      if (inner == "str")
-        inner = "char*";
-      ret_type = inner + "*";
-    } else if (raw_ret == "str")
-      ret_type = "char*";
-    else if (raw_ret == "bool")
-      ret_type = "bool";
-    else if (raw_ret == "char")
-      ret_type = "char";
-    else
-      ret_type = raw_ret;
-    if (inl)
+    if (!infer_ret) {
+      if (raw_ret == "ptr") {
+        std::string inner = advance().value;
+        if (inner == "str") inner = "char*";
+        ret_type = inner + "*";
+      } else if (raw_ret == "str")  ret_type = "char*";
+      else if (raw_ret == "bool")   ret_type = "bool";
+      else if (raw_ret == "char")   ret_type = "char";
+      else if (raw_ret == "u8")     ret_type = "uint8_t";
+      else if (raw_ret == "u32")    ret_type = "uint32_t";
+      else if (raw_ret == "u64")    ret_type = "uint64_t";
+      else                          ret_type = raw_ret;
+      // array return type: int[N] → int*
+      if (current().type == TT::LSBRACKET) {
+        advance();
+        while (current().type != TT::RSBRACKET && current().type != TT::TEOF)
+          advance();
+        if (current().type == TT::RSBRACKET) advance();
+        if (ret_type.empty() || ret_type.back() != '*') ret_type += "*";
+      }
+    }
+    if (inl && !infer_ret)
       ret_type = "static inline " + ret_type;
 
     std::string fname = safe_name(expect(TT::IDENTIFIER, false).value);
-    // register for type inference on call sites
-    func_return_types[fname] = raw_ret;
+    // Detect if we're being called from instantiate_template for this fname.
+    // guard_key format: "originalName@type1,type2"
+    // mangled fname: "originalName__type1__type2"
+    // So base = everything before first "__" (or full fname if no "__")
+    bool is_instantiating_now = false;
+    {
+      size_t dunder = fname.find("__");
+      std::string base_name = (dunder != std::string::npos) ? fname.substr(0, dunder) : fname;
+      for (const auto &k : _mono_in_progress) {
+        size_t at = k.find('@');
+        if (at != std::string::npos &&
+            (k.substr(0, at) == fname || k.substr(0, at) == base_name)) {
+          is_instantiating_now = true; break;
+        }
+      }
+    }
+
+    func_return_types[fname] = infer_ret ? "__infer__" : raw_ret;
     expect(TT::LPAREN, false);
 
     auto saved_var_types = var_types;
-    std::vector<std::string> params;
+
+    // -----------------------------------------------------------------------
+    // Parse params — collect infer_param flags and names for two-pass resolve
+    // -----------------------------------------------------------------------
+    struct ParamInfo {
+      std::string raw;
+      std::string c_type;
+      std::string name;
+      bool infer;
+      bool is_array;
+    };
+    std::vector<ParamInfo> param_infos;
+
     static const std::set<TT> valid_p = {
-        TT::INT,        TT::FLOAT,   TT::STR,    TT::LONG, TT::SHORT,
-        TT::DOUBLE,     TT::VOID,    TT::PTR,    TT::M256, TT::M256I,
-        TT::IDENTIFIER, TT::BOOL_KW, TT::CHAR_KW};
+        TT::INT,        TT::FLOAT,   TT::STR,    TT::LONG,   TT::SHORT,
+        TT::DOUBLE,     TT::VOID,    TT::PTR,    TT::M256,   TT::M256I,
+        TT::IDENTIFIER, TT::BOOL_KW, TT::CHAR_KW,TT::U8,     TT::U32,
+        TT::U64,        TT::LET_KW,  TT::VAR_KW};
+
     while (current().type != TT::RPAREN) {
       if (current().type == TT::TEOF)
         throw LuaBaseError("SyntaxError",
@@ -2314,43 +2805,170 @@ class CTranspiler {
                            "Expected param type in '" + fname + "', got '" +
                                pt.value + "'",
                            pt.line, pt.col);
-      std::string p_type_raw = advance().value;
-      std::string p_type;
-      if (p_type_raw == "ptr") {
-        std::string inner = advance().value;
-        if (inner == "str")
-          inner = "char*";
-        p_type = inner + "*";
-      } else if (p_type_raw == "str")
-        p_type = "char*";
-      else if (p_type_raw == "bool")
-        p_type = "bool";
-      else if (p_type_raw == "char")
-        p_type = "char";
-      else
-        p_type = p_type_raw;
-      std::string p_name = safe_name(expect(TT::IDENTIFIER, false).value);
-      var_types[p_name] = p_type_raw;
-      params.push_back(p_type + " " + p_name);
-      if (current().type == TT::COMMA)
+      ParamInfo pi;
+      pi.raw = advance().value;
+      pi.infer = (pi.raw == "let" || pi.raw == "var");
+
+      if (!pi.infer) {
+        if (pi.raw == "ptr") {
+          std::string inner = advance().value;
+          if (inner == "str") inner = "char*";
+          pi.c_type = inner + "*";
+        } else {
+          pi.c_type = param_raw_to_c(pi.raw);
+        }
+      }
+      pi.name = safe_name(expect(TT::IDENTIFIER, false).value);
+
+      pi.is_array = false;
+      if (current().type == TT::LSBRACKET) {
         advance();
+        while (current().type != TT::RSBRACKET && current().type != TT::TEOF)
+          advance();
+        if (current().type == TT::RSBRACKET) advance();
+        pi.is_array = true;
+        if (!pi.infer && (pi.c_type.empty() || pi.c_type.back() != '*'))
+          pi.c_type += "*";
+      }
+
+      // If we're in an instantiation, var_types is pre-seeded for infer params.
+      // Use what's already there; otherwise placeholder "int".
+      if (pi.infer) {
+        // Check if pre-seeded by instantiate_template
+        auto vit = var_types.find(pi.name);
+        if (vit != var_types.end() && vit->second != "int") {
+          pi.c_type = raw_to_c(vit->second);
+        } else {
+          var_types[pi.name] = "int";
+        }
+      } else {
+        var_types[pi.name] = pi.is_array ? pi.raw + "_ARRAY" : pi.raw;
+      }
+      param_infos.push_back(std::move(pi));
+      if (current().type == TT::COMMA) advance();
     }
     expect(TT::RPAREN, false);
-    // Register param types for call-site argument inference
+
+    // -----------------------------------------------------------------------
+    // Check if this is a template function (has any let/var params)
+    // and we're NOT currently instantiating it.
+    // If so: record it and skip the body.
+    // -----------------------------------------------------------------------
+    bool has_infer_params = false;
+    for (const auto &pi : param_infos)
+      if (pi.infer) { has_infer_params = true; break; }
+
+    if (has_infer_params && !is_instantiating_now) {
+      // Record template descriptor
+      TemplateFunc tmpl;
+      // tok_start = position of return-type token = saved before we advanced past it
+      // We need to rewind to find it. Since we've consumed ret_type + fname + ( + params + ),
+      // store tok_start as the position we recorded earlier in the func signature parse.
+      // We already advanced past all of those. Use the original fn_tok position as anchor.
+      // Actually: fn_tok is the 'function' keyword token; ret type is right after it.
+      // fn_tok.line/col let us find it in the token stream.
+      // Simplest: record pos of ret-type before parse_function_body is called.
+      // That's not accessible here. But we know: we're called with fn_tok being the
+      // 'function' token, and after advance() in the caller, pos pointed at ret-type.
+      // We consumed: raw_ret (1 or 2 tokens) + [N] + fname + ( + params + )
+      // So tok_start = pos_of_current_lbrace - 1 - param_count_tokens - 1 - 1 - ret_tokens
+      // Too fragile. Better: record tok_start at the very beginning of parse_function_body.
+      // We'll fix this by saving pos at the start of parse_function_body.
+      // For now this path is handled by the caller which records tmpl.tok_start.
+      // We'll return a sentinel string and let the caller handle it.
+      // ACTUALLY: we handle it more cleanly by saving pos at top of this function.
+      // That save is already done implicitly: the caller records tok_start before calling us.
+      // ... This is getting circular. Let's use a different approach:
+      // Store tok_start as part of the TemplateFunc at the CALL SITE (transpile() loop).
+      // We return "__TEMPLATE__<fname>" as the code so the caller knows.
+
+      // Build param_slots for the template descriptor
+      for (const auto &pi : param_infos) {
+        TemplateFunc::ParamSlot slot;
+        slot.raw = pi.raw;
+        slot.infer = pi.infer;
+        slot.is_array = pi.is_array;
+        tmpl.param_slots.push_back(slot);
+      }
+      tmpl.inl = inl;
+      tmpl.raw_ret = raw_ret;
+      // tok_start and tok_end: skip body and record
+      expect(TT::LBRACE, false);
+      size_t body_start = pos;
+      int depth = 1;
+      while (pos < tokens.size() && depth > 0) {
+        if (tokens[pos].type == TT::LBRACE) depth++;
+        else if (tokens[pos].type == TT::RBRACE) depth--;
+        pos++;
+      }
+      // pos now points past closing }
+      tmpl.tok_end = pos;
+      // tok_start = we need the token just before fname... store 0 for now,
+      // filled in by the caller which knows the pre-call pos.
+      tmpl.tok_start = 0; // placeholder — filled by caller
+      template_funcs[fname] = tmpl;
+      var_types = saved_var_types;
+      // Signal to caller with the fname so it can fill tok_start
+      return "__TEMPLATE__" + fname;
+    }
+
+    expect(TT::LBRACE, false);
+    size_t body_tok_start = pos;  // first token of body
+
+    // -----------------------------------------------------------------------
+    // First pass: skip over body tokens (balanced braces) to find body_end,
+    // so we can run inference before parsing.  We need the token range.
+    // -----------------------------------------------------------------------
+    {
+      size_t scan = pos;
+      int depth = 1;
+      while (scan < tokens.size() && depth > 0) {
+        if (tokens[scan].type == TT::LBRACE) depth++;
+        else if (tokens[scan].type == TT::RBRACE) depth--;
+        if (depth > 0) scan++;
+        else break;
+      }
+      size_t body_tok_end = scan; // points at closing RBRACE
+
+      // Resolve infer_param types using token-level body scan
+      for (auto &pi : param_infos) {
+        if (!pi.infer) continue;
+        TypeInfo ti = infer_param_type_from_body(pi.name, body_tok_start, body_tok_end);
+        pi.c_type = ti.c_type();
+        if (pi.is_array && (pi.c_type.empty() || pi.c_type.back() != '*'))
+          pi.c_type += "*";
+        // update var_types with the resolved type
+        var_types[pi.name] = pi.is_array ? (pi.c_type + "_ARRAY") : pi.c_type;
+        // also update raw for downstream lookup
+        pi.raw = pi.c_type;
+      }
+
+      // Resolve infer_ret using token-level body scan
+      // (We must do this after param types are resolved so infer_type_at is accurate)
+      if (infer_ret) {
+        TypeInfo rti = infer_return_type_from_body(body_tok_start, body_tok_end, var_types);
+        ret_type = rti.c_type();
+        if (inl) ret_type = "static inline " + ret_type;
+        func_return_types[fname] = ret_type;
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Build params vector for C declaration
+    // -----------------------------------------------------------------------
+    std::vector<std::string> params;
     {
       std::vector<std::string> ptypes;
-      for (const auto &p : params) {
-        // p is "type name" — extract type (everything before last space)
-        size_t sp = p.rfind(' ');
-        if (sp != std::string::npos)
-          ptypes.push_back(p.substr(0, sp));
-        else
-          ptypes.push_back("int");
+      for (const auto &pi : param_infos) {
+        params.push_back(pi.c_type + " " + pi.name);
+        ptypes.push_back(pi.c_type);
       }
       func_param_types[fname] = ptypes;
     }
-    expect(TT::LBRACE, false);
 
+    // -----------------------------------------------------------------------
+    // Second pass: parse body for real (pos still at body_tok_start)
+    // -----------------------------------------------------------------------
     std::vector<std::string> body;
     while (current().type != TT::RBRACE && current().type != TT::TEOF) {
       Token tok2 = current();
@@ -2365,6 +2983,7 @@ class CTranspiler {
     }
     expect(TT::RBRACE, false);
     var_types = saved_var_types;
+
     return ret_type + " " + fname + "(" + join(params, ", ") + ") {\n" +
            join(body, "\n") + "\n}\n";
   }
@@ -2577,8 +3196,8 @@ class CTranspiler {
       }
       if (lt.type == TT::FUNCTION) {
         lh.advance();
-        functions.push_back(lh.line_directive(lt) +
-                            lh.parse_function_body(lt, false));
+        std::string code = lh.emit_function(lt, false);
+        if (!code.empty()) functions.push_back(lh.line_directive(lt) + code);
       } else if (lt.type == TT::INLINE_KW) {
         lh.advance();
         if (lh.current().type != TT::FUNCTION)
@@ -2586,8 +3205,8 @@ class CTranspiler {
                              "'inline' must be followed by 'function'", lt.line,
                              lt.col);
         lh.advance();
-        functions.push_back(lh.line_directive(lt) +
-                            lh.parse_function_body(lt, true));
+        std::string code = lh.emit_function(lt, true);
+        if (!code.empty()) functions.push_back(lh.line_directive(lt) + code);
       } else if (lt.type == TT::TYPE) {
         headers.push_back(lh.line_directive(lt) + lh.parse_type_definition());
       } else if (lt.type == TT::ENUM_KW) {
@@ -2624,7 +3243,9 @@ class CTranspiler {
     for (auto const &[name, type_str] : lh.func_return_types) {
       this->func_return_types[name] = type_str;
     }
-
+    for (auto const &[name, tmpl] : lh.template_funcs) {
+      this->template_funcs[name] = tmpl;
+    }
     this->_lh_included = lh._lh_included;
   }
 
@@ -2711,8 +3332,8 @@ public:
           headers.push_back(line_directive(tok) + parse_enum());
         } else if (tok.type == TT::FUNCTION) {
           advance();
-          functions.push_back(line_directive(tok) +
-                              parse_function_body(tok, false));
+          std::string code = emit_function(tok, false);
+          if (!code.empty()) functions.push_back(line_directive(tok) + code);
         } else if (tok.type == TT::INLINE_KW) {
           advance();
           if (current().type != TT::FUNCTION)
@@ -2720,8 +3341,8 @@ public:
                                "'inline' must be followed by 'function'",
                                tok.line, tok.col);
           advance();
-          functions.push_back(line_directive(tok) +
-                              parse_function_body(tok, true));
+          std::string code = emit_function(tok, true);
+          if (!code.empty()) functions.push_back(line_directive(tok) + code);
         } else if (tok.type == TT::LINK) {
           advance();
           Token ft = expect(TT::STRING, true);
@@ -2810,6 +3431,7 @@ int main(int argc, char **argv) {
   bool manual_main = false;
   bool priCMD = false;
   bool dbuild = false;
+  bool line = true;
   auto log = [&](const std::string &s) {
     if (!shut)
       std::cout << s << "\n";
@@ -2830,10 +3452,12 @@ int main(int argc, char **argv) {
       manual_main = true;
     if (a == "-sCMD")
       priCMD = true;
+    if (a == "-noLine" || a == "--noLine")
+      line = false;
   }
 
   if (argc < 3) {
-    log("luabase version 2.9.1 forked from Mebecool1");
+    log("luabase version 2.9.1 Mebecool1");
     die("Usage: luabasec <in.lb> <out> [extra.c] [-lPATH] [-gLIB] [-wLIBDIR] "
         "[-c] [-s] [--asm] [--main]",
         1);

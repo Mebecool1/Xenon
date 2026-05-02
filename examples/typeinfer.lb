@@ -1,4 +1,12 @@
-link "MathGraphic.lh"
-link "Math.lh"
-let x = v4(1,2,3,5)
-println(sizeof(x), ", ", typeof(x))
+function float foo(let x, let y, let z){
+    if x == 0 then 
+      println("0")
+    else
+      return x+y+z
+    end
+    return 0
+}
+let x = foo(1,2,3)
+let y = foo(0.1, 2.3, 3)
+println(x)
+println(y)
