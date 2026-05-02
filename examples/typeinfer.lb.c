@@ -35,28 +35,15 @@ static inline void _lb_throw(const char* msg) {
 }
 #endif /* __LUABASE_RUNTIME__ */
 
-float foo__int__int__int(int x, int y, int z) {
-    if ((x==0)) {
-    printf("%s",TO_STR("0")); printf("\n");
-} else {
-    return ((x+y)+z);
-}
-    return 0;
+float foo__int__float(float x, float y) {
+    return (((x==0)?1:(x+y)));
 }
 
-float foo__float__float__int(float x, float y, float z) {
-    if ((x==0)) {
-    printf("%s",TO_STR("0")); printf("\n");
-} else {
-    return ((x+y)+z);
-}
-    return 0;
+int foo__int__int(int x, int y) {
+    return (((x==0)?1:(x+y)));
 }
 
 int main(int argc, char** argv) {
-    float x = foo__int__int__int(1, 2, 3);
-    float y = foo__float__float__int(0.1, 2.3, 3);
-    printf("%s",TO_STR(x)); printf("\n");
-    printf("%s",TO_STR(y)); printf("\n");
+    printf("%s",TO_STR(foo__int__float(1, 67.11))); printf("%s",TO_STR(", ")); printf("%s",TO_STR(foo__int__int(4, 2))); printf("\n");
     return 0;
 }

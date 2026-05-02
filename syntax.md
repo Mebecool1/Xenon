@@ -100,6 +100,13 @@ $$
 \quad \text{return fib(n-1) + fib(n-2)} \\
 \text{\}} \\ \\
 \text{inline function float square(float f) \{ return f * f \}}
+\\
+\text{You can also use let/var in functions!}
+\\\\
+\text{function let fib(let n) \{
+\text{    insert code here    }
+
+}
 \end{array}
 $$
 
@@ -171,9 +178,9 @@ $$
 $$
 \text{easiest way:}
 \\
-bash \to install.sh
+bash \to remove.sh
 \\
-exact\ command \to \text{"./install.sh"}
+exact\ command \to \text{"./remove.sh"}
 $$
 ---
 ## 11. Standard Library

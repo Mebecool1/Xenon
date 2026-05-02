@@ -1,12 +1,4 @@
-function float foo(let x, let y, let z){
-    if x == 0 then 
-      println("0")
-    else
-      return x+y+z
-    end
-    return 0
+function let foo(let x, let y){
+  return (x == 0 ? 1 : x + y)
 }
-let x = foo(1,2,3)
-let y = foo(0.1, 2.3, 3)
-println(x)
-println(y)
+println(foo(1,67.11), ", ", foo(4,2))

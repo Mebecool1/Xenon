@@ -6,3 +6,5 @@ typeinfer_debug.c
 hexamplesh/*
 examples/.*
 typeinfer_debug.c.sig
+examples/mass.lh.c
+examples/mass.lb.c

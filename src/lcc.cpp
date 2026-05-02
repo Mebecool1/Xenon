@@ -1,8 +1,4 @@
-// luabasec.cpp — LuaBase transpiler, fully standalone C++
-// Build: g++ -o lcc lcc.cpp -O2 -std=c++17
-//
-// Converted from Python implementation. All features F01-F30 preserved.
-// All bug fixes BUG-A through BUG-M preserved.
+
 
 #include <algorithm>
 #include <cassert>
@@ -16,6 +12,8 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <queue>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -3249,6 +3247,77 @@ class CTranspiler {
     this->_lh_included = lh._lh_included;
   }
 
+  // -----------------------------------------------------------------------
+  // DCE: Dead Code Elimination — remove unused functions and specializations
+  // -----------------------------------------------------------------------
+  std::set<std::string> extract_called_functions(const std::vector<std::string> &code_lines) {
+    std::set<std::string> called;
+    // Simple pattern: look for identifier followed by (
+    std::regex func_call_pattern(R"(\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\()");
+    for (const auto &line : code_lines) {
+      std::sregex_iterator it(line.begin(), line.end(), func_call_pattern);
+      std::sregex_iterator end;
+      while (it != end) {
+        called.insert((*it)[1].str());
+        ++it;
+      }
+    }
+    return called;
+  }
+
+  std::vector<std::string> eliminate_dead_functions(const std::vector<std::string> &funcs,
+                                                     const std::set<std::string> &called_from_main) {
+    std::vector<std::string> result;
+    std::set<std::string> reachable;
+    std::set<std::string> visited;
+    
+    // BFS to find all reachable functions from main
+    std::queue<std::string> worklist;
+    for (const auto &fname : called_from_main)
+      worklist.push(fname);
+    
+    // First pass: collect all function names and their bodies
+    std::map<std::string, std::string> func_map;
+    for (const auto &func : funcs) {
+      std::regex name_pattern(R"(^[^\(]*\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\()");
+      std::smatch m;
+      if (std::regex_search(func, m, name_pattern)) {
+        func_map[m[1].str()] = func;
+      }
+    }
+    
+    // BFS: follow function calls
+    while (!worklist.empty()) {
+      std::string fname = worklist.front();
+      worklist.pop();
+      if (visited.count(fname)) continue;
+      visited.insert(fname);
+      reachable.insert(fname);
+      
+      auto it = func_map.find(fname);
+      if (it != func_map.end()) {
+        auto called = extract_called_functions({it->second});
+        for (const auto &callee : called) {
+          if (!visited.count(callee) && func_map.count(callee)) {
+            worklist.push(callee);
+          }
+        }
+      }
+    }
+    
+    // Emit only reachable functions
+    for (const auto &func : funcs) {
+      std::regex name_pattern(R"(^[^\(]*\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\()");
+      std::smatch m;
+      if (std::regex_search(func, m, name_pattern)) {
+        if (reachable.count(m[1].str())) {
+          result.push_back(func);
+        }
+      }
+    }
+    return result;
+  }
+
 public:
   explicit CTranspiler(std::vector<Token> toks) : tokens(std::move(toks)) {
     // build default headers block
@@ -3379,8 +3448,15 @@ public:
     }
 
     std::string body_str = join(main_body, "\n    ");
+    
+    // -----------------------------------------------------------------------
+    // DCE Pass: eliminate functions not reachable from main
+    // -----------------------------------------------------------------------
+    std::set<std::string> called_in_main = extract_called_functions(main_body);
+    std::vector<std::string> live_functions = eliminate_dead_functions(functions, called_in_main);
+    
     std::string res = join(headers, "\n") + "\n";
-    res += join(functions, "\n") + "\n";
+    res += join(live_functions, "\n") + "\n";
     if (manual_main) {
       if (!main_body.empty())
         res += "/* [LuaBase] -main mode: top-level statements outside "
