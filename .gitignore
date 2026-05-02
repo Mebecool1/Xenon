@@ -8,3 +8,4 @@ examples/.*
 typeinfer_debug.c.sig
 examples/mass.lh.c
 examples/mass.lb.c
+*_debug

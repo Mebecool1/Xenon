@@ -1,4 +1,25 @@
 function let foo(let x, let y){
-  return (x == 0 ? 1 : x + y)
+  return (x == 0 ? 1 : x + *y)
 }
-println(foo(1,67.11), ", ", foo(4,2))
+function let updateValue(let val){
+  if *val != 5 then return 1 end
+  *val = 20
+  return 0
+}
+
+let y = 5
+float xh = 2.1
+let wda = foo(1, &xh)
+
+println(wda)
+println("--")
+let xz = foo(1, &y)
+println(xz)
+let vb = 5
+let ptr_to_vb = &vb
+updateValue(ptr_to_vb)
+println(vb)
+vb -= 2
+println(vb)
+
+

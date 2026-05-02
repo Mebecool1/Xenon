@@ -35,15 +35,38 @@ static inline void _lb_throw(const char* msg) {
 }
 #endif /* __LUABASE_RUNTIME__ */
 
-float foo__int__float(float x, float y) {
-    return (((x==0)?1:(x+y)));
+void addValue(int* thing, int val) {
+    *thing = (((int)(*(thing)))+val);
 }
 
-int foo__int__int(int x, int y) {
-    return (((x==0)?1:(x+y)));
+float foo__int__float_(float x, float* y) {
+    return (((x==0)?1:(x+*(y))));
+}
+
+int foo__int__int_(int x, int* y) {
+    return (((x==0)?1:(x+*(y))));
+}
+
+int updateValue__int_(int* val) {
+    if ((*(val)!=5)) {
+    return 1;
+}
+    *val = 20;
+    return 0;
 }
 
 int main(int argc, char** argv) {
-    printf("%s",TO_STR(foo__int__float(1, 67.11))); printf("%s",TO_STR(", ")); printf("%s",TO_STR(foo__int__int(4, 2))); printf("\n");
+    int y = 5;
+    float xh = 2.1;
+    float wda = foo__int__float_(1, &xh);
+    addValue(&wda, 2);
+    printf("%s",TO_STR(wda)); printf("\n");
+    printf("%s",TO_STR("--")); printf("\n");
+    int xz = foo__int__int_(1, &y);
+    printf("%s",TO_STR(xz)); printf("\n");
+    int vb = 5;
+    int* ptr_to_vb = &vb;
+    updateValue__int_(ptr_to_vb);
+    printf("%s",TO_STR(vb)); printf("\n");
     return 0;
 }

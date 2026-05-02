@@ -1,5 +1,3 @@
-
-
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
@@ -678,6 +676,14 @@ class CTranspiler {
   std::map<std::string, std::map<std::string,std::string>>   mono_registry;
   // prevent re-entrant instantiation of same specialization
   std::set<std::string> _mono_in_progress;
+  int _mono_depth{0};           // guards against indirect recursive template loops
+  static constexpr int _mono_max_depth = 64;
+
+  // DCE: call-graph built during parsing (no regex on output strings)
+  // "__main__" is the synthetic root for top-level statements
+  std::string _cur_func{"__main__"};
+  std::string _cur_func_ret{"int"};  // C return type of current function
+  std::map<std::string, std::set<std::string>> _callees;
 
   std::set<std::string> _handle_declared;
   std::set<std::string> _lh_included;
@@ -704,14 +710,23 @@ class CTranspiler {
 
   std::string safe_name(const std::string &name) {
     static const std::set<std::string> c_keywords = {
-        "double",   "int",      "float",    "char",     "while",    "if",
-        "return",   "break",    "FILE",     "long",     "void",     "short",
-        "__m256",   "__m256i",  "for",      "do",       "else",     "struct",
-        "typedef",  "switch",   "case",     "default",  "const",    "static",
-        "unsigned", "signed",   "extern",   "goto",     "sizeof",   "enum",
-        "union",    "continue", "register", "volatile", "auto",     "bool",
-        "true",     "false",    "NULL",     "uint8_t",  "uint32_t", "uint64_t",
-        "inline", "auto"
+        // C89/C99/C11 keywords
+        "auto",       "break",      "case",       "char",       "const",
+        "continue",   "default",    "do",         "double",     "else",
+        "enum",       "extern",     "float",      "for",        "goto",
+        "if",         "inline",     "int",        "long",       "register",
+        "restrict",   "return",     "short",      "signed",     "sizeof",
+        "static",     "struct",     "switch",     "typedef",    "union",
+        "unsigned",   "void",       "volatile",   "while",
+        // C11 keywords
+        "_Alignas",   "_Alignof",   "_Atomic",    "_Bool",      "_Complex",
+        "_Generic",   "_Imaginary", "_Noreturn",  "_Static_assert", "_Thread_local",
+        // common macros / types that collide
+        "bool",       "true",       "false",      "NULL",
+        "uint8_t",    "uint16_t",   "uint32_t",   "uint64_t",
+        "int8_t",     "int16_t",    "int32_t",    "int64_t",
+        "size_t",     "ssize_t",    "ptrdiff_t",  "FILE",
+        "__m256",     "__m256i",    "__m128",      "__m128i",
     };
     return c_keywords.count(name) ? "var_" + name : name;
   }
@@ -747,8 +762,25 @@ class CTranspiler {
                            name_tok.line, name_tok.col);
       std::string m = expect(TT::IDENTIFIER, false).value;
       if (current().type == TT::ASSIGN) {
+        Token eq_tok = current();
         advance();
-        members.push_back(m + " = " + parse_expr());
+        Token val_tok = current();
+        std::string val = parse_expr();
+        // Reject string literals and float literals as enum values
+        if (val_tok.type == TT::STRING)
+          throw LuaBaseError("TypeError",
+                             "enum '" + enum_name + "' member '" + m +
+                                 "' cannot be assigned a string value",
+                             val_tok.line, val_tok.col);
+        if (val_tok.type == TT::NUMBER &&
+            (val_tok.value.find('.') != std::string::npos ||
+             val_tok.value.find('e') != std::string::npos ||
+             val_tok.value.find('E') != std::string::npos))
+          throw LuaBaseError("TypeError",
+                             "enum '" + enum_name + "' member '" + m +
+                                 "' cannot be assigned a floating-point value",
+                             val_tok.line, val_tok.col);
+        members.push_back(m + " = " + val);
       } else {
         members.push_back(m);
       }
@@ -968,7 +1000,8 @@ class CTranspiler {
     }
     if (current().type == TT::MULTIPLY) {
       advance();
-      return "*" + safe_name(expect(TT::IDENTIFIER, false).value);
+      // Allow *(expr) or *ident — parse_power handles both
+      return "*(" + parse_power() + ")";
     }
     if (current().type == TT::INCR) {
       advance();
@@ -1028,9 +1061,23 @@ class CTranspiler {
     if (t.type == TT::CAST) {
       advance();
       expect(TT::LPAREN, false);
+      Token type_tok = current();
+      // Valid cast targets: built-in type keywords, ptr, or known struct/enum names
+      static const std::set<TT> valid_cast_types = {
+          TT::INT,    TT::FLOAT,  TT::DOUBLE, TT::LONG,   TT::SHORT,
+          TT::CHAR_KW,TT::BOOL_KW,TT::VOID,   TT::U8,     TT::U32,
+          TT::U64,    TT::PTR,    TT::IDENTIFIER};
+      if (!valid_cast_types.count(type_tok.type))
+        throw LuaBaseError("TypeError",
+                           "cast: expected a type name, got '" + type_tok.value + "'",
+                           type_tok.line, type_tok.col);
       std::string tn = advance().value;
-      if (tn == "str")
-        tn = "char*";
+      if (tn == "str") tn = "char*";
+      else if (tn == "ptr") {
+        std::string inner_t = advance().value;
+        if (inner_t == "str") inner_t = "char*";
+        tn = inner_t + "*";
+      }
       expect(TT::COMMA, false);
       std::string inner = parse_expr();
       expect(TT::RPAREN, false);
@@ -1642,7 +1689,9 @@ class CTranspiler {
     // Re-entrancy guard (recursive templates would loop)
     std::string guard_key = fname + "@" + key;
     if (_mono_in_progress.count(guard_key)) return fname;
+    if (_mono_depth >= _mono_max_depth) return fname; // indirect recursion cutoff
     _mono_in_progress.insert(guard_key);
+    _mono_depth++;
 
     std::string mangled = mono_mangle(fname, concrete_types);
     reg[key] = mangled; // register early to handle recursion
@@ -1731,6 +1780,7 @@ class CTranspiler {
     // Restore parser state
     pos = saved_pos;
     var_types = saved_var_types;
+    _mono_depth--;
     _mono_in_progress.erase(guard_key);
     return mangled;
   }
@@ -1792,6 +1842,7 @@ class CTranspiler {
       // zero-arg template — instantiate with empty specialization
       call_name = instantiate_template(fname, {});
     }
+    _callees[_cur_func].insert(call_name);
     return call_name + "(" + join(args, ", ") + ")";
   }
 
@@ -1892,6 +1943,11 @@ class CTranspiler {
 
     // GLOBAL
     if (t.type == TT::GLOBAL_KW) {
+      if (_cur_func != "__main__")
+        throw LuaBaseError("SyntaxError",
+                           "'global' cannot be used inside function '" + _cur_func +
+                               "' — move it to top-level scope",
+                           t.line, t.col);
       advance();
       std::string decl = parse_statement();
       if (!decl.empty())
@@ -2215,6 +2271,7 @@ class CTranspiler {
       advance();
       std::string cond = parse_expr();
       expect(TT::THEN, false);
+      auto scope0 = var_types;
       std::vector<std::string> body;
       while (current().type != TT::ELSEIF && current().type != TT::ELSE &&
              current().type != TT::END && current().type != TT::TEOF) {
@@ -2225,12 +2282,14 @@ class CTranspiler {
       }
       if (current().type == TT::TEOF)
         throw LuaBaseError("SyntaxError", "Unterminated 'if'", t.line, t.col);
+      var_types = scope0;
 
       std::vector<std::string> elseif_parts;
       while (current().type == TT::ELSEIF) {
         Token ei = advance();
         std::string ce = parse_expr();
         expect(TT::THEN, false);
+        auto scope_ei = var_types;
         std::vector<std::string> be;
         while (current().type != TT::ELSEIF && current().type != TT::ELSE &&
                current().type != TT::END && current().type != TT::TEOF) {
@@ -2242,12 +2301,14 @@ class CTranspiler {
         if (current().type == TT::TEOF)
           throw LuaBaseError("SyntaxError", "Unterminated 'elseif'", ei.line,
                              ei.col);
+        var_types = scope_ei;
         elseif_parts.push_back("} else if (" + ce + ") {\n" + join(be, "\n"));
       }
 
       std::string else_part;
       if (current().type == TT::ELSE) {
         advance();
+        auto scope_else = var_types;
         std::vector<std::string> eb;
         while (current().type != TT::END && current().type != TT::TEOF) {
           Token tok2 = current();
@@ -2255,6 +2316,7 @@ class CTranspiler {
           if (!s.empty())
             eb.push_back(line_directive(tok2) + "    " + s);
         }
+        var_types = scope_else;
         else_part = " else {\n" + join(eb, "\n") + "\n}";
       }
       expect(TT::END, false);
@@ -2274,6 +2336,7 @@ class CTranspiler {
       advance();
       std::string cond = parse_expr();
       expect(TT::DO, false);
+      auto scope_w = var_types;
       std::vector<std::string> body;
       while (current().type != TT::END && current().type != TT::TEOF) {
         Token tok2 = current();
@@ -2285,6 +2348,7 @@ class CTranspiler {
         throw LuaBaseError("SyntaxError", "Unterminated 'while'", t.line,
                            t.col);
       expect(TT::END, false);
+      var_types = scope_w;
       return "while (" + cond + ") {\n    " + join(body, "    \n") + "\n}";
     }
 
@@ -2302,6 +2366,9 @@ class CTranspiler {
         step = parse_expr();
       }
       expect(TT::DO, false);
+      auto scope_f = var_types;
+      scope_f[var] = "int";   // loop var visible inside, not outside
+      var_types = scope_f;
       std::vector<std::string> body;
       while (current().type != TT::END && current().type != TT::TEOF) {
         Token tok2 = current();
@@ -2312,7 +2379,9 @@ class CTranspiler {
       if (current().type == TT::TEOF)
         throw LuaBaseError("SyntaxError", "Unterminated 'for'", t.line, t.col);
       expect(TT::END, false);
-      var_types[var] = "int";
+      var_types = scope_f;
+      // erase loop var from outer scope
+      var_types.erase(var);
       std::string inner = body.empty() ? "" : join(body, "\n    ");
       return "for(int " + var + "=(" + start +
              ");"
@@ -2345,6 +2414,7 @@ class CTranspiler {
           advance();
           std::string val = parse_expr();
           expect(TT::COLON, false);
+          auto scope_case = var_types;
           std::vector<std::string> stmts;
           while (current().type != TT::CASE &&
                  current().type != TT::DEFAULT_KW &&
@@ -2353,17 +2423,20 @@ class CTranspiler {
             if (!s.empty())
               stmts.push_back("    " + s);
           }
+          var_types = scope_case;
           cases.push_back("case " + val + ":\n" + join(stmts, "\n") +
                           "\n    break;");
         } else if (current().type == TT::DEFAULT_KW) {
           advance();
           if (current().type == TT::COLON)
             advance();
+          auto scope_def = var_types;
           while (current().type != TT::RBRACE && current().type != TT::TEOF) {
             std::string s = parse_statement();
             if (!s.empty())
               default_stmts.push_back("    " + s);
           }
+          var_types = scope_def;
         } else {
           advance();
         }
@@ -2494,7 +2567,13 @@ class CTranspiler {
       if (current().type == TT::END || current().type == TT::RBRACE ||
           current().type == TT::TEOF || current().type == TT::SEMICOLON)
         return "return;";
-      return "return " + parse_expr() + ";";
+      std::string expr = parse_expr();
+      // Warn: void function returning a value
+      if (_cur_func_ret == "void")
+        throw LuaBaseError("TypeError",
+                           "function '" + _cur_func + "' is declared void but returns a value",
+                           t.line, t.col);
+      return "return " + expr + ";";
     }
 
     // prefix ++ / --
@@ -2766,6 +2845,10 @@ class CTranspiler {
     func_return_types[fname] = infer_ret ? "__infer__" : raw_ret;
     expect(TT::LPAREN, false);
 
+    std::string saved_cur_func = _cur_func;
+    std::string saved_cur_func_ret = _cur_func_ret;
+    _cur_func = fname;
+    _cur_func_ret = ""; // resolved after ret_type is finalised below
     auto saved_var_types = var_types;
 
     // -----------------------------------------------------------------------
@@ -2900,6 +2983,8 @@ class CTranspiler {
       tmpl.tok_start = 0; // placeholder — filled by caller
       template_funcs[fname] = tmpl;
       var_types = saved_var_types;
+      _cur_func = saved_cur_func;
+      _cur_func_ret = saved_cur_func_ret;
       // Signal to caller with the fname so it can fill tok_start
       return "__TEMPLATE__" + fname;
     }
@@ -2944,6 +3029,8 @@ class CTranspiler {
         func_return_types[fname] = ret_type;
       }
     }
+    // Record for the return-statement validator
+    _cur_func_ret = ret_type;
 
     // -----------------------------------------------------------------------
     // Build params vector for C declaration
@@ -2970,11 +3057,15 @@ class CTranspiler {
     }
     if (current().type == TT::TEOF) {
       var_types = saved_var_types;
+      _cur_func = saved_cur_func;
+      _cur_func_ret = saved_cur_func_ret;
       throw LuaBaseError("SyntaxError", "Unterminated function '" + fname + "'",
                          fn_tok.line, fn_tok.col);
     }
     expect(TT::RBRACE, false);
     var_types = saved_var_types;
+    _cur_func = saved_cur_func;
+    _cur_func_ret = saved_cur_func_ret;
 
     return ret_type + " " + fname + "(" + join(params, ", ") + ") {\n" +
            join(body, "\n") + "\n}\n";
@@ -3238,76 +3329,68 @@ class CTranspiler {
     for (auto const &[name, tmpl] : lh.template_funcs) {
       this->template_funcs[name] = tmpl;
     }
+    // Merge call-graph edges so DCE sees calls made inside .lh functions
+    for (auto const &[caller, callees] : lh._callees) {
+      for (const auto &callee : callees)
+        this->_callees[caller].insert(callee);
+    }
     this->_lh_included = lh._lh_included;
   }
 
   // -----------------------------------------------------------------------
-  // DCE: Dead Code Elimination — remove unused functions and specializations
+  // DCE: Dead Code Elimination — call-graph built during parsing via _callees.
+  // No regex on generated strings; edges are recorded by emit_call().
   // -----------------------------------------------------------------------
-  std::set<std::string> extract_called_functions(const std::vector<std::string> &code_lines) {
-    std::set<std::string> called;
-    // Simple pattern: look for identifier followed by (
-    std::regex func_call_pattern(R"(\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\()");
-    for (const auto &line : code_lines) {
-      std::sregex_iterator it(line.begin(), line.end(), func_call_pattern);
-      std::sregex_iterator end;
-      while (it != end) {
-        called.insert((*it)[1].str());
-        ++it;
-      }
+
+  // Collect all functions reachable from a set of seed names via BFS.
+  std::set<std::string> reachable_from(const std::set<std::string> &seeds) {
+    std::set<std::string> visited;
+    std::queue<std::string> worklist;
+    for (const auto &s : seeds)
+      worklist.push(s);
+    while (!worklist.empty()) {
+      std::string fn = worklist.front(); worklist.pop();
+      if (!visited.insert(fn).second) continue;
+      auto it = _callees.find(fn);
+      if (it != _callees.end())
+        for (const auto &callee : it->second)
+          if (!visited.count(callee))
+            worklist.push(callee);
     }
-    return called;
+    return visited;
   }
 
-  std::vector<std::string> eliminate_dead_functions(const std::vector<std::string> &funcs,
-                                                     const std::set<std::string> &called_from_main) {
+  std::vector<std::string> eliminate_dead_functions(
+      const std::vector<std::string> &funcs,
+      const std::set<std::string> & /*unused — kept for call-site compat*/) {
+    // Seed: everything called from top-level (main body) context.
+    std::set<std::string> seeds;
+    auto mit = _callees.find("__main__");
+    if (mit != _callees.end())
+      seeds = mit->second;
+
+    std::set<std::string> live = reachable_from(seeds);
+
+    // Extract each function's name from its first line
+    // (format: "<ret> <name>(" produced by parse_function_body)
+    // We scan only to the first '(' on the first line — no multi-line regex.
     std::vector<std::string> result;
-    std::set<std::string> reachable;
-    std::set<std::string> visited;
-    
-    // BFS to find all reachable functions from main
-    std::queue<std::string> worklist;
-    for (const auto &fname : called_from_main)
-      worklist.push(fname);
-    
-    // First pass: collect all function names and their bodies
-    std::map<std::string, std::string> func_map;
     for (const auto &func : funcs) {
-      std::regex name_pattern(R"(^[^\(]*\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\()");
-      std::smatch m;
-      if (std::regex_search(func, m, name_pattern)) {
-        func_map[m[1].str()] = func;
-      }
-    }
-    
-    // BFS: follow function calls
-    while (!worklist.empty()) {
-      std::string fname = worklist.front();
-      worklist.pop();
-      if (visited.count(fname)) continue;
-      visited.insert(fname);
-      reachable.insert(fname);
-      
-      auto it = func_map.find(fname);
-      if (it != func_map.end()) {
-        auto called = extract_called_functions({it->second});
-        for (const auto &callee : called) {
-          if (!visited.count(callee) && func_map.count(callee)) {
-            worklist.push(callee);
-          }
-        }
-      }
-    }
-    
-    // Emit only reachable functions
-    for (const auto &func : funcs) {
-      std::regex name_pattern(R"(^[^\(]*\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\()");
-      std::smatch m;
-      if (std::regex_search(func, m, name_pattern)) {
-        if (reachable.count(m[1].str())) {
-          result.push_back(func);
-        }
-      }
+      // Find first '(' to delimit the name search
+      size_t paren = func.find('(');
+      if (paren == std::string::npos) { result.push_back(func); continue; }
+      // Walk backwards from paren skipping whitespace to find name end
+      size_t name_end = paren;
+      while (name_end > 0 && func[name_end - 1] == ' ') name_end--;
+      // Walk further back to find name start
+      size_t name_start = name_end;
+      while (name_start > 0 &&
+             (std::isalnum((unsigned char)func[name_start - 1]) ||
+              func[name_start - 1] == '_'))
+        name_start--;
+      std::string fn_name = func.substr(name_start, name_end - name_start);
+      if (fn_name.empty() || live.count(fn_name))
+        result.push_back(func);
     }
     return result;
   }
@@ -3445,9 +3528,9 @@ public:
     
     // -----------------------------------------------------------------------
     // DCE Pass: eliminate functions not reachable from main
+    // Call-graph was built during parsing via _callees; no string scanning needed.
     // -----------------------------------------------------------------------
-    std::set<std::string> called_in_main = extract_called_functions(main_body);
-    std::vector<std::string> live_functions = eliminate_dead_functions(functions, called_in_main);
+    std::vector<std::string> live_functions = eliminate_dead_functions(functions, {});
     
     std::string res = join(headers, "\n") + "\n";
     res += join(live_functions, "\n") + "\n";
@@ -3685,7 +3768,7 @@ int main(int argc, char **argv) {
     clang_args.push_back(ci);
   if (!dbuild) {
     clang_args.push_back("-ffast-math");
-    clang_args.push_back("-march=native");
+    clang_args.push_back("-march=x86-64-v3");
     clang_args.push_back("-w");
     clang_args.push_back("-O3");
     clang_args.push_back("-fuse-ld=lld");
