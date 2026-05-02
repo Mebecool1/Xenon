@@ -1654,17 +1654,11 @@ class CTranspiler {
     // Seek to template body start
     pos = tmpl.tok_start;
 
-    // Pre-seed param types in var_types so body-scan inference sees concrete types.
-    // We'll replay the param list, substituting concrete types for let/var slots.
-    // Skip past return type token(s)
-    // (tok_start points at the return-type token; we re-parse from there)
-
-    // Build a mapping: param_name → concrete_type  by peeking at param list
-    // We need to advance past ret-type to get to fname, then LPAREN, then params.
+    
     {
-      // parse ret type (skip, we'll use infer_ret logic below)
+      
       size_t scan = pos;
-      // skip return type (may be "ptr X" = 2 tokens, or 1 token)
+      
       std::string raw_r = tokens[scan].value; scan++;
       if (raw_r == "let" || raw_r == "var") { /* inferred */ }
       else if (raw_r == "ptr") { scan++; } // ptr X
