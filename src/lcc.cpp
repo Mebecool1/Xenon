@@ -683,6 +683,10 @@ class CTranspiler {
     std::string raw_ret; // "let","var","int","float",...
     struct ParamSlot { std::string raw; bool infer; bool is_array; };
     std::vector<ParamSlot> param_slots;
+    // When merged from a sub-transpiler (.lh file), store the token range
+    // so instantiation doesn't depend on invalid indices in parent's token stream
+    std::vector<Token> extracted_tokens;
+    bool has_extracted = false;
   };
   std::map<std::string, TemplateFunc>                        template_funcs;
   std::map<std::string, std::map<std::string,std::string>>   mono_registry;
@@ -691,11 +695,8 @@ class CTranspiler {
   int _mono_depth{0};           // guards against indirect recursive template loops
   static constexpr int _mono_max_depth = 64;
 
-  // DCE: call-graph built during parsing (no regex on output strings)
-  // "__main__" is the synthetic root for top-level statements
   std::string _cur_func{"__main__"};
   std::string _cur_func_ret{"int"};  // C return type of current function
-  std::map<std::string, std::set<std::string>> _callees;
 
   std::set<std::string> _handle_declared;
   std::set<std::string> _lh_included;
@@ -1738,9 +1739,16 @@ class CTranspiler {
     // Save current parser state
     size_t saved_pos = pos;
     auto saved_var_types = var_types;
+    auto saved_tokens = tokens; // save in case we switch to extracted tokens
 
-    // Seek to template body start
-    pos = tmpl.tok_start;
+    // If this template came from a .lh file, use its extracted tokens instead
+    // of invalid indices into parent's token stream
+    if (tmpl.has_extracted && !tmpl.extracted_tokens.empty()) {
+      tokens = tmpl.extracted_tokens;
+      pos = 0; // start from beginning of extracted tokens
+    } else {
+      pos = tmpl.tok_start; // use original indices (for non-merged templates)
+    }
 
     
     {
@@ -1796,10 +1804,13 @@ class CTranspiler {
     // The fname token is at tok_start + (1 or 2 for ret) + (1 for [N]?) tokens.
     // Simpler: find the IDENTIFIER token that is the function name.
     {
-      size_t scan = tmpl.tok_start;
+      size_t tok_start_idx = tmpl.has_extracted ? 0 : tmpl.tok_start;
+      size_t scan = tok_start_idx;
       // skip ret type
-      std::string raw_r2 = tokens[scan].value; scan++;
-      if (raw_r2 == "ptr") scan++;
+      if (scan < tokens.size()) {
+        std::string raw_r2 = tokens[scan].value; scan++;
+        if (raw_r2 == "ptr" && scan < tokens.size()) scan++;
+      }
       if (scan < tokens.size() && tokens[scan].type == TT::LSBRACKET) {
         scan++;
         while (scan < tokens.size() && tokens[scan].type != TT::RSBRACKET) scan++;
@@ -1809,7 +1820,7 @@ class CTranspiler {
       if (scan < tokens.size() && tokens[scan].type == TT::IDENTIFIER) {
         std::string orig_fname = tokens[scan].value;
         tokens[scan].value = mangled; // temporarily rename
-        pos = tmpl.tok_start;
+        pos = tok_start_idx;
         std::string code = parse_function_body(tokens[scan], tmpl.inl);
         tokens[scan].value = orig_fname; // restore
         functions.push_back(code);
@@ -1817,6 +1828,7 @@ class CTranspiler {
     }
 
     // Restore parser state
+    tokens = saved_tokens; // restore original token stream
     pos = saved_pos;
     var_types = saved_var_types;
     _mono_depth--;
@@ -1880,7 +1892,6 @@ class CTranspiler {
       // zero-arg template — instantiate with empty specialization
       call_name = instantiate_template(fname, {});
     }
-    _callees[_cur_func].insert(call_name);
     return call_name + "(" + join(args, ", ") + ")";
   }
 
@@ -3345,6 +3356,19 @@ class CTranspiler {
         lh.advance();
         std::string code = lh.emit_function(lt, false);
         if (!code.empty()) functions.push_back(lh.line_directive(lt) + code);
+        // If emit_function detected a template, it patched tok_start in lh.template_funcs.
+        // Extract tokens from the template for cross-module portability.
+        if (!code.empty() || code == "") { // even if empty (templates return "")
+          // Find the most recently added template in lh and extract its tokens
+          for (auto &[tname, tmpl] : lh.template_funcs) {
+            if (tmpl.has_extracted) continue; // already extracted
+            if (tmpl.tok_start > 0 && tmpl.tok_end <= lh.tokens.size()) {
+              tmpl.extracted_tokens.assign(lh.tokens.begin() + tmpl.tok_start, 
+                                           lh.tokens.begin() + tmpl.tok_end);
+              tmpl.has_extracted = !tmpl.extracted_tokens.empty();
+            }
+          }
+        }
       } else if (lt.type == TT::INLINE_KW) {
         lh.advance();
         if (lh.current().type != TT::FUNCTION)
@@ -3354,6 +3378,15 @@ class CTranspiler {
         lh.advance();
         std::string code = lh.emit_function(lt, true);
         if (!code.empty()) functions.push_back(lh.line_directive(lt) + code);
+        // Extract tokens from any newly-registered templates
+        for (auto &[tname, tmpl] : lh.template_funcs) {
+          if (tmpl.has_extracted) continue;
+          if (tmpl.tok_start > 0 && tmpl.tok_end <= lh.tokens.size()) {
+            tmpl.extracted_tokens.assign(lh.tokens.begin() + tmpl.tok_start, 
+                                         lh.tokens.begin() + tmpl.tok_end);
+            tmpl.has_extracted = !tmpl.extracted_tokens.empty();
+          }
+        }
       } else if (lt.type == TT::TYPE) {
         headers.push_back(lh.line_directive(lt) + lh.parse_type_definition());
       } else if (lt.type == TT::ENUM_KW) {
@@ -3390,73 +3423,16 @@ class CTranspiler {
     for (auto const &[name, type_str] : lh.func_return_types) {
       this->func_return_types[name] = type_str;
     }
+    for (auto const &[name, ptypes] : lh.func_param_types) {
+      this->func_param_types[name] = ptypes;
+    }
+    for (auto const &[sname, fields] : lh.struct_field_types) {
+      this->struct_field_types[sname] = fields;
+    }
     for (auto const &[name, tmpl] : lh.template_funcs) {
       this->template_funcs[name] = tmpl;
     }
-    // Merge call-graph edges so DCE sees calls made inside .lh functions
-    for (auto const &[caller, callees] : lh._callees) {
-      for (const auto &callee : callees)
-        this->_callees[caller].insert(callee);
-    }
     this->_lh_included = lh._lh_included;
-  }
-
-  // -----------------------------------------------------------------------
-  // DCE: Dead Code Elimination — call-graph built during parsing via _callees.
-  // No regex on generated strings; edges are recorded by emit_call().
-  // -----------------------------------------------------------------------
-
-  // Collect all functions reachable from a set of seed names via BFS.
-  std::set<std::string> reachable_from(const std::set<std::string> &seeds) {
-    std::set<std::string> visited;
-    std::queue<std::string> worklist;
-    for (const auto &s : seeds)
-      worklist.push(s);
-    while (!worklist.empty()) {
-      std::string fn = worklist.front(); worklist.pop();
-      if (!visited.insert(fn).second) continue;
-      auto it = _callees.find(fn);
-      if (it != _callees.end())
-        for (const auto &callee : it->second)
-          if (!visited.count(callee))
-            worklist.push(callee);
-    }
-    return visited;
-  }
-
-  std::vector<std::string> eliminate_dead_functions(
-      const std::vector<std::string> &funcs,
-      const std::set<std::string> & /*unused — kept for call-site compat*/) {
-    // Seed: everything called from top-level (main body) context.
-    std::set<std::string> seeds;
-    auto mit = _callees.find("__main__");
-    if (mit != _callees.end())
-      seeds = mit->second;
-
-    std::set<std::string> live = reachable_from(seeds);
-
-    // Extract each function's name from its first line
-    // (format: "<ret> <name>(" produced by parse_function_body)
-    // We scan only to the first '(' on the first line — no multi-line regex.
-    std::vector<std::string> result;
-    for (const auto &func : funcs) {
-      // Find first '(' to delimit the name search
-      size_t paren = func.find('(');
-      if (paren == std::string::npos) { result.push_back(func); continue; }
-      // Walk backwards from paren skipping whitespace to find name end
-      size_t name_end = paren;
-      while (name_end > 0 && func[name_end - 1] == ' ') name_end--;
-      // Walk further back to find name start
-      size_t name_start = name_end;
-      while (name_start > 0 &&
-             (std::isalnum((unsigned char)func[name_start - 1]) ||
-              func[name_start - 1] == '_'))
-        name_start--;
-      std::string fn_name = func.substr(name_start, name_end - name_start);
-      if (fn_name.empty() || live.count(fn_name))
-        result.push_back(func);
-    }
-    return result;
   }
 
 public:
@@ -3600,14 +3576,8 @@ public:
 
     std::string body_str = join(main_body, "\n    ");
     
-    // -----------------------------------------------------------------------
-    // DCE Pass: eliminate functions not reachable from main
-    // Call-graph was built during parsing via _callees; no string scanning needed.
-    // -----------------------------------------------------------------------
-    std::vector<std::string> live_functions = eliminate_dead_functions(functions, {});
-    
     std::string res = join(headers, "\n") + "\n";
-    res += join(live_functions, "\n") + "\n";
+    res += join(functions, "\n") + "\n";
     if (manual_main) {
       if (!main_body.empty())
         res += "/* [LuaBase] -main mode: top-level statements outside "

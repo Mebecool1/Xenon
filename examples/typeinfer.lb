@@ -1,3 +1,4 @@
+link "typeinfer.lh"
 function let foo(let x, let y){
   return (x == 0 ? 1 : x + *y)
 }
@@ -21,5 +22,10 @@ updateValue(ptr_to_vb)
 println(vb)
 vb -= 2
 println(vb)
+
+let xwad = 0
+let ywad = giveNumberBackAndUpdate(&xwad)
+println(xwad)
+println(ywad)
 
 
