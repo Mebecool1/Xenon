@@ -1,4 +1,4 @@
-# luaBase (lb) Language Specification v2.7.3
+# xenon (xen) Language Specification v2.7.3
 Please view this file using an actual markdown reader, not the default github markdown preview.
 ---
 ## 1. Installation
@@ -28,7 +28,7 @@ $$
 
 \begin{array}{|l|l|l|}
 \hline
-\mathbf{Category} & \mathbf{luaBase\ Type} & \mathbf{C\ Representation} \\ \hline
+\mathbf{Category} & \mathbf{xenon\ Type} & \mathbf{C\ Representation} \\ \hline
 \text{Integers} & \text{int, short, long} & \text{int, short, long} \\ \hline
 \text{Fixed-Width} & \text{u8, u32, u64} & \text{uint8\_t, uint32\_t, uint64\_t} \\ \hline
 \text{Floating Point} & \text{float, double} & \text{float, double} \\ \hline
@@ -149,19 +149,19 @@ $$
 \text{\} except (str msg) \{} \\
 \quad \text{println("Caught: ", msg)} \\
 \text{\}} \\ \\
-\text{link "math.lh"} \\
+\text{link "math.xen"} \\
 \text{link "stdio.h"}
 \end{array}
 $$
 
 ---
 
-## 9. Compiler Flags (lcc)
+## 9. Compiler Flags (xenc)
 $$
 \begin{array}{|l|l|}
 \hline
 \text{Flag} & \text{Purpose} \\ \hline
-\text{-c} & \text{Keep debug .lb.c file} \\ \hline
+\text{-c} & \text{Keep debug .xen.c file} \\ \hline
 \text{-asm} & \text{Generate assembly code} \\ \hline
 \text{-main} & \text{Skip top-level auto-main} \\ \hline
 \text{-l[path]} & \text{Add include directory} \\ \hline
@@ -189,19 +189,19 @@ $$
 ### Accessing the standard library
 ---
 $$
-\text{Just do: link "library.lh"}\\
+\text{Just do: link "library.xen"}\\
 \text{Standard library is installed when you do ./install.sh}\\
 \text{AUTOMATICALLY!!}
 $$
 ---
-### List of LH files in the standard library:
+### List of XEN files in the standard library:
 $$
 \begin{array}{|l|l|}
 \hline
 \text{Name} & \text{Purpose} \\ \hline
-\text{Math.lh} & \text{General purpose Math library} \\ \hline
-\text{stdlib.lh} & \text{Provide general functions} \\ \hline
-\text{MathGraphic.lh} & \text{Provide Graphical Math functions} \\ \hline
+\text{Math.xen} & \text{General purpose Math library} \\ \hline
+\text{stdlib.xen} & \text{Provide general functions} \\ \hline
+\text{MathGraphic.xen} & \text{Provide Graphical Math functions} \\ \hline
 \end{array}
 
 $$

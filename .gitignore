@@ -1,12 +1,12 @@
 exampleoutputs/*
-examples/stdlibtest.lb.c
+examples/*.lb.c
+examples/*.lh.c
+examples/*.xen.c
 .vscode/*
 reload.sh
 typeinfer_debug.c
 hexamplesh/*
 examples/.*
 typeinfer_debug.c.sig
-examples/mass.lh.c
-examples/mass.lb.c
 *_debug
 examples/typeinfer
