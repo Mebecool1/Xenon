@@ -1,0 +1,8 @@
+link "MathGraphic.xen"
+
+vec3f a = v3(1,2,3)
+printfmt("its: %.2f, %.2f, %.2f\n", a.x, a.y, a.z)
+
+vec3f b = v3(2,3,4)
+vec3f c = vec3mul(a,b)
+printfmt("its mul: %.2f, %.2f, %.2f\n", c.x, c.y, c.z)

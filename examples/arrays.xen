@@ -1,0 +1,31 @@
+function void mains() {
+    # 1. Declare and initialize an integer array
+    int scores[5] = {10, 20, 30, 40, 50}
+    
+    # 2. Declare a string array (char* in C)
+    str labels[3] = {"Alpha", "Beta", "Gamma"}
+
+    print("--- Array Access Test ---", "\n")
+
+    # 3. Test basic indexing
+    print("Score at index 0: ", scores[0], "\n")
+    print("Label at index 2: ", labels[2], "\n")
+
+    # 4. Test Assignment to array members
+    scores[1] = 99
+    print("Updated score at index 1: ", scores[1], "\n")
+
+    print("\n", "--- While Loop Iteration Test ---", "\n")
+
+    # 5. Iteration test
+    int i = 0
+    while i < 5 do
+        print("Index ", i, " value: ", scores[i], "\n")
+        i = i + 1
+    end
+
+    print("\n", "Test Complete.", "\n")
+}
+
+# Entry point call
+mains()

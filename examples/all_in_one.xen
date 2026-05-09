@@ -1,0 +1,70 @@
+# ==========================================
+# xenon All-In-One Feature Showcase
+# Features: Types, Pointers, Arrays, SIMD, and Logic
+# ==========================================
+
+# 1. Define a custom structural type
+type Device {
+    int id
+    float temp
+    str status
+}
+
+# 2. Function showing pointer and struct interaction
+function void update_device(ptr Device d, float new_temp) {
+    # Accessing members via pointer (transpiles to d->temp)
+    d.temp = new_temp
+    
+    if d.temp > 40.0 then
+        d.status = "WARNING: OVERHEAT"
+    else
+        d.status = "STABLE"
+    end
+}
+
+# 3. Main Entry Point
+function int mains() {
+    print("--- Starting xenon System Test ---", "\n")
+
+    # 4. Array and Loop Test (0-indexed)
+    int sensors[4] = {101, 102, 103, 104}
+    int i = 0
+    while i < 4 do
+        print("Initializing Sensor ID: ", sensors[i], "\n")
+        i = i + 1
+    end
+
+    # 5. Struct and Pointer Test
+    Device my_pi
+    my_pi.id = sensors[0]
+    my_pi.temp = 25.5
+    my_pi.status = "IDLE"
+
+    print("\n", "Current State: ", my_pi.status, " (", my_pi.temp, "C)", "\n")
+
+    # Pass by reference using address-of operator
+    update_device(&my_pi, 45.2)
+
+    print("Updated State: ", my_pi.status, " (", my_pi.temp, "C)", "\n")
+
+    # 6. SIMD / AVX2 Test (__m256)
+    # Note: Your transpiler includes <immintrin.h> and _lb_m for printing!
+    print("\n", "--- SIMD / Vector Math Test ---", "\n")
+    
+    
+    __m256 vec = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0}
+    print("AVX2 Vector Data: ", vec, "\n")
+
+    # 7. File I/O Safety Test
+    print("\n", "Logging results to 'system.log'...", "\n")
+    fopen("system.log", "w")
+    fwrite("Log Entry: ")
+    fwrite(my_pi.status)
+    fclose()
+
+    print("Test Complete. Check system.log for details.", "\n")
+    return 0
+}
+
+# Execute the program
+mains()

@@ -1,0 +1,15 @@
+# Pointers and Memory Addresses in xenon
+function void mains() {
+    int secret_code = 42
+    ptr int p = &secret_code
+    
+    print("Original Value: ", secret_code, "\n")
+    print("Address of Value: ", p, "\n")
+    
+    # Modify the value via the pointer
+    *p = 1337
+    
+    print("New Value (via pointer): ", secret_code, "\n")
+}
+
+mains()

@@ -1,0 +1,20 @@
+# Math and Logic Test
+function float square(float x) {
+    return x * x
+}
+
+function void main() {
+    float val = 5.5
+    float result = square(val)
+    
+    print("The square of ", val, " is ", result, "\n")
+
+    # Boolean logic test
+    if result > 25.0 && val < 10.0 then
+        print("Calculation is within the safety range.", "\n")
+    else
+        print("Calculation out of bounds.", "\n")
+    end
+}
+
+main()

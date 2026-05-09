@@ -1,0 +1,7 @@
+function let x(float x, float y){
+  return x+y
+};
+println(x(1,2))
+println(x(1.2, 2.2))
+println(x(1, 2.2))
+
