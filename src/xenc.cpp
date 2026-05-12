@@ -3023,6 +3023,22 @@ class CTranspiler {
     for (auto const &kv : local_var_types)
       var_types[kv.first] = kv.second;
 
+    // Pre-scan: collect let/var local variable types so return-expr inference
+    // can resolve identifiers like `return result` where result = func_call(...)
+    for (size_t i = body_start; i + 3 < body_end; i++) {
+      if (tokens[i].type != TT::LET_KW && tokens[i].type != TT::VAR_KW)
+        continue;
+      // pattern: LET_KW/VAR_KW IDENTIFIER ASSIGN expr
+      if (tokens[i + 1].type != TT::IDENTIFIER)
+        continue;
+      if (tokens[i + 2].type != TT::ASSIGN)
+        continue;
+      std::string vname = tokens[i + 1].value;
+      TypeInfo rhs_ti = infer_type_at(i + 3);
+      if (!rhs_ti.is_unknown())
+        var_types[vname] = rhs_ti.c_type();
+    }
+
     for (size_t i = body_start; i < body_end; i++) {
       if (tokens[i].type != TT::RETURN)
         continue;
@@ -3219,10 +3235,11 @@ class CTranspiler {
       if (pi.infer) {
         // Check if pre-seeded by instantiate_template
         auto vit = var_types.find(pi.name);
-        if (vit != var_types.end() && vit->second != "int") {
-          pi.c_type = raw_to_c(vit->second);
+        if (vit != var_types.end()) {
+          pi.c_type = raw_to_c(vit->second); // covers "int" AND struct types
         } else {
           var_types[pi.name] = "int";
+          pi.c_type = "int";
         }
       } else {
         var_types[pi.name] = pi.is_array ? pi.raw + "_ARRAY" : pi.raw;
