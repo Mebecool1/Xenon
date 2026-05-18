@@ -133,7 +133,20 @@ enum class TT {
   GLOBAL_KW,
   LET_KW,
   VAR_KW,
-
+  OVERLOAD_KW,
+  ADDOP_KW,
+  OPERATOR_KW,
+  ARGS_KW,
+  BINARY_KW,
+  UNARY_KW,
+  ALIAS_KW,
+  PIPE_KW,
+  MATCH_KW,
+  WITH_KW,
+  IN_KW,
+  NAMESPACE_KW,
+  ARE_KW,
+  IGNORE_KW,
 };
 
 static std::string tt_name(TT t) {
@@ -250,7 +263,20 @@ static std::string tt_name(TT t) {
     C(GLOBAL_KW);
     C(LET_KW);
     C(VAR_KW);
-
+    C(OVERLOAD_KW);
+    C(ADDOP_KW);
+    C(OPERATOR_KW);
+    C(ARGS_KW);
+    C(BINARY_KW);
+    C(UNARY_KW);
+    C(ALIAS_KW);
+    C(PIPE_KW);
+    C(MATCH_KW);
+    C(WITH_KW);
+    C(IN_KW);
+    C(NAMESPACE_KW);
+    C(ARE_KW);
+    C(IGNORE_KW);
 #undef C
   default:
     return "UNKNOWN";
@@ -295,6 +321,11 @@ class Lexer {
   std::string src;
   size_t pos{0};
   int line{1}, col{1};
+  // Custom operator symbols registered via addop — checked before the
+  // built-in single/two-char tables so they take priority.
+  std::set<std::string> custom_ops_n; // multi-char custom symbols (2-3+ chars)
+  std::set<std::string> custom_ops_2; // two-char custom symbols
+  std::set<std::string> custom_ops_1; // one-char custom symbols
 
   static const std::map<std::string, TT> &keywords() {
     static std::map<std::string, TT> kw = {
@@ -364,6 +395,20 @@ class Lexer {
         {"global", TT::GLOBAL_KW},
         {"let", TT::LET_KW},
         {"var", TT::VAR_KW},
+        {"overload", TT::OVERLOAD_KW},
+        {"addop", TT::ADDOP_KW},
+        {"operator", TT::OPERATOR_KW},
+        {"args", TT::ARGS_KW},
+        {"binary", TT::BINARY_KW},
+        {"unary", TT::UNARY_KW},
+        {"alias", TT::ALIAS_KW},
+        {"pipe", TT::PIPE_KW},
+        {"match", TT::MATCH_KW},
+        {"with", TT::WITH_KW},
+        {"in", TT::IN_KW},
+        {"namespace", TT::NAMESPACE_KW},
+        {"are", TT::ARE_KW},
+        {"ignore", TT::IGNORE_KW},
 
     };
     return kw;
@@ -388,7 +433,15 @@ class Lexer {
   }
 
 public:
-  explicit Lexer(std::string source) : src(std::move(source)) {}
+  explicit Lexer(std::string source,
+                 std::set<std::string> custom_syms = {})
+      : src(std::move(source)) {
+    for (const auto &sym : custom_syms) {
+      if (sym.size() >= 2) custom_ops_n.insert(sym);
+      if (sym.size() == 2) custom_ops_2.insert(sym);
+      else if (sym.size() == 1) custom_ops_1.insert(sym);
+    }
+  }
 
   std::vector<Token> tokenize() {
     std::vector<Token> tokens;
@@ -512,6 +565,48 @@ public:
         continue;
       }
 
+      // custom two-char operators (registered via addop)
+      if (pos + 1 < src.size()) {
+        std::string d = src.substr(pos, 2);
+        if (custom_ops_2.count(d)) {
+          tokens.emplace_back(TT::IDENTIFIER, d, tok_line, tok_col);
+          advance_char(); advance_char();
+          continue;
+        }
+      }
+      // custom 3-char operators (registered via addop)
+      if (pos + 2 < src.size()) {
+        std::string s3 = src.substr(pos, 3);
+        if (custom_ops_n.count(s3)) {
+          tokens.emplace_back(TT::IDENTIFIER, s3, tok_line, tok_col);
+          advance_char();
+          advance_char();
+          advance_char();
+          continue;
+        }
+      }
+
+      // custom 2-char operators (registered via addop)
+      if (pos + 1 < src.size()) {
+        std::string s2 = src.substr(pos, 2);
+        if (custom_ops_n.count(s2)) {
+          tokens.emplace_back(TT::IDENTIFIER, s2, tok_line, tok_col);
+          advance_char();
+          advance_char();
+          continue;
+        }
+      }
+
+      // custom one-char operators (registered via addop)
+      {
+        std::string s1(1, c);
+        if (custom_ops_1.count(s1)) {
+          tokens.emplace_back(TT::IDENTIFIER, s1, tok_line, tok_col);
+          advance_char();
+          continue;
+        }
+      }
+
       // two-char operators
       if (pos + 1 < src.size()) {
         std::string d = src.substr(pos, 2);
@@ -568,6 +663,40 @@ public:
 // ===========================================================================
 // Helpers
 // ===========================================================================
+
+// Pre-scan source text for  addop operator(SYM)  declarations and return
+// the set of custom symbols so the Lexer can recognise them before parsing.
+// This is a simple regex-free scan — we just look for the literal text
+// "addop" followed (with optional whitespace) by "operator" then "(SYM)".
+static std::set<std::string> prescan_addop_symbols(const std::string &src) {
+  std::set<std::string> syms;
+  size_t p = 0;
+  while (p < src.size()) {
+    // find next occurrence of "addop"
+    size_t found = src.find("addop", p);
+    if (found == std::string::npos) break;
+    p = found + 5; // skip "addop"
+    // skip whitespace
+    while (p < src.size() && std::isspace((unsigned char)src[p])) p++;
+    // must be followed by "operator"
+    if (src.substr(p, 8) != "operator") continue;
+    p += 8;
+    // skip whitespace
+    while (p < src.size() && std::isspace((unsigned char)src[p])) p++;
+    // must be '('
+    if (p >= src.size() || src[p] != '(') continue;
+    p++;
+    // collect chars until ')'
+    std::string sym;
+    while (p < src.size() && src[p] != ')' && src[p] != '\n') {
+      if (!std::isspace((unsigned char)src[p])) sym += src[p];
+      p++;
+    }
+    if (!sym.empty() && sym.size() <= 2) syms.insert(sym);
+  }
+  return syms;
+}
+
 static std::string c_path(const std::string &p) {
   std::string r = p;
   size_t pos = 0;
@@ -727,8 +856,29 @@ class CTranspiler {
   int _mono_depth{0}; // guards against indirect recursive template loops
   static constexpr int _mono_max_depth = 64;
 
+  // Operator overload / custom operator registry ----------------------------
+  // key: symbol string ("+", "-", "<<", etc.)
+  // value: generated C function name
+  struct OverloadEntry {
+    std::string func_name;  // e.g. "_Overload_plus_a_b_int"
+    std::string arg_a;      // first param name used at definition
+    std::string arg_b;      // second param name (empty for unary)
+    std::string ret_type;   // C return type
+    bool is_binary{true};
+  };
+  std::map<std::string, OverloadEntry> _op_overloads;  // symbol → entry
+  // alias registry: alias name → original name
+  std::map<std::string, std::string> _aliases;
+
   std::string _cur_func{"__main__"};
   std::string _cur_func_ret{"int"}; // C return type of current function
+
+  // Namespace support --------------------------------------------------------
+  std::string _cur_namespace{""}; // current namespace being defined
+  // namespace_name → {symbol_name → C_name}  (for lookups)
+  std::map<std::string, std::map<std::string, std::string>> _namespaces;
+  // symbols to make available unqualified (via "ignore namespace")
+  std::set<std::string> _ignored_namespaces;
 
   std::set<std::string> _handle_declared;
   std::set<std::string> _lh_included;
@@ -753,7 +903,7 @@ class CTranspiler {
     return Token(ttype, "", tok.line, tok.col);
   }
 
-  std::string safe_name(const std::string &name) {
+  std::string safe_name(const std::string &name) const {
     static const std::set<std::string> c_keywords = {
         // C89/C99/C11 keywords
         "auto",
@@ -826,6 +976,12 @@ class CTranspiler {
     return c_keywords.count(name) ? "var_" + name : name;
   }
 
+  // Mangle a symbol name with namespace prefix if we're in a namespace
+  std::string mangle_with_ns(const std::string &name) const {
+    if (_cur_namespace.empty()) return safe_name(name);
+    return safe_name(_cur_namespace + "__" + name);
+  }
+
   std::string line_directive(const Token &tok) {
     if (tok.line == 0 || !emit_line_directives)
       return "";
@@ -838,6 +994,331 @@ class CTranspiler {
       if (hh.find(h) != std::string::npos)
         return true;
     return false;
+  }
+
+  // -----------------------------------------------------------------------
+  // Operator overload helpers
+  // -----------------------------------------------------------------------
+  // Convert an operator symbol to a readable C identifier fragment
+  static std::string symbol_to_name(const std::string &sym) {
+    static const std::map<std::string, std::string> table = {
+        {"+", "plus"}, {"-", "minus"}, {"*", "mul"}, {"/", "div"},
+        {"%", "mod"},  {"^", "xor"},   {"==","eq"},   {"!=","ne"},
+        {">", "gt"},   {"<", "lt"},    {">=","ge"},   {"<=","le"},
+        {"<<","shl"},  {">>","shr"},   {"|","bitor"}, {"&","bitand"},
+    };
+    auto it = table.find(sym);
+    if (it != table.end()) return it->second;
+    // For custom symbols not in the table, encode each char as hex
+    std::string r = "op";
+    for (unsigned char c : sym) { char buf[4]; snprintf(buf,4,"%02x",c); r+=buf; }
+    return r;
+  }
+
+  // Parse  operator(SYM)  and return the symbol string
+  std::string parse_op_sym(const Token &kw_tok) {
+    expect(TT::LPAREN, false);
+    // The symbol can be one or two characters; grab until RPAREN
+    std::string sym;
+    while (current().type != TT::RPAREN && current().type != TT::TEOF)
+      sym += advance().value;
+    if (sym.empty())
+      throw XenonError("SyntaxError", "operator() requires a symbol",
+                       kw_tok.line, kw_tok.col);
+    expect(TT::RPAREN, false);
+    return sym;
+  }
+
+  // Parse  args(a:TYPE, b:TYPE)  or  args(a, b)  — returns {name, type} pairs.
+  // Type defaults to empty string; parse_overload fills it from ret_type if absent.
+  // TYPE may include:
+  //   ptr <BASE>   — pointer, e.g. "ptr int" → "int*"
+  //   const <BASE> — const-qualified, e.g. "const int" → "const int"
+  //   ptr const <BASE> / const ptr <BASE> combinations
+  struct ArgDef { std::string name, type; };
+  std::pair<ArgDef, ArgDef> parse_op_args(const Token &kw_tok) {
+    expect(TT::LPAREN, false);
+
+    // Collect a single type specifier starting at current position.
+    // Handles optional leading `const`, `ptr`, and combinations thereof.
+    auto parse_arg_type = [&]() -> std::string {
+      bool is_const = false;
+      bool is_ptr   = false;
+
+      // Consume any leading const/ptr qualifiers in any order
+      while (true) {
+        if (current().type == TT::CONST_KW) {
+          advance();
+          is_const = true;
+        } else if (current().type == TT::PTR) {
+          advance();
+          is_ptr = true;
+        } else {
+          break;
+        }
+      }
+
+      // Collect the base type tokens until a terminator
+      std::string base_raw;
+      while (current().type != TT::RPAREN &&
+             current().type != TT::COMMA &&
+             current().type != TT::BINARY_KW &&
+             current().type != TT::UNARY_KW &&
+             current().type != TT::TEOF) {
+        // Stop if we hit another ptr/const — shouldn't happen after above loop,
+        // but guard anyway
+        if (current().type == TT::PTR || current().type == TT::CONST_KW) break;
+        base_raw += advance().value;
+      }
+
+      // Map Xenon base type to C type
+      std::string base_c = raw_to_c(base_raw.empty() ? "void" : base_raw);
+      // "str" already becomes "char*"; don't double-pointer it unless ptr given
+      bool base_already_ptr = (!base_c.empty() && base_c.back() == '*');
+
+      std::string result;
+      if (is_const) result += "const ";
+      result += base_c;
+      if (is_ptr && !base_already_ptr) result += "*";
+      else if (is_ptr && base_already_ptr) result += "*"; // ptr ptr base → double-ptr
+      return result;
+    };
+
+    auto parse_one = [&]() -> ArgDef {
+      std::string name = expect(TT::IDENTIFIER, false).value;
+      std::string type;
+      if (current().type == TT::COLON) {
+        advance();
+        type = parse_arg_type();
+      }
+      return {name, type};
+    };
+
+    ArgDef a = parse_one();
+    ArgDef b;
+    if (current().type == TT::COMMA) {
+      advance();
+      // may be 'binary' or 'unary' as a marker with no second arg
+      if (current().type == TT::BINARY_KW || current().type == TT::UNARY_KW) {
+        advance();
+      } else {
+        b = parse_one();
+        // optional trailing binary/unary marker
+        if (current().type == TT::COMMA) {
+          advance();
+          if (current().type == TT::BINARY_KW || current().type == TT::UNARY_KW)
+            advance();
+        }
+      }
+    }
+    expect(TT::RPAREN, false);
+    return {a, b};
+  }
+
+  // Parse  type(RETTYPE)  and return the C return type string.
+  // RETTYPE may include ptr and/or const qualifiers, e.g.:
+  //   type(int)            -> "int"
+  //   type(ptr int)        -> "int*"
+  //   type(const int)      -> "const int"
+  //   type(ptr const char) -> "const char*"
+  std::string parse_op_type(const Token &kw_tok) {
+    expect(TT::LPAREN, false);
+
+    bool is_const = false;
+    bool is_ptr   = false;
+
+    // Consume optional leading const/ptr qualifiers in any order
+    while (true) {
+      if (current().type == TT::CONST_KW) { advance(); is_const = true; }
+      else if (current().type == TT::PTR)  { advance(); is_ptr   = true; }
+      else break;
+    }
+
+    // Collect the base type tokens until RPAREN
+    std::string rt;
+    while (current().type != TT::RPAREN && current().type != TT::TEOF) {
+      if (current().type == TT::PTR)      { advance(); is_ptr   = true; continue; }
+      if (current().type == TT::CONST_KW) { advance(); is_const = true; continue; }
+      rt += advance().value;
+    }
+
+    if (rt.empty() && !is_ptr && !is_const)
+      throw XenonError("SyntaxError", "type() requires a return type",
+                       kw_tok.line, kw_tok.col);
+    expect(TT::RPAREN, false);
+
+    std::string base_c = raw_to_c(rt.empty() ? "void" : rt);
+    bool base_already_ptr = (!base_c.empty() && base_c.back() == '*');
+
+    std::string result;
+    if (is_const) result += "const ";
+    result += base_c;
+    if (is_ptr && !base_already_ptr) result += "*";
+    else if (is_ptr && base_already_ptr) result += "*";
+    return result;
+  }
+
+  // Parse the body block { ... } and return it verbatim as a C body string
+  std::string parse_op_body(const Token &kw_tok) {
+    expect(TT::LBRACE, false);
+    std::vector<std::string> stmts;
+    while (current().type != TT::RBRACE && current().type != TT::TEOF) {
+      Token t2 = current();
+      std::string s = parse_statement();
+      if (!s.empty()) stmts.push_back(line_directive(t2) + "    " + s);
+    }
+    if (current().type == TT::TEOF)
+      throw XenonError("SyntaxError", "Unterminated operator body",
+                       kw_tok.line, kw_tok.col);
+    expect(TT::RBRACE, false);
+    return join(stmts, "\n");
+  }
+
+  // -----------------------------------------------------------------------
+  // overload operator(+) args(a,b) type(RETTYPE) { body }
+  // -----------------------------------------------------------------------
+  void parse_overload(const Token &kw_tok) {
+    std::string sym = parse_op_sym(kw_tok);
+    // expect 'args'
+    if (current().type != TT::ARGS_KW)
+      throw XenonError("SyntaxError",
+        "overload: expected 'args' after operator()", kw_tok.line, kw_tok.col);
+    advance();
+    auto [arg_a, arg_b] = parse_op_args(kw_tok);
+    bool is_binary = !arg_b.name.empty();
+    // expect 'type'
+    Token type_tok = current();
+    if (current().type != TT::TYPE && current().type != TT::IDENTIFIER)
+      throw XenonError("SyntaxError",
+        "overload: expected 'type' after args()", kw_tok.line, kw_tok.col);
+    advance();
+    std::string ret_type = parse_op_type(type_tok);
+
+    // If no per-arg type was given, default to ret_type (old behaviour).
+    // If the user wrote  args(a:int, b:int)  those types are used as-is.
+    if (arg_a.type.empty()) arg_a.type = ret_type;
+    if (is_binary && arg_b.type.empty()) arg_b.type = ret_type;
+
+    // Build function name
+    std::string safe_ret = ret_type;
+    for (char &c : safe_ret) if (c == '*' || c == ' ') c = '_';
+    std::string fname = "_Overload_" + symbol_to_name(sym) + "_" +
+                        arg_a.name + (is_binary ? "_" + arg_b.name : "") + "_" + safe_ret;
+
+    // Register params in var_types so the body can refer to them correctly
+    var_types[arg_a.name] = arg_a.type;
+    if (is_binary) var_types[arg_b.name] = arg_b.type;
+
+    std::string body = parse_op_body(kw_tok);
+
+    // Emit the C function with correct per-arg types
+    std::string params = arg_a.type + " " + arg_a.name;
+    if (is_binary) params += ", " + arg_b.type + " " + arg_b.name;
+    std::string fn = ret_type + " " + fname + "(" + params + ") {\n" + body + "\n}\n";
+    functions.push_back(fn);
+
+    _op_overloads[sym] = {fname, arg_a.name, arg_b.name, ret_type, is_binary};
+    func_return_types[fname] = ret_type;
+  }
+
+  // -----------------------------------------------------------------------
+  // addop operator(<<) args(a,b,binary) type(RETTYPE) { body }
+  // (Same logic as overload; addop just allows any 1-2 char symbol)
+  // -----------------------------------------------------------------------
+  void parse_addop(const Token &kw_tok) {
+    parse_overload(kw_tok);  // identical parsing; symbol validation is implicit
+  }
+
+  // -----------------------------------------------------------------------
+  // alias NEWNAME = EXISTINGNAME
+  // -----------------------------------------------------------------------
+  std::string parse_alias(const Token &kw_tok) {
+    std::string new_name = expect(TT::IDENTIFIER, false).value;
+    expect(TT::ASSIGN, false);
+    std::string orig_name = expect(TT::IDENTIFIER, false).value;
+    _aliases[new_name] = orig_name;
+    func_return_types[new_name] = func_return_types.count(orig_name)
+                                    ? func_return_types[orig_name] : "";
+    // Emit a C #define so the binary just works
+    return "#define " + new_name + " " + orig_name;
+  }
+
+  // -----------------------------------------------------------------------
+  // pipe EXPR |> FUNC  — rewritten as FUNC(EXPR)
+  // Syntax as a statement:  pipe VAR |> func1 |> func2
+  // We handle this inside parse_statement by rewriting.
+  // -----------------------------------------------------------------------
+  std::string parse_pipe_stmt(const Token &kw_tok) {
+    // Only parse the seed value up to the first |> — don't call parse_expr
+    // as it will consume | via parse_bitwise_or. Use parse_unary instead.
+    std::string expr = parse_unary();
+    while (current().type == TT::BITOR && pos + 1 < tokens.size() &&
+           tokens[pos + 1].type == TT::GT) {
+      advance(); // consume |
+      advance(); // consume >
+      std::string fname = safe_name(expect(TT::IDENTIFIER, false).value);
+      expr = fname + "(" + expr + ")";
+    }
+    return expr + ";";
+  }
+
+  // -----------------------------------------------------------------------
+  // match EXPR with { CASE VAL: body ... default: body }
+  // Compiles to a C if-else chain (works for any type, not just ints).
+  // -----------------------------------------------------------------------
+  std::string parse_match(const Token &kw_tok) {
+    std::string subject = parse_expr();
+    // expect 'with'
+    if (current().type != TT::WITH_KW)
+      throw XenonError("SyntaxError",
+        "match: expected 'with' after expression", kw_tok.line, kw_tok.col);
+    advance();
+    expect(TT::LBRACE, false);
+
+    std::vector<std::string> branches;
+    std::string default_branch;
+    bool first = true;
+
+    while (current().type != TT::RBRACE && current().type != TT::TEOF) {
+      if (current().type == TT::CASE) {
+        advance();
+        std::string val = parse_expr();
+        expect(TT::COLON, false);
+        auto scope_save = var_types;
+        std::vector<std::string> stmts;
+        while (current().type != TT::CASE && current().type != TT::DEFAULT_KW &&
+               current().type != TT::RBRACE && current().type != TT::TEOF) {
+          std::string s = parse_statement();
+          if (!s.empty()) stmts.push_back("    " + s);
+        }
+        var_types = scope_save;
+        std::string keyword = first ? "if" : "else if";
+        first = false;
+        branches.push_back(keyword + " ((" + subject + ") == (" + val + ")) {\n" +
+                           join(stmts, "\n") + "\n}");
+      } else if (current().type == TT::DEFAULT_KW) {
+        advance();
+        if (current().type == TT::COLON) advance();
+        auto scope_save = var_types;
+        std::vector<std::string> stmts;
+        while (current().type != TT::RBRACE && current().type != TT::TEOF) {
+          std::string s = parse_statement();
+          if (!s.empty()) stmts.push_back("    " + s);
+        }
+        var_types = scope_save;
+        default_branch = "else {\n" + join(stmts, "\n") + "\n}";
+      } else {
+        advance(); // skip unexpected token
+      }
+    }
+    if (current().type == TT::TEOF)
+      throw XenonError("SyntaxError", "Unterminated 'match'",
+                       kw_tok.line, kw_tok.col);
+    expect(TT::RBRACE, false);
+
+    std::string result = join(branches, " ");
+    if (!default_branch.empty()) result += " " + default_branch;
+    return result;
   }
 
   // -----------------------------------------------------------------------
@@ -894,10 +1375,10 @@ class CTranspiler {
     advance(); // skip 'type'
     Token name_tok = current();
     std::string struct_name = expect(TT::IDENTIFIER, false).value;
+    std::string mangled_struct_name = mangle_with_ns(struct_name);
     expect(TT::LBRACE, false);
     std::vector<std::string> fields;
-    auto &field_map = struct_field_types[struct_name]; // declared early for
-                                                       // inline registration
+    auto &field_map = struct_field_types[mangled_struct_name]; // use mangled name
     static const std::set<TT> valid_field_types = {
         TT::INT,     TT::FLOAT,  TT::STR,        TT::LONG,
         TT::SHORT,   TT::DOUBLE, TT::VOID,       TT::PTR,
@@ -951,9 +1432,9 @@ class CTranspiler {
         advance();
     }
     expect(TT::RBRACE, false);
-    var_types[struct_name] = "STRUCT";
+    var_types[mangled_struct_name] = "STRUCT";
     return "typedef struct {\n    " + join(fields, "\n    ") + "\n} " +
-           struct_name + ";\n";
+           mangled_struct_name + ";\n";
   }
 
   // -----------------------------------------------------------------------
@@ -997,6 +1478,27 @@ class CTranspiler {
   // Expression parser
   // -----------------------------------------------------------------------
   std::string parse_expr() { return parse_ternary(); }
+
+  // Check if the current IDENTIFIER token is a registered custom operator symbol
+  bool is_custom_op_token() const {
+    if (pos >= tokens.size()) return false;
+    const Token &t = tokens[pos];
+    if (t.type != TT::IDENTIFIER) return false;
+    return _op_overloads.count(t.value) > 0;
+  }
+
+  // Custom infix operators sit just above comparison in precedence.
+  // parse_ternary → parse_logical → ... → parse_comparison → parse_custom_infix → parse_shift
+  std::string parse_custom_infix() {
+    std::string left = parse_shift();
+    while (is_custom_op_token()) {
+      std::string sym = advance().value;
+      std::string right = parse_shift();
+      const auto &ov = _op_overloads[sym];
+      left = ov.func_name + "(" + left + ", " + right + ")";
+    }
+    return left;
+  }
 
   std::string parse_ternary() {
     std::string c = parse_logical();
@@ -1047,13 +1549,21 @@ class CTranspiler {
   }
 
   std::string parse_comparison() {
-    std::string left = parse_shift();
+    std::string left = parse_custom_infix();
     static const std::map<TT, std::string> cmp = {
         {TT::EQ, "=="}, {TT::NE, "!="}, {TT::LT, "<"},
         {TT::GT, ">"},  {TT::LE, "<="}, {TT::GE, ">="}};
     while (cmp.count(current().type)) {
-      std::string op = cmp.at(advance().type);
-      left = "(" + left + op + parse_shift() + ")";
+      TT op_tt = current().type;
+      advance();
+      std::string op_sym = cmp.at(op_tt);
+      std::string right = parse_custom_infix();
+      if (_op_overloads.count(op_sym)) {
+        const auto &ov = _op_overloads[op_sym];
+        left = ov.func_name + "(" + left + ", " + right + ")";
+      } else {
+        left = "(" + left + op_sym + right + ")";
+      }
     }
     return left;
   }
@@ -1061,8 +1571,16 @@ class CTranspiler {
   std::string parse_shift() {
     std::string left = parse_additive();
     while (current().type == TT::SHL || current().type == TT::SHR) {
-      std::string op = (advance().type == TT::SHL) ? "<<" : ">>";
-      left = "(" + left + op + parse_additive() + ")";
+      TT op_tt = current().type;
+      std::string op_sym = (op_tt == TT::SHL) ? "<<" : ">>";
+      advance();
+      std::string right = parse_additive();
+      if (_op_overloads.count(op_sym)) {
+        const auto &ov = _op_overloads[op_sym];
+        left = ov.func_name + "(" + left + ", " + right + ")";
+      } else {
+        left = "(" + left + op_sym + right + ")";
+      }
     }
     return left;
   }
@@ -1070,8 +1588,14 @@ class CTranspiler {
   std::string parse_additive() {
     std::string left = parse_multiplicative();
     while (current().type == TT::PLUS || current().type == TT::MINUS) {
-      std::string op = advance().value;
-      left = "(" + left + op + parse_multiplicative() + ")";
+      std::string op_sym = advance().value;
+      std::string right = parse_multiplicative();
+      if (_op_overloads.count(op_sym)) {
+        const auto &ov = _op_overloads[op_sym];
+        left = ov.func_name + "(" + left + ", " + right + ")";
+      } else {
+        left = "(" + left + op_sym + right + ")";
+      }
     }
     return left;
   }
@@ -1080,8 +1604,14 @@ class CTranspiler {
     std::string left = parse_unary();
     while (current().type == TT::MULTIPLY || current().type == TT::DIVIDE ||
            current().type == TT::MOD) {
-      std::string op = advance().value;
-      left = "(" + left + op + parse_unary() + ")";
+      std::string op_sym = advance().value;
+      std::string right = parse_unary();
+      if (_op_overloads.count(op_sym)) {
+        const auto &ov = _op_overloads[op_sym];
+        left = ov.func_name + "(" + left + ", " + right + ")";
+      } else {
+        left = "(" + left + op_sym + right + ")";
+      }
     }
     return left;
   }
@@ -1236,7 +1766,35 @@ class CTranspiler {
 
     if (tok.type == TT::IDENTIFIER) {
       std::string name = safe_name(tok.value);
+
+      // NAME::symbol — namespace qualified access
+      if (current().type == TT::COLON &&
+          pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
+        advance(); advance(); // consume ::
+        std::string sym = expect(TT::IDENTIFIER, false).value;
+        std::string resolved = resolve_qualified(tok.value, sym);
+        if (resolved.empty())
+          resolved = tok.value + "__" + sym; // best-effort if not registered yet
+        name = resolved;
+        if (current().type == TT::LPAREN) {
+          advance();
+          return emit_call(name, tok);
+        }
+        return name;
+      }
+
       if (current().type == TT::LPAREN) {
+        // If in a namespace, try local scope first
+        if (!_cur_namespace.empty()) {
+          auto &ns_map = _namespaces[_cur_namespace];
+          auto it = ns_map.find(tok.value);
+          if (it != ns_map.end()) name = it->second;
+        }
+        // Check if this is an ignored-namespace symbol
+        if (name == safe_name(tok.value)) {
+          std::string resolved = resolve_ignored_ns(tok.value);
+          if (!resolved.empty()) name = resolved;
+        }
         advance();
         return emit_call(name, tok);
       }
@@ -1677,6 +2235,25 @@ class CTranspiler {
 
     if (tok.type == TT::IDENTIFIER) {
       std::string name = safe_name(tok.value);
+      std::string raw_name = tok.value; // preserve for NS lookup
+
+      // Check for namespace-qualified call: NS::func(...)
+      if (pos < tokens.size() && tokens[pos].type == TT::COLON &&
+          pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
+        pos += 2; // consume ::
+        if (pos < tokens.size() && tokens[pos].type == TT::IDENTIFIER) {
+          std::string func_name = tokens[pos++].value;
+          std::string resolved = resolve_qualified(raw_name, func_name);
+          if (resolved.empty()) resolved = raw_name + "__" + func_name;
+          // Now we're at the potential LPAREN
+          if (pos < tokens.size() && tokens[pos].type == TT::LPAREN) {
+            skip_balanced(TT::LPAREN, TT::RPAREN);
+            return lookup_func_ret(resolved);
+          }
+          // Not a call, just NS::sym
+          return TypeInfo::unknown();
+        }
+      }
 
       // Function call: name(...)
       if (pos < tokens.size() && tokens[pos].type == TT::LPAREN) {
@@ -2078,6 +2655,149 @@ class CTranspiler {
   }
 
   // -----------------------------------------------------------------------
+  // Namespace support
+  // -----------------------------------------------------------------------
+  // "in namespace NAME are { ... }"
+  // Parses the block, mangling every function/type/overload defined inside
+  // with NAME__ prefix, and registers them in _namespaces[NAME].
+  void parse_namespace_block(const Token &kw_tok) {
+    // expect 'namespace'
+    if (current().type != TT::NAMESPACE_KW)
+      throw XenonError("SyntaxError",
+        "'in' must be followed by 'namespace'", kw_tok.line, kw_tok.col);
+    advance();
+    // expect NAME
+    std::string ns_name = expect(TT::IDENTIFIER, false).value;
+    // expect 'are'
+    if (current().type != TT::ARE_KW)
+      throw XenonError("SyntaxError",
+        "namespace declaration must have 'are' after name", kw_tok.line, kw_tok.col);
+    advance();
+    // expect '{'
+    expect(TT::LBRACE, false);
+
+    // Save and set current namespace
+    std::string prev_ns = _cur_namespace;
+    _cur_namespace = ns_name;
+    auto &ns_map = _namespaces[ns_name]; // creates if absent (redef support)
+
+    // Helper: peek at the function name token after the return type.
+    // Scans forward past any type tokens (keywords + optional ptr/const qualifier)
+    // until it finds the IDENTIFIER followed by LPAREN — that is the fname.
+    auto peek_fname = [&]() -> std::string {
+      size_t scan = pos;
+      // skip type keyword tokens and ptr/const qualifiers
+      while (scan < tokens.size()) {
+        TT tt = tokens[scan].type;
+        if (tt == TT::IDENTIFIER) {
+          // Check if next non-trivial token is LPAREN → this is the fname
+          if (scan + 1 < tokens.size() && tokens[scan + 1].type == TT::LPAREN)
+            return tokens[scan].value;
+          // Otherwise it's a type name (struct type), skip it and keep looking
+          scan++;
+          continue;
+        }
+        // Skip known type keyword tokens
+        if (tt == TT::INT || tt == TT::FLOAT || tt == TT::DOUBLE ||
+            tt == TT::LONG || tt == TT::SHORT || tt == TT::VOID ||
+            tt == TT::BOOL_KW || tt == TT::CHAR_KW || tt == TT::STR ||
+            tt == TT::U8 || tt == TT::U32 || tt == TT::U64 ||
+            tt == TT::PTR || tt == TT::CONST_KW ||
+            tt == TT::M256 || tt == TT::M256I) {
+          scan++;
+          continue;
+        }
+        break;
+      }
+      return "";
+    };
+
+    while (current().type != TT::RBRACE && current().type != TT::TEOF) {
+      Token t = current();
+      if (t.type == TT::SEMICOLON) { advance(); continue; }
+
+      if (t.type == TT::FUNCTION) {
+        advance();
+        // peek at name before emit_function consumes it, register in ns_map
+        std::string short_name = peek_fname();
+        std::string code = emit_function(t, false);
+        if (!code.empty()) functions.push_back(line_directive(t) + code);
+        if (!short_name.empty())
+          ns_map[short_name] = ns_name + "__" + short_name;
+      } else if (t.type == TT::INLINE_KW) {
+        advance();
+        if (current().type != TT::FUNCTION)
+          throw XenonError("SyntaxError",
+            "'inline' must be followed by 'function'", t.line, t.col);
+        Token fn_tok = current(); advance();
+        std::string short_name = peek_fname();
+        std::string code = emit_function(fn_tok, true);
+        if (!code.empty()) functions.push_back(line_directive(fn_tok) + code);
+        if (!short_name.empty())
+          ns_map[short_name] = ns_name + "__" + short_name;
+      } else if (t.type == TT::TYPE) {
+        // Peek at struct name before parsing
+        std::string struct_name;
+        if (pos + 1 < tokens.size() && tokens[pos + 1].type == TT::IDENTIFIER)
+          struct_name = tokens[pos + 1].value;
+        std::string code = parse_type_definition();
+        if (!code.empty()) {
+          headers.push_back(line_directive(t) + code);
+          // Register struct in namespace
+          if (!struct_name.empty())
+            ns_map[struct_name] = ns_name + "__" + struct_name;
+        }
+      } else if (t.type == TT::ENUM_KW) {
+        std::string code = parse_enum();
+        if (!code.empty()) headers.push_back(line_directive(t) + code);
+      } else if (t.type == TT::OVERLOAD_KW) {
+        advance();
+        if (current().type != TT::OPERATOR_KW)
+          throw XenonError("SyntaxError",
+            "'overload' must be followed by 'operator'", t.line, t.col);
+        advance();
+        parse_overload(t);
+      } else if (t.type == TT::ADDOP_KW) {
+        advance();
+        if (current().type != TT::OPERATOR_KW)
+          throw XenonError("SyntaxError",
+            "'addop' must be followed by 'operator'", t.line, t.col);
+        advance();
+        parse_addop(t);
+      } else {
+        advance();
+      }
+    }
+
+    if (current().type == TT::TEOF)
+      throw XenonError("SyntaxError",
+        "Unterminated namespace '" + ns_name + "'", kw_tok.line, kw_tok.col);
+    expect(TT::RBRACE, false);
+
+    _cur_namespace = prev_ns;
+  }
+
+  // Resolve NAME::symbol → mangled C name
+  // Returns empty string if not found.
+  std::string resolve_qualified(const std::string &ns, const std::string &sym) const {
+    auto nit = _namespaces.find(ns);
+    if (nit == _namespaces.end()) return "";
+    auto sit = nit->second.find(sym);
+    if (sit == nit->second.end()) return "";
+    return sit->second;
+  }
+
+  // Resolve unqualified symbol through ignored namespaces.
+  // Returns the mangled name if found in any ignored namespace, else "".
+  std::string resolve_ignored_ns(const std::string &sym) const {
+    for (auto &ns : _ignored_namespaces) {
+      std::string r = resolve_qualified(ns, sym);
+      if (!r.empty()) return r;
+    }
+    return "";
+  }
+
+  // -----------------------------------------------------------------------
   // Statement parser
   // -----------------------------------------------------------------------
   std::string parse_statement() {
@@ -2089,6 +2809,67 @@ class CTranspiler {
       return parse_type_definition();
     if (t.type == TT::ENUM_KW)
       return parse_enum();
+
+    // in namespace NAME are { ... }
+    if (t.type == TT::IN_KW) {
+      Token kw = advance();
+      parse_namespace_block(kw);
+      return "";
+    }
+
+    // ignore namespace NAME
+    if (t.type == TT::IGNORE_KW) {
+      advance();
+      if (current().type != TT::NAMESPACE_KW)
+        throw XenonError("SyntaxError",
+          "'ignore' must be followed by 'namespace'", t.line, t.col);
+      advance();
+      std::string ns_name = expect(TT::IDENTIFIER, false).value;
+      _ignored_namespaces.insert(ns_name);
+      return "";
+    }
+
+    // overload operator(SYM) args(a,b) type(RET) { body }
+    if (t.type == TT::OVERLOAD_KW) {
+      Token kw = advance();
+      if (current().type != TT::OPERATOR_KW)
+        throw XenonError("SyntaxError",
+          "'overload' must be followed by 'operator'", kw.line, kw.col);
+      advance();
+      parse_overload(kw);
+      return "";
+    }
+
+    // addop operator(SYM) args(a,b,binary) type(RET) { body }
+    if (t.type == TT::ADDOP_KW) {
+      Token kw = advance();
+      if (current().type != TT::OPERATOR_KW)
+        throw XenonError("SyntaxError",
+          "'addop' must be followed by 'operator'", kw.line, kw.col);
+      advance();
+      parse_addop(kw);
+      return "";
+    }
+
+    // alias NEWNAME = EXISTINGNAME
+    if (t.type == TT::ALIAS_KW) {
+      Token kw = advance();
+      std::string def = parse_alias(kw);
+      headers.push_back(def + "\n");
+      return "";
+    }
+
+    // pipe EXPR |> func1 |> func2
+    if (t.type == TT::PIPE_KW) {
+      Token kw = advance();
+      return parse_pipe_stmt(kw);
+    }
+
+    // match EXPR with { case VAL: ... default: ... }
+    if (t.type == TT::MATCH_KW) {
+      Token kw = advance();
+      return parse_match(kw);
+    }
 
     // HLT
     if (t.type == TT::HLT) {
@@ -2757,7 +3538,38 @@ class CTranspiler {
 
     // identifier: assign, compound assign, ++/--, call
     if (t.type == TT::IDENTIFIER) {
-      std::string name = safe_name(advance().value);
+      std::string raw_id = advance().value;
+
+      // NAME::sym — namespace qualified call at statement level
+      if (current().type == TT::COLON &&
+          pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
+        advance(); advance(); // consume ::
+        std::string sym = expect(TT::IDENTIFIER, false).value;
+        std::string resolved = resolve_qualified(raw_id, sym);
+        if (resolved.empty()) resolved = raw_id + "__" + sym;
+        if (current().type == TT::LPAREN) {
+          // NS::func() call
+          Token call_tok = current();
+          advance();
+          return emit_call(resolved, call_tok) + ";";
+        }
+        if (current().type == TT::IDENTIFIER) {
+          // NS::TYPE varname  — variable declaration
+          std::string varname = safe_name(advance().value);
+          var_types[varname] = resolved;
+          if (current().type == TT::ASSIGN) {
+            advance();
+            return resolved + " " + varname + " = " + parse_expr() + ";";
+          }
+          return resolved + " " + varname + ";";
+        }
+        // bare NS::sym expression
+        return resolved + ";";
+      }
+
+      std::string type_to_use = raw_id;
+
+      std::string name = safe_name(raw_id);
       while (current().type == TT::LSBRACKET || current().type == TT::DOT ||
              current().type == TT::ARROW) {
         if (current().type == TT::LSBRACKET) {
@@ -2784,9 +3596,32 @@ class CTranspiler {
           name = name + "->" + expect(TT::IDENTIFIER, false).value;
         }
       }
+      // NS::TYPE var — need to emit declaration
+      if (type_to_use != raw_id && !type_to_use.empty()) {
+        var_types[name] = type_to_use;
+        if (current().type == TT::ASSIGN) {
+          advance();
+          std::string rhs = parse_expr();
+          return type_to_use + " " + name + " = " + rhs + ";";
+        } else {
+          // Just declaration with no init
+          return type_to_use + " " + name + ";";
+        }
+      }
+
       if (current().type == TT::ASSIGN) {
+        // Check for = operator overload
+        if (_op_overloads.count("=")) {
+          Token assign_tok = current();
+          advance();
+          std::string rhs = parse_expr();
+          const auto &ov = _op_overloads["="];
+          // Emit overload call: name = Overload_eq(name, rhs)
+          return name + " = " + ov.func_name + "(" + name + ", " + rhs + ");";
+        }
         advance();
-        return name + " = " + parse_expr() + ";";
+        std::string rhs = parse_expr();
+        return name + " = " + rhs + ";";
       }
       static const std::map<TT, std::string> compound = {
           {TT::PLUS_ASSIGN, "+="}, {TT::MINUS_ASSIGN, "-="},
@@ -2794,7 +3629,9 @@ class CTranspiler {
           {TT::MOD_ASSIGN, "%="},
       };
       if (compound.count(current().type)) {
-        std::string cop = compound.at(advance().type);
+        TT compound_tt = current().type;
+        advance();
+        std::string cop = compound.at(compound_tt);
         return name + " " + cop + " " + parse_expr() + ";";
       }
       if (current().type == TT::INCR) {
@@ -2807,6 +3644,14 @@ class CTranspiler {
       }
       if (current().type == TT::LPAREN) {
         Token call_tok = current();
+        // If we're in a namespace, try to resolve locally first
+        if (!_cur_namespace.empty()) {
+          auto &ns_map = _namespaces[_cur_namespace];
+          auto it = ns_map.find(raw_id);
+          if (it != ns_map.end()) {
+            name = it->second; // use mangled name
+          }
+        }
         advance();
         return emit_call(name, call_tok) + ";";
       }
@@ -3084,7 +3929,7 @@ class CTranspiler {
   std::string emit_function(const Token &fn_tok, bool inl) {
     size_t tok_start = pos; // ret-type token is current()
     std::string code = parse_function_body(fn_tok, inl);
-    if (code.size() > 14 && code.substr(0, 12) == "__TEMPLATE__") {
+    if (code.size() > 12 && code.substr(0, 12) == "__TEMPLATE__") {
       std::string tname = code.substr(12);
       auto tit = template_funcs.find(tname);
       if (tit != template_funcs.end())
@@ -3144,7 +3989,7 @@ class CTranspiler {
     if (inl && !infer_ret)
       ret_type = "static inline " + ret_type;
 
-    std::string fname = safe_name(expect(TT::IDENTIFIER, false).value);
+    std::string fname = mangle_with_ns(expect(TT::IDENTIFIER, false).value);
     // Detect if we're being called from instantiate_template for this fname.
     // guard_key format: "originalName@type1,type2"
     // mangled fname: "originalName__type1__type2"
@@ -3367,9 +4212,9 @@ class CTranspiler {
         TypeInfo rti = infer_return_type_from_body(body_tok_start, body_tok_end,
                                                    var_types);
         ret_type = rti.c_type();
+        func_return_types[fname] = ret_type; // store bare type, not "static inline ..."
         if (inl)
           ret_type = "static inline " + ret_type;
-        func_return_types[fname] = ret_type;
       }
     }
     // Record for the return-statement validator
@@ -3626,7 +4471,7 @@ class CTranspiler {
                          tok.line, tok.col);
     std::string lh_source((std::istreambuf_iterator<char>(f)),
                           std::istreambuf_iterator<char>());
-    std::vector<Token> lh_toks = Lexer(lh_source).tokenize();
+    std::vector<Token> lh_toks = Lexer(lh_source, prescan_addop_symbols(lh_source)).tokenize();
 
     CTranspiler lh(lh_toks);
     lh.isSubTranspiler = true;
@@ -3654,8 +4499,7 @@ class CTranspiler {
         // If emit_function detected a template, it patched tok_start in
         // lh.template_funcs. Extract tokens from the template for cross-module
         // portability.
-        if (!code.empty() ||
-            code == "") { // even if empty (templates return "")
+        { // process both regular functions and templates (which return "")
           // Find the most recently added template in lh and extract its tokens
           for (auto &[tname, tmpl] : lh.template_funcs) {
             if (tmpl.has_extracted)
@@ -3712,6 +4556,17 @@ class CTranspiler {
               scan_h_for_funcs(local);
           }
         }
+      } else if (lt.type == TT::IN_KW) {
+        lh.advance();
+        lh.parse_namespace_block(lt);
+      } else if (lt.type == TT::IGNORE_KW) {
+        lh.advance();
+        if (lh.current().type == TT::NAMESPACE_KW) {
+          lh.advance();
+          Token ns_tok = lh.expect(TT::IDENTIFIER, true);
+          if (!ns_tok.value.empty())
+            lh._ignored_namespaces.insert(ns_tok.value);
+        }
       } else {
         lh.parse_statement();
       }
@@ -3736,6 +4591,18 @@ class CTranspiler {
     for (auto const &[name, tmpl] : lh.template_funcs) {
       this->template_funcs[name] = tmpl;
     }
+    for (auto const &[sym, entry] : lh._op_overloads) {
+      this->_op_overloads[sym] = entry;
+    }
+    for (auto const &[aname, orig] : lh._aliases) {
+      this->_aliases[aname] = orig;
+    }
+    for (auto const &[nsname, nsmap] : lh._namespaces) {
+      for (auto const &[sym, cname] : nsmap)
+        this->_namespaces[nsname][sym] = cname;
+    }
+    for (auto const &ns : lh._ignored_namespaces)
+      this->_ignored_namespaces.insert(ns);
     this->_lh_included = lh._lh_included;
   }
 
@@ -3756,40 +4623,40 @@ public:
       headers.push_back(
           "#ifndef __XENON_RUNTIME__\n"
           "#define __XENON_RUNTIME__\n"
-          "static char _lb_buf[512];\n"
+          "static char _lb_bufs[8][512];\n"
+          "static int  _lb_buf_idx = 0;\n"
+          "static inline char* _lb_next(void) { _lb_buf_idx=(_lb_buf_idx+1)%8; return _lb_bufs[_lb_buf_idx]; }\n"
           "static inline char* _lb_s(char* x)        { return x; }\n"
           "static inline char* _lb_cs(const char* x) { return (char*)x; }\n"
-          "static inline char* _lb_f(float x)        { "
-          "snprintf(_lb_buf,sizeof(_lb_buf),\"%g\",x); return _lb_buf; }\n"
-          "static inline char* _lb_d(double x)       { "
-          "snprintf(_lb_buf,sizeof(_lb_buf),\"%.10g\",x); return _lb_buf; }\n"
-          "static inline char* _lb_i(int x)          { "
-          "snprintf(_lb_buf,sizeof(_lb_buf),\"%d\",x); return _lb_buf; }\n"
-          "static inline char* _lb_l(long x)         { "
-          "snprintf(_lb_buf,sizeof(_lb_buf),\"%ld\",x); return _lb_buf; }\n"
-          "static inline char* _lb_u(short x)        { "
-          "snprintf(_lb_buf,sizeof(_lb_buf),\"%d\",(int)x); return _lb_buf; }\n"
+          "static inline char* _lb_f(float x)        { char*b=_lb_next();"
+          "snprintf(b,512,\"%g\",x); return b; }\n"
+          "static inline char* _lb_d(double x)       { char*b=_lb_next();"
+          "snprintf(b,512,\"%.10g\",x); return b; }\n"
+          "static inline char* _lb_i(int x)          { char*b=_lb_next();"
+          "snprintf(b,512,\"%d\",x); return b; }\n"
+          "static inline char* _lb_l(long x)         { char*b=_lb_next();"
+          "snprintf(b,512,\"%ld\",x); return b; }\n"
+          "static inline char* _lb_u(short x)        { char*b=_lb_next();"
+          "snprintf(b,512,\"%d\",(int)x); return b; }\n"
           "static inline char* _lb_b(int x)          { return x ? \"true\" : "
           "\"false\"; }\n"
-          "static inline char* _lb_c(char x)         { _lb_buf[0]=x; "
-          "_lb_buf[1]='\\0'; return _lb_buf; }\n"
+          "static inline char* _lb_c(char x)         { char*b=_lb_next(); b[0]=x; "
+          "b[1]='\\0'; return b; }\n"
           "static inline char* _lb_m(__m256 v)  { float f[8]; "
-          "_mm256_storeu_ps(f,v); "
-          "snprintf(_lb_buf,sizeof(_lb_buf),\"[%g,%g,%g,%g,%g,%g,%g,%g]\","
-          "f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7]); return _lb_buf; }\n"
+          "_mm256_storeu_ps(f,v); char*b=_lb_next();"
+          "snprintf(b,512,\"[%g,%g,%g,%g,%g,%g,%g,%g]\","
+          "f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7]); return b; }\n"
           "static inline char* _lb_mi(__m256i v) { union{__m256i v;int "
-          "i[8];}u; u.v=v; "
-          "snprintf(_lb_buf,sizeof(_lb_buf),\"[%d,%d,%d,%d,%d,%d,%d,%d]\","
+          "i[8];}u; u.v=v; char*b=_lb_next();"
+          "snprintf(b,512,\"[%d,%d,%d,%d,%d,%d,%d,%d]\","
           "u.i[0],u.i[1],u.i[2],u.i[3],u.i[4],u.i[5],u.i[6],u.i[7]); return "
-          "_lb_buf; }\n"
-          "static inline char* _lb_u8(uint8_t x)   { "
-          "snprintf(_lb_buf,sizeof(_lb_buf),\"%\" PRIu8,x); return _lb_buf; }\n"
-          "static inline char* _lb_u32(uint32_t x) { "
-          "snprintf(_lb_buf,sizeof(_lb_buf),\"%\" PRIu32,x); return _lb_buf; "
-          "}\n"
-          "static inline char* _lb_u64(uint64_t x) { "
-          "snprintf(_lb_buf,sizeof(_lb_buf),\"%\" PRIu64,x); return _lb_buf; "
-          "}\n"
+          "b; }\n"
+          "static inline char* _lb_u8(uint8_t x)   { char*b=_lb_next();"
+          "snprintf(b,512,\"%\" PRIu8,x); return b; }\n"
+          "static inline char* _lb_u32(uint32_t x) { char*b=_lb_next();"
+          "snprintf(b,512,\"%\" PRIu32,x); return b; }\n"
+          "static inline char* _lb_u64(uint64_t x) { char*b=_lb_next();"
+          "snprintf(b,512,\"%\" PRIu64,x); return b; }\n"
           "#define TO_STR(x) _Generic((x),"
           "char*:_lb_s,const char*:_lb_cs,"
           "__m256:_lb_m,__m256i:_lb_mi,"
@@ -3832,6 +4699,24 @@ public:
           headers.push_back(line_directive(tok) + parse_type_definition());
         } else if (tok.type == TT::ENUM_KW) {
           headers.push_back(line_directive(tok) + parse_enum());
+        } else if (tok.type == TT::OVERLOAD_KW) {
+          advance();
+          if (current().type != TT::OPERATOR_KW)
+            throw XenonError("SyntaxError",
+              "'overload' must be followed by 'operator'", tok.line, tok.col);
+          advance();
+          parse_overload(tok);
+        } else if (tok.type == TT::ADDOP_KW) {
+          advance();
+          if (current().type != TT::OPERATOR_KW)
+            throw XenonError("SyntaxError",
+              "'addop' must be followed by 'operator'", tok.line, tok.col);
+          advance();
+          parse_addop(tok);
+        } else if (tok.type == TT::ALIAS_KW) {
+          advance();
+          std::string def = parse_alias(tok);
+          headers.push_back(def + "\n");
         } else if (tok.type == TT::FUNCTION) {
           advance();
           std::string code = emit_function(tok, false);
@@ -3966,7 +4851,7 @@ int main(int argc, char **argv) {
   }
 
   if (argc < 3) {
-    log("xenc version 2.9.1");
+    log("xenc version 2.9.3");
     die("Usage: xenc <in.xen> <out> [extra.c] [-lPATH] [-gLIB] [-wLIBDIR] "
         "[-c] [-s] [--asm] [--main]",
         1);
@@ -3974,7 +4859,7 @@ int main(int argc, char **argv) {
 
   std::string inf = argv[1];
   if (inf == "-v") {
-    std::cout << "xenc compiler version 2.9.1.";
+    std::cout << "xenc compiler version 2.9.3.";
     return 0;
   }
   std::string out_bin = argv[2];
@@ -4026,7 +4911,7 @@ int main(int argc, char **argv) {
   log("[*] Tokenizing...");
   std::vector<Token> tokens;
   try {
-    tokens = Lexer(source).tokenize();
+    tokens = Lexer(source, prescan_addop_symbols(source)).tokenize();
   } catch (XenonError &e) {
     die(e.what());
   } catch (std::exception &e) {

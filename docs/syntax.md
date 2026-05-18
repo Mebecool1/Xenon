@@ -155,8 +155,29 @@ $$
 $$
 
 ---
+## 9. Operator Overload and Adding
+$$
+\text{Operator Overload: }
+\\
+overload\ operator(+)\ args(a, b)\ type(int)\ \{
+    \\
+    return\ a+b+100    
+\\
+\}
 
-## 9. Compiler Flags (xenc)
+\\
+\\
+\text{Adding Operators:}\\
+addop\ operator(<<)\ args(a,b,binary)\ type(int)\ \{
+    \\return\ a*b
+    \\\}\\\\
+\text{Usage:}
+\\
+println(1+2)\ //\ will\ now\ give\ 103\ (1+2+100)
+\\
+println(1 << 2)\ //\ will\ now\ give\ 2\ (1*2)
+$$
+## 10. Compiler Flags (xenc)
 $$
 \begin{array}{|l|l|}
 \hline
@@ -176,7 +197,7 @@ $$
 
 $$
 ---
-## 10. Uninstallation
+## 11. Uninstallation
 $$
 \text{easiest way:}
 \\
@@ -185,7 +206,7 @@ bash \to remove.sh
 exact\ command \to \text{"./remove.sh"}
 $$
 ---
-## 11. Standard Library
+## 12. Standard Library
 ### Accessing the standard library
 ---
 $$
@@ -202,6 +223,7 @@ $$
 \text{Math.xen} & \text{General purpose Math library} \\ \hline
 \text{stdlib.xen} & \text{Provide general functions} \\ \hline
 \text{MathGraphic.xen} & \text{Provide Graphical Math functions} \\ \hline
+\text{String.xen} & \text{Provide String utilities} \\ \hline
 \end{array}
 
 $$

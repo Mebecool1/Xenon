@@ -10,4 +10,6 @@ examples/.*
 typeinfer_debug.c.sig
 *_debug
 examples/typeinfer
-
+stdlib/*.c
+*.c
+reloadS*

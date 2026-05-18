@@ -1,0 +1,86 @@
+
+type String {
+    ptr char data
+    bool isHeap
+    int size
+}
+
+in namespace string are {
+    function String New(ptr char literal) {
+        String s 
+        s.data = cast(ptr char, literal) 
+        s.isHeap = false
+        s.size = strlen(literal)
+        return s
+    }
+    function void Free(ptr String s){
+        if s.isHeap == true then
+        free(s.data)
+        s.data = 0
+        s.isHeap = false
+        s.size = 0
+        end
+    }
+}
+function void StrAppend(ptr String s, String extra) {
+    // 1. Pull the length directly from the struct metadata! No strlen required.
+    let extra_len = extra.size 
+    if extra_len == 0 then
+      return
+    end
+    
+    let new_size = s.size + extra_len
+    if not s.isHeap then
+      ptr char new_data = malloc(new_size + 1)
+
+      memcpy(new_data, s.data, s.size)
+      // 2. Read from extra.data instead of the raw pointer
+      memcpy(new_data + s.size, extra.data, extra_len) 
+      ptr char terminator_ptr = new_data + new_size
+      terminator_ptr[0] = 0
+
+      s.data = new_data
+      s.isHeap = true
+      s.size = new_size
+    else
+      s.data = realloc(s.data, new_size + 1)
+      // 3. Read from extra.data here as well
+      memcpy(s.data + s.size, extra.data, extra_len) 
+      ptr char terminator_ptr = s.data + new_size
+      terminator_ptr[0] = 0
+      s.size = new_size
+    end
+}
+
+function bool StrEq(ptr String a, ptr String b) {
+    if a.size != b.size then
+      return false
+    end
+    if a.data == b.data then
+      return true
+    end
+    int result = memcmp(a.data, b.data, a.size)
+    return result == 0
+}
+in namespace string are {
+    function void Print(ptr String a){
+        if (a && a.data) then
+            println(a.data)
+        end
+    }
+}
+overload operator(==) args(a:String, b:String) type(bool) {
+    return StrEq(&a, &b)
+}
+
+addop operator(<<) args(a:ptr String, b:String) type(int) {
+    StrAppend(a, b)
+    return 0
+}
+overload operator(+) args(a: String, b: String) type(String) {
+    String result
+    String copyOfA = a 
+    int thing = &copyOfA << b 
+    result = copyOfA 
+    return result
+}

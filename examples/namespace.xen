@@ -1,0 +1,30 @@
+link "MathGraphic.xen"
+in namespace some are {
+    function void some(){
+        println("some")
+    }
+    function void otherSome(){
+        some()
+    }
+    type something {
+        int value
+    }
+}
+link "String.xen"
+String x = string::New("hello world!")
+string::Print(&x)
+some::some()
+some::otherSome()
+string::Free(&x)
+
+some::something u;
+u.value = 5
+println(u.value)
+println()
+vec2f xi = gmath::v2(1, 2)
+vec2f y = gmath::v2(2, 3)
+vec2f z = gmath::vec2Add(xi, y)
+println(z.x)
+println(z.y)
+
+

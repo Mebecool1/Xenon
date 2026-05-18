@@ -10,7 +10,7 @@ function void show_stats(Player p) {
     print("Health: ", p.health, "\n")
 }
 
-function void main() {
+function void mains() {
     Player p1
     p1.id = 1
     p1.health = 100.0
@@ -19,4 +19,4 @@ function void main() {
     show_stats(p1)
 }
 
-main()
+mains()

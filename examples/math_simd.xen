@@ -3,7 +3,7 @@ function float square(float x) {
     return x * x
 }
 
-function void main() {
+function void mains() {
     float val = 5.5
     float result = square(val)
     
@@ -17,4 +17,4 @@ function void main() {
     end
 }
 
-main()
+mains()
