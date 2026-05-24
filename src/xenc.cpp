@@ -486,8 +486,14 @@ static bool is_warn_kind(const std::string &k) {
 // ===========================================================================
 struct XenonError : std::exception {
   std::string kind, msg_full;
+  // suggestion     — short human label, e.g. "remove extraneous '$' sigils"
+  // fix_snippet    — the corrected source line (replaces the erroneous one)
+  // fix_col        — 1-based column where the fix region starts in fix_snippet
+  // fix_len        — number of chars the fix spans (for '----' underline)
   XenonError(std::string kind_, std::string msg, std::optional<int> line = {},
-               std::optional<int> col = {}, std::string snippet = "")
+               std::optional<int> col = {}, std::string snippet = "",
+               std::string suggestion = "", std::string fix_snippet = "",
+               int fix_col = 0, int fix_len = 0)
       : kind(std::move(kind_)) {
     std::ostringstream ss;
     bool is_warn = is_warn_kind(kind);
@@ -576,13 +582,48 @@ struct XenonError : std::exception {
       ss << ansi::blue() << ansi::bold()
          << std::string(gutter_w, ' ') << ansi::reset();
       if (caret_col > 0 && caret_col <= (int)final_snippet.size() + 1) {
+        const std::string &caret_color = is_warn ? ansi::byellow() : ansi::bred();
         ss << std::string(caret_col - 1, ' ')
-           << ansi::bred() << ansi::bold() << "^"
-           << ansi::bred() << std::string(
+           << caret_color << ansi::bold() << "^"
+           << caret_color << std::string(
                 std::max(0, (int)final_snippet.size() - caret_col), '~')
            << ansi::reset();
       }
       ss << "\n";
+
+      // ── Suggestion block (clang/rustc style) ──────────────────────────────
+      // Rendered only when the caller supplies a fix_snippet.
+      // Format mirrors rustc's `help:` / clang's fix-it:
+      //
+      //   note: replace with:
+      //   2 │ println(var)
+      //             ----
+      if (!suggestion.empty() || !fix_snippet.empty()) {
+        // "note:" label
+        ss << "\n  " << ansi::bcyan() << ansi::bold() << "note:" << ansi::reset()
+           << " " << ansi::white();
+        if (!suggestion.empty())
+          ss << suggestion;
+        else
+          ss << "replace with:";
+        ss << ansi::reset() << "\n";
+
+        if (!fix_snippet.empty()) {
+          // Reuse the same gutter width as the error line
+          ss << ansi::blue() << ansi::bold() << "  " << lnum << " │ "
+             << ansi::reset()
+             << ansi::bgreen() << fix_snippet << ansi::reset() << "\n";
+          // '----' underline in green under the replacement region
+          if (fix_col > 0 && fix_len > 0) {
+            ss << ansi::blue() << ansi::bold()
+               << std::string(gutter_w, ' ') << ansi::reset();
+            ss << std::string(fix_col - 1, ' ')
+               << ansi::bgreen() << ansi::bold()
+               << std::string(fix_len, '-')
+               << ansi::reset() << "\n";
+          }
+        }
+      }
     }
 
     // Show related occurrences mentioned in the message (e.g. function names
@@ -684,6 +725,9 @@ class Lexer {
   std::set<std::string> custom_ops_n; // multi-char custom symbols (2-3+ chars)
   std::set<std::string> custom_ops_2; // two-char custom symbols
   std::set<std::string> custom_ops_1; // one-char custom symbols
+public:
+  std::vector<std::string> lex_errors; // collected errors (non-fatal accumulation)
+private:
 
   static const std::map<std::string, TT> &keywords() {
     static std::map<std::string, TT> kw = {
@@ -805,6 +849,10 @@ public:
     std::vector<Token> tokens;
     while (pos < src.size()) {
       char c = src[pos];
+      // wrap entire character-dispatch in a try so lex errors are collected
+      // rather than aborting on the first one.
+      size_t skip_after_error = 0; // if set, catch will advance pos here
+      try {
 
       // whitespace
       if (std::isspace((unsigned char)c)) {
@@ -1010,14 +1058,99 @@ public:
       }
 
       {
-        std::string hint;
-        if (c == '@') hint = " (did you mean '&' for address-of?)";
-        else if (c == '`') hint = " (backtick strings are not supported; use double quotes)";
-        else if (c == '$') hint = " (variable sigils are not used in Xenon; write the name directly)";
-        else if (c == '\\') hint = " (standalone backslash is invalid; use it inside strings only)";
-        throw XenonError("LexError",
-                           std::string("Unexpected character '") + c + "'" + hint,
-                           tok_line, tok_col, current_line_text());
+        // ── Build a rich diagnostic with suggestion for each bad char ──────
+        std::string raw_line = current_line_text();
+        std::string msg, suggestion, fix_snip;
+        int fix_col = 0, fix_len = 0;
+
+        if (c == '$') {
+          // Count consecutive '$' starting at tok_col-1 (0-based in line)
+          // then collect the identifier that follows them.
+          int line_off = tok_col - 1; // 0-based offset in raw_line
+          int ndollar = 0;
+          size_t scan = (size_t)line_off;
+          while (scan < raw_line.size() && raw_line[scan] == '$') {
+            ndollar++;
+            scan++;
+          }
+          // Collect the identifier after the '$' run
+          size_t id_start = scan;
+          while (scan < raw_line.size() &&
+                 (std::isalnum((unsigned char)raw_line[scan]) || raw_line[scan] == '_'))
+            scan++;
+          std::string ident = raw_line.substr(id_start, scan - id_start);
+
+          msg = std::string("unexpected '") + c + "': Xenon does not use variable sigils";
+          if (ndollar == 1)
+            suggestion = "remove the '$'";
+          else
+            suggestion = "remove the " + std::to_string(ndollar) + " '$' sigils";
+          if (!ident.empty()) suggestion += " — write just '" + ident + "'";
+
+          // Build the fixed line by replacing the $...$ident region with ident
+          fix_snip = raw_line.substr(0, line_off) + ident
+                   + raw_line.substr(id_start + ident.size());
+          fix_col = line_off + 1;       // 1-based start of fix
+          fix_len = (int)ident.size();  // length of the replacement
+
+        } else if (c == '@') {
+          msg = "unexpected '@': did you mean '&' for address-of?";
+          suggestion = "use '&' instead of '@'";
+          fix_snip = raw_line;
+          fix_snip[tok_col - 1] = '&';
+          fix_col = tok_col;
+          fix_len = 1;
+
+        } else if (c == '`') {
+          // Find matching closing backtick on the same line, if any
+          size_t close = raw_line.find('`', tok_col);
+          msg = "unexpected '`': string literals use double quotes, not backticks";
+          if (close != std::string::npos) {
+            suggestion = "replace backticks with double quotes";
+            fix_snip = raw_line;
+            fix_snip[tok_col - 1] = '"';
+            fix_snip[close] = '"';
+            fix_col = tok_col;
+            fix_len = (int)(close - (tok_col - 1)) + 1;
+            // skip to just after the closing backtick so it doesn't re-fire
+            // close is 0-based offset in raw_line; pos is currently at tok_col-1
+            // so closing backtick is at pos + (close - (tok_col-1))
+            skip_after_error = pos + (close - (tok_col - 1)) + 1;
+          } else {
+            suggestion = "replace '`' with '\"'";
+            fix_snip = raw_line;
+            fix_snip[tok_col - 1] = '"';
+            fix_col = tok_col;
+            fix_len = 1;
+          }
+
+        } else if (c == '\\') {
+          msg = "unexpected '\\': standalone backslash is only valid inside string literals";
+          suggestion = "remove the backslash, or place it inside a string";
+
+        } else {
+          msg = std::string("unexpected character '") + c + "'";
+        }
+
+        throw XenonError("LexError", msg, tok_line, tok_col, raw_line,
+                          suggestion, fix_snip, fix_col, fix_len);
+      }
+      } catch (XenonError &_lex_err) {
+        // Collect error; skip the entire run of the same offending character
+        // (e.g. all four '$' in '$$$$var') so we emit one error per run, not
+        // one per character.
+        lex_errors.push_back(_lex_err.what());
+        if (skip_after_error > pos) {
+          // jump directly past a known end point (e.g. closing backtick)
+          while (pos < skip_after_error && pos < src.size()) advance_char();
+        } else {
+          char bad = (pos < src.size()) ? src[pos] : '\0';
+          if (pos < src.size()) advance_char();
+          // absorb repeated identical junk chars so we don't re-fire
+          while (pos < src.size() && src[pos] == bad &&
+                 bad != '\0' && !std::isalnum((unsigned char)bad) && bad != '_')
+            advance_char();
+        }
       }
     }
     tokens.emplace_back(TT::TEOF, "", line, col);
@@ -1188,6 +1321,19 @@ class CTranspiler {
   std::vector<std::string> headers;
   std::vector<std::string> functions;
   std::vector<std::string> main_body;
+public:
+  std::vector<std::string> transpile_errors;   // collected errors  (fatal)
+  std::vector<std::string> transpile_warnings; // collected warnings (non-fatal)
+
+  // Emit a Warning-level diagnostic — does NOT stop compilation.
+  void emit_warning(const std::string &kind, const std::string &msg,
+                    int line = 0, int col = 0) {
+    transpile_warnings.push_back(
+        XenonError("Warning", "[" + kind + "] " + msg,
+                   line > 0 ? std::optional<int>(line) : std::nullopt,
+                   col  > 0 ? std::optional<int>(col)  : std::nullopt).what());
+  }
+private:
   std::map<std::string, std::string> var_types;
   std::map<std::string, std::string>
       func_return_types; // fname → raw return type
@@ -1389,6 +1535,122 @@ class CTranspiler {
   bool _memory_safe{true};
   bool _in_unsafe_block{false};
   std::set<std::string> _unsafe_functions;
+
+  // ── Symbol tracking for undefined-function/type validation ───────────────
+  // Functions and types imported from .h files (populated by scan_h_full)
+  std::set<std::string> _h_imported_functions;
+  std::set<std::string> _h_imported_types;
+  // Functions and types imported from .xen files (populated by transpile_lh)
+  std::set<std::string> _xen_imported_functions;
+  std::set<std::string> _xen_imported_types;
+
+  // All Xenon builtin function-like keywords (emit as C calls in parse_expr /
+  // parse_statement without going through emit_call, so they never hit the
+  // undefined-call check — but we list them here for completeness and for the
+  // is_known_function() helper).
+  static const std::set<std::string> &builtin_functions() {
+    static const std::set<std::string> s = {
+      // I/O
+      "print","println","printfmt","scanf","printf","fprintf","sprintf",
+      "snprintf","sscanf","fscanf","fgets","fputs","puts","getchar","fgetc",
+      "getc","putchar","fputc","perror","gets_s",
+      // file I/O (keyword-handled in parse_statement, but also callable)
+      "fopen","fclose","fwrite","fread","fflush","ftell","fseek","frewind",
+      "rewind","feof","ferror","tmpfile","popen","pclose",
+      // string
+      "strlen","strcpy","strncpy","strcat","strncat","strcmp","strncmp",
+      "strchr","strrchr","strstr","strtok","strdup","strndup","strtol",
+      "strtod","strtoul","strtoull","strtof","strtold","atoi","atof","atol",
+      "atoll","sprintf","snprintf","sscanf","memcpy","memmove","memset",
+      "memcmp","memchr",
+      // math
+      "abs","fabs","sqrt","cbrt","pow","exp","log","log2","log10","ceil",
+      "floor","round","trunc","sin","cos","tan","asin","acos","atan","atan2",
+      "sinh","cosh","tanh","fmod","modf","frexp","ldexp","hypot","fma",
+      "fmin","fmax","isnan","isinf","isfinite",
+      // memory
+      "malloc","calloc","realloc","free","aligned_alloc",
+      // process / system
+      "exit","abort","system","execv","execve","execvp","getenv","setenv",
+      "rand","srand","time","clock","difftime","mktime","localtime",
+      "gmtime","strftime","usleep","sleep","getpid","getppid",
+      // AVX / intrinsics (common subset)
+      "_mm256_set1_ps","_mm256_set1_epi32","_mm256_setzero_ps",
+      "_mm256_setzero_si256","_mm256_load_ps","_mm256_store_ps",
+      "_mm256_loadu_ps","_mm256_storeu_ps","_mm256_add_ps","_mm256_sub_ps",
+      "_mm256_mul_ps","_mm256_div_ps","_mm256_fmadd_ps","_mm256_fnmadd_ps",
+      "_mm256_hadd_ps","_mm256_castps256_ps128","_mm_hadd_ps",
+      "_mm_cvtss_f32","_mm256_extractf128_ps","_mm256_add_epi32",
+      "_mm256_sub_epi32","_mm256_mullo_epi32","_mm256_cvtepi32_ps",
+      "_mm256_set_ps","_mm256_set_epi32","_mm256_cmp_ps","_mm256_blendv_ps",
+      "_mm256_and_ps","_mm256_or_ps","_mm256_xor_ps","_mm256_andnot_ps",
+      "_mm256_cvtps_epi32","_mm256_cvttps_epi32","_mm256_permute_ps",
+      "_mm256_permute2f128_ps","_mm256_broadcast_ss","_mm256_movemask_ps",
+      // misc C standard
+      "assert","qsort","bsearch","typeof","sizeof",
+      // Xenon runtime helpers emitted directly
+      "_lb_throw","TO_STR",
+      // hlt is a keyword but compiles to usleep
+      "hlt",
+    };
+    return s;
+  }
+
+  // All Xenon builtin type names (primitive types, always valid).
+  static const std::set<std::string> &builtin_types() {
+    static const std::set<std::string> s = {
+      "int","float","double","long","short","char","bool","void",
+      "str","u8","u32","u64","__m256","__m256i",
+      // C equivalents that appear in .h imports
+      "uint8_t","uint16_t","uint32_t","uint64_t","int8_t","int16_t",
+      "int32_t","int64_t","size_t","ptrdiff_t","ssize_t",
+      "FILE","jmp_buf","va_list","wchar_t","wint_t",
+      // common POSIX / libc types
+      "pid_t","off_t","mode_t","uid_t","gid_t","dev_t","ino_t",
+      "time_t","clock_t","suseconds_t",
+      // Xenon ptr (not a standalone type, but accepted in var declarations)
+      "ptr",
+      // C NULL / boolean
+      "NULL","true","false",
+    };
+    return s;
+  }
+
+  // Returns true if `name` is a valid callable function in this translation unit.
+  bool is_known_function(const std::string &name) const {
+    if (builtin_functions().count(name)) return true;
+    if (func_return_types.count(name))  return true; // user-defined or .h scanned
+    if (template_funcs.count(name))     return true;
+    if (_h_imported_functions.count(name)) return true;
+    if (_xen_imported_functions.count(name)) return true;
+    // operator-overloaded functions are internally mangled; also allow _Overload_*
+    if (name.size() > 10 && name.substr(0,10) == "_Overload_") return true;
+    // always-unsafe builtins are still known functions
+    if (always_unsafe_builtins().count(name)) return true;
+    // aliases resolve to known functions
+    auto ait = _aliases.find(name);
+    if (ait != _aliases.end() && is_known_function(ait->second)) return true;
+    // namespace-qualified name: check the resolved symbol
+    // (the caller already resolved ns::sym → ns__sym before calling emit_call)
+    return false;
+  }
+
+  // Returns true if `name` is a valid type name in this translation unit.
+  bool is_known_type(const std::string &name) const {
+    if (builtin_types().count(name))   return true;
+    if (var_types.count(name))         return true; // struct/enum defined in source
+    if (_h_imported_types.count(name)) return true;
+    if (_xen_imported_types.count(name)) return true;
+    if (_generic_structs.count(name))  return true;
+    // instantiated generic: Vec__int etc.
+    if (_instantiated_generic_structs.count(name)) return true;
+    // enum names are registered in _enum_names
+    if (_enum_names.count(name))       return true;
+    // aliases
+    auto ait = _aliases.find(name);
+    if (ait != _aliases.end() && is_known_type(ait->second)) return true;
+    return false;
+  }
 
   struct UnsafeViolation {
     int line, col;
@@ -4686,6 +4948,45 @@ class CTranspiler {
   // -----------------------------------------------------------------------
   std::string emit_call(const std::string &fname, const Token &call_tok,
                         const std::string &explicit_type_arg = "") {
+    // ── Undefined function check ───────────────────────────────────────────
+    // Skip the check for names that start with '_' (internal/C runtime helpers)
+    // or contain '__' (mangled namespace/struct names already validated at
+    // definition time), or are a known alias target.
+    bool skip_undef_check =
+        (!fname.empty() && fname[0] == '_') ||
+        fname.find("__") != std::string::npos;
+    if (!skip_undef_check && !is_known_function(fname)) {
+      // Build a helpful "did you mean?" list from func_return_types keys
+      std::vector<std::string> candidates;
+      for (const auto &[fn, _] : func_return_types) {
+        // Simple Levenshtein-free heuristic: share a long common prefix/suffix
+        size_t common = 0;
+        size_t minlen = std::min(fn.size(), fname.size());
+        for (size_t ci = 0; ci < minlen; ci++) {
+          if (fn[ci] == fname[ci]) common++;
+          else break;
+        }
+        if (common >= 3 || (minlen > 0 && common * 2 >= minlen))
+          candidates.push_back(fn);
+      }
+      // Build error message
+      std::string msg = "Call to undefined function '" + fname + "'.\n"
+        "  Checked: builtin functions, user-defined functions, "
+        ".xen imports, .h imports — none matched.\n"
+        "  If '" + fname + "' comes from a C header, add: link \"the_header.h\"\n"
+        "  If it comes from a .xen file, add: link \"the_file.xen\"";
+      if (!candidates.empty()) {
+        msg += "\n  Did you mean: ";
+        for (size_t ci = 0; ci < candidates.size() && ci < 3; ci++) {
+          if (ci) msg += ", ";
+          msg += "'" + candidates[ci] + "'";
+        }
+        msg += "?";
+      }
+      throw XenonError("NameError", msg, call_tok.line, call_tok.col);
+    }
+    // ──────────────────────────────────────────────────────────────────────
+
     // Collect arg start positions BEFORE consuming them
     bool is_tmpl = template_funcs.count(fname) > 0;
     std::vector<size_t> arg_starts;
@@ -5446,6 +5747,59 @@ class CTranspiler {
         (t.type == TT::IDENTIFIER &&
          ((var_types.count(t.value) && var_types[t.value] == "STRUCT") ||
           _enum_names.count(t.value)));
+
+    // ── Unknown type check ────────────────────────────────────────────────
+    // Pattern: IDENTIFIER IDENTIFIER  →  "TYPE varName" declaration.
+    // If the first IDENTIFIER is not a known type, throw immediately.
+    // We only trigger this when:
+    //   - current token is an IDENTIFIER (potential custom type name)
+    //   - next token is also an IDENTIFIER (potential variable name)
+    //   - it is NOT already a recognised keyword type (handled by type_decl_toks)
+    //   - it is NOT followed by '(' (that would be a function call, handled below)
+    //   - it is NOT followed by '=', '[', '.', '::', '++', '--' (assignment / expression)
+    // This specifically catches  awddawd x = dawd()  or  awddawd x;
+    if (t.type == TT::IDENTIFIER && !is_custom &&
+        pos + 1 < tokens.size() &&
+        tokens[pos + 1].type == TT::IDENTIFIER &&
+        // Make sure token after next is not '(' — that would make t a function call
+        !(pos + 2 < tokens.size() && tokens[pos + 2].type == TT::LPAREN)) {
+      // Possibly a "TYPE varName" declaration with an unknown type.
+      // Confirm: this pattern should not look like "existingVar anotherVar"
+      // (that's not valid Xenon anyway, so we still want an error).
+      // Only skip the check if t.value is in var_types as a variable (not a STRUCT).
+      bool is_existing_var = var_types.count(t.value) && var_types[t.value] != "STRUCT";
+      if (!is_existing_var && !is_known_type(t.value)) {
+        // Build helpful candidates from struct_field_types and var_types
+        std::vector<std::string> type_candidates;
+        for (const auto &[tn, tv] : var_types) {
+          if (tv == "STRUCT" || tv == "GENERIC_STRUCT") {
+            size_t common = 0;
+            size_t minlen = std::min(tn.size(), t.value.size());
+            for (size_t ci = 0; ci < minlen; ci++) {
+              if (tn[ci] == t.value[ci]) common++;
+              else break;
+            }
+            if (common >= 3 || (minlen > 0 && common * 2 >= minlen))
+              type_candidates.push_back(tn);
+          }
+        }
+        std::string tmsg = "Unknown type '" + t.value + "'.\n"
+          "  Checked: builtin types (int, float, str, bool, …), "
+          "user-defined structs/enums, .xen imports, .h imports — none matched.\n"
+          "  If '" + t.value + "' is from a C header, add: link \"the_header.h\"\n"
+          "  If it is from a .xen file, add: link \"the_file.xen\"";
+        if (!type_candidates.empty()) {
+          tmsg += "\n  Did you mean: ";
+          for (size_t ci = 0; ci < type_candidates.size() && ci < 3; ci++) {
+            if (ci) tmsg += ", ";
+            tmsg += "'" + type_candidates[ci] + "'";
+          }
+          tmsg += "?";
+        }
+        throw XenonError("TypeError", tmsg, t.line, t.col);
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────
     static const std::set<TT> type_decl_toks = {
         TT::INT,     TT::FLOAT,   TT::STR,  TT::PTR,  TT::LONG,
         TT::SHORT,   TT::DOUBLE,  TT::VOID, TT::M256, TT::M256I,
@@ -6790,31 +7144,130 @@ class CTranspiler {
 
       bool func_is_unsafe = _unsafe_functions.count(fname) > 0;
 
-      if (!violations.empty() && !func_is_unsafe) {
-        std::ostringstream msg;
-        msg << "function '" << fname << "' contains unsafe operations "
-            << "but is not declared 'unsafe function'.\n"
-            << "  Found " << violations.size() << " violation(s):\n";
-        for (const auto &v : violations) {
-          msg << "    [" << v.kind << "]";
-          if (v.line > 0) msg << " line " << v.line << ":" << v.col;
-          msg << " — " << v.message << "\n";
-        }
-        msg << "  Fix: declare the function as 'unsafe function', wrap each\n"
-            << "  unsafe operation in 'unsafe { }' inside an unsafe function,\n"
-            << "  or pass -no-check to disable safety analysis entirely.";
-        var_types = saved_var_types;
-        _cur_func = saved_cur_func;
-        _cur_func_ret = saved_cur_func_ret;
-        throw XenonError("SafetyError", msg.str(), fn_tok.line, fn_tok.col);
-      }
+      if (!violations.empty()) {
+        // ── Partition violations: hard errors vs warnings ─────────────────
+        // Hard: undefined behaviour or correctness bugs that must be fixed.
+        // Soft: style/safety hints that compile fine but deserve attention.
+        static const std::set<std::string> warn_kinds = {
+          "ShadowedVariable", "SignedUnsignedMismatch",
+          "ImplicitNarrowing", "UnusedReturnValue",
+        };
 
-      if (!violations.empty() && func_is_unsafe) {
-        bool all_in_unsafe_blocks = true;
+        // Rephrase each violation message to be crisp (≤ one line).
+        auto crisp = [](const UnsafeViolation &v) -> std::string {
+          // ShadowedVariable
+          if (v.kind == "ShadowedVariable")
+            return "'" + v.message.substr(v.message.find("'") + 0,
+                     v.message.find("'", 1) - 0 + 1) // keep quoted name intact
+                   .substr(0, v.message.find(" shadows"))
+                   + " shadows an outer variable — rename one of them";
+          // SignedUnsignedMismatch — extract just the types
+          if (v.kind == "SignedUnsignedMismatch") {
+            size_t a = v.message.find("'"), b = v.message.find("'", a+1);
+            size_t c = v.message.find("'", b+1), d = v.message.find("'", c+1);
+            std::string st = (a!=std::string::npos && b!=std::string::npos)
+                              ? v.message.substr(a+1,b-a-1) : "signed";
+            std::string ut = (c!=std::string::npos && d!=std::string::npos)
+                              ? v.message.substr(c+1,d-c-1) : "unsigned";
+            return "signed/unsigned comparison (" + st + " vs " + ut +
+                   ") — negative values compare greater than large unsigned ones";
+          }
+          // ImplicitNarrowing — keep it short
+          if (v.kind == "ImplicitNarrowing") {
+            size_t a = v.message.find("'"), b = v.message.find("'",a+1);
+            size_t c = v.message.find("'",b+1), d = v.message.find("'",c+1);
+            std::string wide = (c!=std::string::npos && d!=std::string::npos)
+                               ? v.message.substr(c+1,d-c-1) : "wider";
+            size_t e = v.message.find("'",d+1), f = v.message.find("'",e+1);
+            std::string narrow = (e!=std::string::npos && f!=std::string::npos)
+                                 ? v.message.substr(e+1,f-e-1) : "narrower";
+            return "narrowing: '" + wide + "' → '" + narrow +
+                   "' may truncate — use cast(" + narrow + ", ...) to silence";
+          }
+          // UnusedReturnValue
+          if (v.kind == "UnusedReturnValue") {
+            size_t a = v.message.find("'"), b = v.message.find("'",a+1);
+            std::string fn = (a!=std::string::npos && b!=std::string::npos)
+                             ? v.message.substr(a+1,b-a-1) : "function";
+            size_t c = v.message.find("'",b+1), d = v.message.find("'",c+1);
+            std::string rt = (c!=std::string::npos && d!=std::string::npos)
+                             ? v.message.substr(c+1,d-c-1) : "?";
+            return "return value of '" + fn + "' (" + rt + ") ignored";
+          }
+          // UseAfterFree
+          if (v.kind == "UseAfterFree")
+            return v.message;
+          // NullDeref
+          if (v.kind == "NullDeref")
+            return v.message;
+          // ConstViolation
+          if (v.kind == "ConstViolation") {
+            size_t a = v.message.find("'"), b = v.message.find("'",a+1);
+            std::string nm = (a!=std::string::npos && b!=std::string::npos)
+                             ? v.message.substr(a+1,b-a-1) : "variable";
+            return "'" + nm + "' is const — cannot assign after declaration";
+          }
+          // UnreachableCode
+          if (v.kind == "UnreachableCode")
+            return "unreachable code after 'return'";
+          // Uninitialised
+          if (v.kind == "Uninitialised") {
+            size_t a = v.message.find("'"), b = v.message.find("'",a+1);
+            std::string nm = (a!=std::string::npos && b!=std::string::npos)
+                             ? v.message.substr(a+1,b-a-1) : "variable";
+            return "'" + nm + "' used before initialisation";
+          }
+          // DivisionByZero
+          if (v.kind == "DivisionByZero")
+            return "division by zero — undefined behaviour";
+          // IntegerOverflow
+          if (v.kind == "IntegerOverflow") {
+            size_t a = v.message.find("literal value ");
+            size_t b = v.message.find(" ", a + 14);
+            std::string lit = (a!=std::string::npos && b!=std::string::npos)
+                              ? v.message.substr(a+14, b-a-14) : "";
+            size_t c = v.message.find("type '"), d = v.message.find("'", c+6);
+            std::string ty = (c!=std::string::npos && d!=std::string::npos)
+                             ? v.message.substr(c+6,d-c-6) : "type";
+            return "value " + lit + " overflows '" + ty + "'";
+          }
+          // StrMutation
+          if (v.kind == "StrMutation") {
+            size_t a = v.message.find("'"), b = v.message.find("'",a+1);
+            std::string nm = (a!=std::string::npos && b!=std::string::npos)
+                             ? v.message.substr(a+1,b-a-1) : "str";
+            return "mutating str '" + nm + "' via index — wrap in unsafe { }";
+          }
+          return v.message;
+        };
+
+        // Emit warnings immediately (non-fatal)
         for (const auto &v : violations) {
-          (void)v;
+          if (warn_kinds.count(v.kind))
+            emit_warning(v.kind, crisp(v), v.line, v.col);
         }
-        (void)all_in_unsafe_blocks;
+
+        // Collect hard errors
+        std::vector<UnsafeViolation> hard;
+        for (const auto &v : violations)
+          if (!warn_kinds.count(v.kind) && !func_is_unsafe)
+            hard.push_back(v);
+
+        if (!hard.empty()) {
+          std::ostringstream msg;
+          msg << "'" << fname << "' has " << hard.size()
+              << " unsafe operation" << (hard.size() > 1 ? "s" : "")
+              << " — declare as 'unsafe function' or wrap each in 'unsafe { }'";
+          for (const auto &v : hard) {
+            msg << "\n    [" << v.kind << "]";
+            if (v.line > 0) msg << " line " << v.line << ":" << v.col;
+            msg << " — " << crisp(v);
+          }
+          var_types = saved_var_types;
+          _cur_func = saved_cur_func;
+          _cur_func_ret = saved_cur_func_ret;
+          throw XenonError("SafetyError", msg.str(), fn_tok.line, fn_tok.col);
+        }
       }
     }
     // Record for the return-statement validator
@@ -6966,142 +7419,377 @@ class CTranspiler {
   }
 
   // -----------------------------------------------------------------------
-  // Scan a .h file for function signatures via clang -ast-dump=json
-  // Extracts every FunctionDecl: name + return type, no hardcoding.
-  // Falls back silently if clang not available or file unreadable.
+  // System include search paths (queried once from gcc -v, cached).
   // -----------------------------------------------------------------------
-  void scan_h_for_funcs(const std::string &path) {
-    if (!fs::exists(path))
-      return;
-
-    // build clang command — dump AST as JSON, suppress system header noise
-    std::string cmd = "clang -Xclang -ast-dump=json -fsyntax-only "
-                      "-fno-color-diagnostics \"" +
-                      path + "\" 2>/dev/null";
-    FILE *pipe = popen(cmd.c_str(), "r");
-    if (!pipe)
-      return;
-
-    // read all output
-    std::string json;
-    char buf[4096];
-    while (fgets(buf, sizeof(buf), pipe))
-      json += buf;
-    pclose(pipe);
-
-    if (json.empty())
-      return;
-
-    // -------------------------------------------------------------------
-    // Minimal JSON walk — no external lib needed.
-    // We look for the pattern:
-    //   "kind": "FunctionDecl"   (anywhere in an object)
-    //   "name": "<fname>"        (in same object)
-    //   "type": { "qualType": "<rettype> (<params>)" }
-    //
-    // Strategy: scan for "kind":"FunctionDecl", then within the same
-    // brace-scope grab "name" and "qualType".
-    // -------------------------------------------------------------------
-    auto json_str_val = [&](const std::string &src, size_t from,
-                            const std::string &key) -> std::string {
-      // find "key" : "value" starting at from, return value or ""
-      std::string needle = "\"" + key + "\"";
-      size_t k = src.find(needle, from);
-      if (k == std::string::npos)
-        return "";
-      size_t colon = src.find(':', k + needle.size());
-      if (colon == std::string::npos)
-        return "";
-      size_t q1 = src.find('"', colon + 1);
-      if (q1 == std::string::npos)
-        return "";
-      size_t q2 = q1 + 1;
-      while (q2 < src.size() && !(src[q2] == '"' && src[q2 - 1] != '\\'))
-        q2++;
-      return src.substr(q1 + 1, q2 - q1 - 1);
-    };
-
-    // find matching closing brace for object starting at `open` (which is '{')
-    auto find_close = [&](const std::string &src, size_t open) -> size_t {
-      int depth = 0;
-      bool in_str = false;
-      for (size_t i = open; i < src.size(); i++) {
-        if (in_str) {
-          if (src[i] == '\\') {
-            i++;
-            continue;
-          }
-          if (src[i] == '"')
-            in_str = false;
-        } else {
-          if (src[i] == '"') {
-            in_str = true;
-            continue;
-          }
-          if (src[i] == '{')
-            depth++;
-          else if (src[i] == '}') {
-            if (--depth == 0)
-              return i;
-          }
-        }
+  static std::vector<std::string> system_include_paths() {
+    static std::vector<std::string> cached;
+    static bool done = false;
+    if (done) return cached;
+    done = true;
+    // Ask gcc where it searches for system headers
+    FILE *p = popen("gcc -x c -v -fsyntax-only /dev/null 2>&1", "r");
+    if (!p) { cached = {"/usr/include","/usr/local/include"}; return cached; }
+    std::string out;
+    char buf[512];
+    while (fgets(buf, sizeof(buf), p)) out += buf;
+    pclose(p);
+    // Parse lines between "#include <...> search starts here:" and "End of search"
+    bool in_section = false;
+    std::istringstream ss(out);
+    std::string line;
+    while (std::getline(ss, line)) {
+      if (line.find("#include <...>") != std::string::npos) { in_section = true; continue; }
+      if (in_section && line.find("End of search") != std::string::npos) break;
+      if (in_section && !line.empty() && line[0] == ' ') {
+        std::string p2 = line.substr(1);
+        while (!p2.empty() && (p2.back() == ' ' || p2.back() == '\n' || p2.back() == '\r'))
+          p2.pop_back();
+        if (!p2.empty()) cached.push_back(p2);
       }
-      return std::string::npos;
-    };
-
-    const std::string kind_needle = "\"kind\":\"FunctionDecl\"";
-    // normalised search: clang may emit spaces around colon
-    // so also try with spaces
-    size_t search = 0;
-    while (search < json.size()) {
-      // find next FunctionDecl
-      size_t kpos = json.find("\"FunctionDecl\"", search);
-      if (kpos == std::string::npos)
-        break;
-
-      // walk back to find the opening '{' of this object
-      size_t obj_start = json.rfind('{', kpos);
-      if (obj_start == std::string::npos) {
-        search = kpos + 1;
-        continue;
-      }
-
-      size_t obj_end = find_close(json, obj_start);
-      if (obj_end == std::string::npos) {
-        search = kpos + 1;
-        continue;
-      }
-
-      std::string obj = json.substr(obj_start, obj_end - obj_start + 1);
-
-      // extract name
-      std::string fname = json_str_val(obj, 0, "name");
-      // extract qualType — looks like "vec3 (float, float, float)"
-      std::string qual_type = json_str_val(obj, 0, "qualType");
-
-      if (!fname.empty() && !qual_type.empty()) {
-        // return type is everything before the first '('
-        size_t paren = qual_type.find('(');
-        if (paren != std::string::npos) {
-          std::string ret = qual_type.substr(0, paren);
-          // trim trailing spaces and pointer stars into clean base type
-          while (!ret.empty() && (ret.back() == ' ' || ret.back() == '\t'))
-            ret.pop_back();
-          // keep pointer stars as part of type (e.g. "char *" → "char*")
-          // normalise: remove spaces before *
-          std::string norm;
-          for (size_t i = 0; i < ret.size(); i++) {
-            if (ret[i] == ' ' && i + 1 < ret.size() && ret[i + 1] == '*')
-              continue;
-            norm += ret[i];
-          }
-          if (!norm.empty() && fname != "operator")
-            func_return_types[fname] = norm;
-        }
-      }
-
-      search = obj_end + 1;
     }
+    if (cached.empty()) cached = {"/usr/include","/usr/local/include","/usr/include/x86_64-linux-gnu"};
+    return cached;
+  }
+
+  // -----------------------------------------------------------------------
+  // Find a .h file: local → _include_paths → system include paths.
+  // Returns full path or "" if not found anywhere.
+  // -----------------------------------------------------------------------
+  std::string find_h_on_system(const std::string &fname) const {
+    // 1. Absolute path
+    if (fs::path(fname).is_absolute() && fs::exists(fname))
+      return fs::weakly_canonical(fname).string();
+    // 2. Relative to source dir
+    {
+      std::string c = (fs::path(_source_dir) / fname).string();
+      if (fs::exists(c)) return fs::weakly_canonical(c).string();
+    }
+    // 3. -l include paths
+    for (const auto &ip : _include_paths) {
+      std::string c = (fs::path(ip) / fname).string();
+      if (fs::exists(c)) return fs::weakly_canonical(c).string();
+    }
+    // 4. System paths
+    for (const auto &sp : system_include_paths()) {
+      std::string c = (fs::path(sp) / fname).string();
+      if (fs::exists(c)) return fs::weakly_canonical(c).string();
+    }
+    return "";
+  }
+
+  // -----------------------------------------------------------------------
+  // Trim leading/trailing whitespace from a string (in-place helper).
+  // -----------------------------------------------------------------------
+  static void trim(std::string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) { s.clear(); return; }
+    size_t b = s.find_last_not_of(" \t\r\n");
+    s = s.substr(a, b - a + 1);
+  }
+  static std::string trimmed(std::string s) { trim(s); return s; }
+
+  // -----------------------------------------------------------------------
+  // Normalise a C type string: collapse spaces before *, remove trailing ws.
+  // "char *"  → "char*"   "unsigned int " → "unsigned int"
+  // -----------------------------------------------------------------------
+  static std::string norm_ctype(const std::string &raw) {
+    std::string s = trimmed(raw);
+    // collapse "type *" → "type*" and "type **" → "type**"
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) {
+      if (s[i] == ' ' && i + 1 < s.size() && s[i+1] == '*') continue;
+      out += s[i];
+    }
+    // also handle "const " prefix — keep it for correctness
+    return out;
+  }
+
+  // -----------------------------------------------------------------------
+  // scan_h_full: parse a .h file (or locate it on system paths) and extract:
+  //   • typedef struct { ... } Name  → struct_field_types[Name]
+  //   • struct Name { ... }          → struct_field_types[Name]
+  //   • RetType FuncName(...)        → func_return_types[FuncName]
+  //
+  // Uses  gcc -E  (preprocessor) to flatten #includes and macros first,
+  // then applies a line-by-line C parser for structs and function decls.
+  // Falls back silently if gcc is unavailable.
+  //
+  // 'path' must already be resolved; call find_h_on_system() first.
+  // -----------------------------------------------------------------------
+  void scan_h_full(const std::string &path) {
+    if (path.empty() || !fs::exists(path)) return;
+
+    // ── 1. Preprocess with gcc -E ─────────────────────────────────────────
+    // Build include flags so the header can find its own transitive deps.
+    std::string inc_flags;
+    for (const auto &ip : _include_paths)
+      inc_flags += " -I\"" + ip + "\"";
+    for (const auto &sp : system_include_paths())
+      inc_flags += " -isystem \"" + sp + "\"";
+
+    std::string cmd = "gcc -E -dD -P" + inc_flags + " \"" + path + "\" 2>/dev/null";
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (!pipe) return;
+    std::string src;
+    char buf[8192];
+    while (fgets(buf, sizeof(buf), pipe)) src += buf;
+    pclose(pipe);
+    if (src.empty()) return;
+
+    // ── 2. Tokenise preprocessed text into logical lines ──────────────────
+    // Collapse multi-line constructs (struct bodies etc.) into single logical
+    // lines by tracking brace depth.  We emit each top-level declaration as
+    // one string.
+    std::vector<std::string> decls;
+    {
+      std::string cur;
+      int brace = 0;
+      bool in_str = false, in_char = false, in_lc = false, in_bc = false;
+      for (size_t i = 0; i < src.size(); i++) {
+        char c = src[i];
+        // line comments (from -dD macros)
+        if (!in_str && !in_char && !in_bc && c == '/' && i+1<src.size() && src[i+1]=='/') {
+          while (i < src.size() && src[i] != '\n') i++;
+          continue;
+        }
+        // block comments
+        if (!in_str && !in_char && c == '/' && i+1<src.size() && src[i+1]=='*') {
+          i += 2;
+          while (i+1 < src.size() && !(src[i]=='*' && src[i+1]=='/')) i++;
+          i++;
+          continue;
+        }
+        if (c == '"' && !in_char) { in_str = !in_str; cur += c; continue; }
+        if (c == '\'' && !in_str) { in_char = !in_char; cur += c; continue; }
+        if (in_str || in_char) { cur += c; continue; }
+        if (c == '{') { brace++; cur += c; continue; }
+        if (c == '}') { brace--; cur += c;
+          if (brace == 0) {
+            // Consume everything up to and including the next ';' at depth 0.
+            // This captures the typedef tag name: "} Point;" → appends " Point;"
+            size_t j = i+1;
+            while (j < src.size() && src[j] != ';' && src[j] != '{') j++;
+            if (j < src.size() && src[j] == ';') {
+              cur += src.substr(i+1, j-i); // includes the ';'
+              i = j;
+            }
+            decls.push_back(cur); cur.clear();
+          }
+          continue;
+        }
+        if (brace == 0 && c == ';') {
+          cur += c;
+          std::string d = trimmed(cur);
+          if (!d.empty()) decls.push_back(d);
+          cur.clear();
+          continue;
+        }
+        // normalise whitespace at brace depth 0
+        if (brace == 0 && (c=='\n'||c=='\r')) {
+          if (!cur.empty() && cur.back() != ' ') cur += ' ';
+          continue;
+        }
+        cur += c;
+      }
+      if (!trimmed(cur).empty()) decls.push_back(trimmed(cur));
+    }
+
+    // ── 3. Parse each declaration ─────────────────────────────────────────
+    // Helper: does a string contain a '{' → it is a struct/union body
+    auto has_body = [](const std::string &d) {
+      return d.find('{') != std::string::npos;
+    };
+
+    // Helper: extract field name and type from "type name" or "type *name" etc.
+    // Returns {"", ""} on failure.
+    auto parse_field = [&](const std::string &fld) -> std::pair<std::string,std::string> {
+      std::string s = trimmed(fld);
+      if (s.empty()) return {"",""};
+      // Remove array suffixes like "float x[4]" → field name "x", type "float"
+      // Also skip function pointer fields (contain '(')
+      if (s.find('(') != std::string::npos) return {"",""};
+      // strip array suffix
+      size_t lb = s.find('[');
+      if (lb != std::string::npos) s = trimmed(s.substr(0, lb));
+      // last token is the name
+      size_t sp = s.rfind(' ');
+      if (sp == std::string::npos) return {"",""};
+      std::string name = trimmed(s.substr(sp+1));
+      std::string type = norm_ctype(trimmed(s.substr(0, sp)));
+      // strip leading '*' from name → move to type
+      while (!name.empty() && name[0] == '*') { type += '*'; name = name.substr(1); }
+      if (name.empty() || type.empty()) return {"",""};
+      // skip keywords that aren't field names
+      static const std::set<std::string> skip = {"const","volatile","restrict","static","inline"};
+      if (skip.count(name)) return {"",""};
+      return {name, type};
+    };
+
+    // Helper: extract fields from a struct body string "{ type name; type name; ... }"
+    auto parse_struct_body = [&](const std::string &body, const std::string &sname) {
+      auto &fmap = struct_field_types[sname];
+      // strip outer braces
+      size_t ob = body.find('{'), cb = body.rfind('}');
+      if (ob == std::string::npos || cb == std::string::npos) return;
+      std::string inner = body.substr(ob+1, cb-ob-1);
+      // split on ';'
+      size_t p = 0;
+      while (p < inner.size()) {
+        size_t semi = inner.find(';', p);
+        if (semi == std::string::npos) break;
+        std::string fld = trimmed(inner.substr(p, semi-p));
+        p = semi + 1;
+        if (fld.empty()) continue;
+        // skip nested struct/union (contains '{')
+        if (fld.find('{') != std::string::npos) continue;
+        auto [fn, ft] = parse_field(fld);
+        if (!fn.empty() && !ft.empty())
+          fmap[fn] = ft;
+      }
+    };
+
+    // Helper: parse function return type from "RetType fname(..." 
+    // where the '(' marks the split.
+    auto parse_func_decl = [&](const std::string &d) {
+      // skip if it's a macro define or typedef-only
+      if (d.substr(0,7) == "#define" || d.substr(0,8) == "typedef ") return;
+      size_t lp = d.find('(');
+      if (lp == std::string::npos) return;
+      std::string before = trimmed(d.substr(0, lp));
+      // last whitespace-separated token before '(' is the function name
+      // handle "(*name)" function pointers — skip them
+      if (before.find('*') != std::string::npos && before.find('(') != std::string::npos)
+        return;
+      size_t sp2 = before.rfind(' ');
+      if (sp2 == std::string::npos) return;
+      std::string fn = trimmed(before.substr(sp2+1));
+      std::string ret = norm_ctype(trimmed(before.substr(0, sp2)));
+      // strip leading '*' from fn → pointer return type
+      while (!fn.empty() && fn[0]=='*') { ret += '*'; fn = fn.substr(1); }
+      if (fn.empty() || ret.empty()) return;
+      // skip C keywords that aren't identifiers
+      static const std::set<std::string> skip2 = {
+        "if","else","while","for","do","return","switch","case","default",
+        "break","continue","sizeof","typedef","struct","union","enum",
+        "static","extern","inline","const","volatile","restrict"
+      };
+      if (skip2.count(fn)) return;
+      // must start with letter or underscore
+      if (!std::isalpha((unsigned char)fn[0]) && fn[0]!='_') return;
+      func_return_types.emplace(fn, ret); // emplace: don't overwrite user-defined
+      _h_imported_functions.insert(fn);
+    };
+
+    for (const auto &d : decls) {
+      std::string s = trimmed(d);
+      if (s.empty() || s[0] == '#') continue; // skip macro lines
+
+      // ── typedef struct { ... } Name; ─────────────────────────────────
+      if (s.substr(0, 8) == "typedef " && has_body(s)) {
+        // extract tag after closing '}'
+        size_t cb = s.rfind('}');
+        if (cb != std::string::npos) {
+          std::string tag = trimmed(s.substr(cb+1));
+          // remove trailing ';'
+          while (!tag.empty() && tag.back()==';') tag.pop_back();
+          trim(tag);
+          if (!tag.empty() && tag.find(' ')==std::string::npos) {
+            parse_struct_body(s, tag);
+            // Also register as a known struct type so is_custom triggers
+            var_types[tag] = "STRUCT";
+            _h_imported_types.insert(tag);
+          }
+        }
+        continue;
+      }
+
+      // ── struct Name { ... }; ─────────────────────────────────────────
+      if ((s.substr(0,7)=="struct " || s.substr(0,6)=="union ") && has_body(s)) {
+        size_t sp3 = s.find(' ');
+        size_t ob  = s.find('{');
+        if (sp3 != std::string::npos && ob != std::string::npos) {
+          std::string sname = trimmed(s.substr(sp3+1, ob-sp3-1));
+          if (!sname.empty() && sname.find(' ')==std::string::npos) {
+            parse_struct_body(s, sname);
+            var_types[sname] = "STRUCT";
+            _h_imported_types.insert(sname);
+          }
+        }
+        continue;
+      }
+
+      // ── typedef Name AliasName; (no body) ────────────────────────────
+      if (s.substr(0,8) == "typedef " && !has_body(s)) {
+        // typedef struct Foo Foo; or typedef int MyInt; or typedef enum E E; etc.
+        std::string rest = trimmed(s.substr(8));
+        while (!rest.empty() && rest.back()==';') rest.pop_back();
+        trim(rest);
+        size_t sp3 = rest.rfind(' ');
+        if (sp3 != std::string::npos) {
+          std::string alias = trimmed(rest.substr(sp3+1));
+          std::string orig  = trimmed(rest.substr(0, sp3));
+          // strip leading '*' from alias (e.g. typedef int *IntPtr)
+          while (!alias.empty() && alias[0] == '*') alias = alias.substr(1);
+          if (!alias.empty() && alias.find(' ')==std::string::npos) {
+            if (struct_field_types.count(orig) || var_types.count(orig)) {
+              var_types[alias] = var_types.count(orig) ? var_types[orig] : "STRUCT";
+              if (struct_field_types.count(orig) && !struct_field_types.count(alias))
+                struct_field_types[alias] = struct_field_types[orig];
+            } else {
+              // Plain typedef (int, unsigned, function pointer, etc.)
+              var_types[alias] = orig;
+            }
+            _h_imported_types.insert(alias);
+          }
+        }
+        continue;
+      }
+
+      // ── enum Name { ... }; or typedef enum { ... } Name; ─────────────
+      if (has_body(s) &&
+          (s.substr(0,5) == "enum " || s.find("enum ") != std::string::npos)) {
+        size_t cb = s.rfind('}');
+        if (cb != std::string::npos) {
+          std::string tail = trimmed(s.substr(cb+1));
+          while (!tail.empty() && tail.back()==';') tail.pop_back();
+          trim(tail);
+          if (!tail.empty() && tail.find(' ')==std::string::npos) {
+            // typedef enum { ... } Name;
+            _enum_names.insert(tail);
+            var_types[tail] = "ENUM";
+            _h_imported_types.insert(tail);
+          } else {
+            // enum Name { ... };
+            size_t epos = s.find("enum ");
+            if (epos != std::string::npos) {
+              size_t ob = s.find('{', epos);
+              if (ob != std::string::npos) {
+                std::string ename = trimmed(s.substr(epos+5, ob-(epos+5)));
+                if (!ename.empty() && ename.find(' ')==std::string::npos) {
+                  _enum_names.insert(ename);
+                  var_types[ename] = "ENUM";
+                  _h_imported_types.insert(ename);
+                }
+              }
+            }
+          }
+        }
+        continue;
+      }
+
+      // ── Everything else: try as a function declaration or definition ──
+      // parse_func_decl only inspects the text before the first '(', so it
+      // correctly extracts the name/return-type from both bare declarations
+      // ("void foo();") and inline definitions ("void foo() { ... }").
+      parse_func_decl(s);
+    }
+  }
+
+  // Convenience: resolve fname on all paths then call scan_h_full.
+  // Replaces the old scan_h_for_funcs call sites.
+  void scan_h_for_funcs(const std::string &path) {
+    // Keep the old name so existing call sites don't need changing.
+    scan_h_full(path);
   }
 
   // -----------------------------------------------------------------------
@@ -7321,9 +8009,12 @@ class CTranspiler {
 
     for (auto const &[name, type_str] : lh.var_types) {
       this->var_types[name] = type_str;
+      if (type_str == "STRUCT" || type_str == "GENERIC_STRUCT")
+        this->_xen_imported_types.insert(name);
     }
     for (auto const &[name, type_str] : lh.func_return_types) {
       this->func_return_types[name] = type_str;
+      this->_xen_imported_functions.insert(name);
     }
     for (auto const &[name, ptypes] : lh.func_param_types) {
       this->func_param_types[name] = ptypes;
@@ -7355,6 +8046,12 @@ class CTranspiler {
     this->_lh_included = lh._lh_included;
     for (auto const &uf : lh._unsafe_functions)
       this->_unsafe_functions.insert(uf);
+    for (const auto &fn : lh._xen_imported_functions)
+      this->_xen_imported_functions.insert(fn);
+    for (const auto &tn : lh._xen_imported_types)
+      this->_xen_imported_types.insert(tn);
+    for (const auto &en : lh._enum_names)
+      this->_enum_names.insert(en);
   }
 
 public:
@@ -7578,17 +8275,25 @@ public:
           if (ends_with(ft.value, ".xen"))
             transpile_lh(ft.value, ft);
           else {
-            headers.push_back("#include \"" + ft.value + "\"");
-            // scan for type inference
-            std::string local = (fs::path(_source_dir) / ft.value).string();
-            if (fs::exists(local))
-              scan_h_for_funcs(local);
-            for (const auto &ipath : _include_paths) {
-              std::string candidate = (fs::path(ipath) / ft.value).string();
-              if (fs::exists(candidate)) {
-                scan_h_for_funcs(candidate);
-                break;
-              }
+            // Resolve the .h on local paths, -l paths, and system include paths.
+            std::string h_path = find_h_on_system(ft.value);
+            if (h_path.empty()) {
+              // Not found — emit as a bare #include and warn; C compiler may find it.
+              headers.push_back("#include <" + ft.value + ">");
+              emit_warning("LinkWarning",
+                "'" + ft.value + "' not found on include paths or system paths — "
+                "type/function info unavailable; add -l<path> if it's non-standard",
+                ft.line, ft.col);
+            } else {
+              // Emit as angle-bracket or quoted include depending on whether it's system
+              bool is_sys = false;
+              for (const auto &sp : system_include_paths())
+                if (h_path.find(sp) == 0) { is_sys = true; break; }
+              if (is_sys)
+                headers.push_back("#include <" + ft.value + ">");
+              else
+                headers.push_back("#include \"" + ft.value + "\"");
+              scan_h_full(h_path);
             }
           }
         } else {
@@ -7597,13 +8302,17 @@ public:
           if (!stmt.empty())
             main_body.push_back(line_directive(tok) + stmt);
         }
-      } catch (XenonError &) {
-        throw;
+      } catch (XenonError &_tr_err) {
+        // Collect error; advance past the offending token so we can continue
+        // parsing and surface all errors in one pass.
+        transpile_errors.push_back(_tr_err.what());
+        if (current().type != TT::TEOF) advance();
       } catch (std::exception &e) {
-        throw XenonError("InternalError",
+        transpile_errors.push_back(XenonError("InternalError",
                            std::string("Unexpected error near '") + tok.value +
                                "': " + e.what(),
-                           tok.line, tok.col);
+                           tok.line, tok.col).what());
+        if (current().type != TT::TEOF) advance();
       }
     }
 
@@ -7781,7 +8490,14 @@ int main(int argc, char **argv) {
     // Provide the global source buffer so thrown XenonError's can show
     // the snippet/file even when individual throw sites omit it.
     set_current_source_for_errors(source, fs::weakly_canonical(inf).string());
-    tokens = Lexer(source, prescan_addop_symbols(source)).tokenize();
+    Lexer lexer(source, prescan_addop_symbols(source));
+    tokens = lexer.tokenize();
+    if (!lexer.lex_errors.empty()) {
+      for (const auto &err : lexer.lex_errors)
+        std::cerr << err;
+      die("Compilation stopped: " + std::to_string(lexer.lex_errors.size()) +
+          " lex error(s) found.");
+    }
   } catch (XenonError &e) {
     die(e.what());
   } catch (std::exception &e) {
@@ -7800,6 +8516,19 @@ int main(int argc, char **argv) {
     CTranspiler tr(tokens, tcc_mode, !no_check);
     c_code = tr.transpile(source_dir, source_file, manual_main, include_paths,
                           emit_line_dirs);
+    if (!tr.transpile_errors.empty()) {
+      for (const auto &err : tr.transpile_errors)
+        std::cerr << err;
+      die("Compilation stopped: " + std::to_string(tr.transpile_errors.size()) +
+          " error(s) found.");
+    }
+    if (!tr.transpile_warnings.empty()) {
+      for (const auto &w : tr.transpile_warnings)
+        std::cerr << w;
+      log(ansi::warn_tag("!") + " " + ansi::byellow()
+          + std::to_string(tr.transpile_warnings.size()) + " warning(s)"
+          + ansi::reset());
+    }
   } catch (XenonError &e) {
     die(e.what());
   } catch (std::exception &e) {

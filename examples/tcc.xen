@@ -1,8 +1,6 @@
 link "String.xen"
+link "something.h"
 function int main(){
-    ptr int y = malloc(100 * sizeof(int))
-    String x = std::string::New("Hello World!")
-    std::string::Print(&x)
-    free(y)
-    return 0
+    aoihfeoifhseoif() dwad aw()
+    dwadefih x = dawd awd()
 }
