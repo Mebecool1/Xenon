@@ -1,5 +1,8 @@
+link "String.xen"
 function int main(){
-    
-    println(/)
-    ptr int y = calloc(10, 4)
+    ptr int y = malloc(100 * sizeof(int))
+    String x = std::string::New("Hello World!")
+    std::string::Print(&x)
+    free(y)
+    return 0
 }
