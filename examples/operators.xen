@@ -1,43 +1,5 @@
-/*
-link "MathGraphic.xen"
-overload operator(+) args(a: vec2f, b: vec2f) type(vec2f) {
-    return gmath::vec2Add(a, b)
-} 
-let x = gmath::v2(1, 2)
-let y = gmath::v2(2, 3)
-let z = x + y
-println(z.x)
-println(z.y)
-*/
-
-
-link "String.xen"
-/*
-String Some = string::New("Hello World!")
-string::Print(&Some)
-String SomeOther = string::New("Hello World!")
-string::Print(&SomeOther)
-if Some == SomeOther then
-  println("Some is same as SomeOther")
-else
-  println("Some and SomeOther are different")
-end
-*/
-/*
-String Some = string::New("Hello World!\n")
-string::Print(&Some)
-String SomeOther = string::New("Hello World!")
-string::Print(&SomeOther)
-
-int thing = &Some << SomeOther
-string::Print(&Some)
-*/
-String Some = string::New("Hello World!\n")
-
-String SomeOther = string::New("Hello World!")
-
-
-String xy = Some + SomeOther
-string::Print(&xy)
-
-
+in namespace some are {
+  function void some(){
+    println("some")
+  }
+}

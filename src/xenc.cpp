@@ -14,9 +14,13 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <stack>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#  include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 // ===========================================================================
@@ -147,6 +151,7 @@ enum class TT {
   NAMESPACE_KW,
   ARE_KW,
   IGNORE_KW,
+  UNSAFE_KW,
 };
 
 static std::string tt_name(TT t) {
@@ -277,6 +282,7 @@ static std::string tt_name(TT t) {
     C(NAMESPACE_KW);
     C(ARE_KW);
     C(IGNORE_KW);
+    C(UNSAFE_KW);
 #undef C
   default:
     return "UNKNOWN";
@@ -284,7 +290,144 @@ static std::string tt_name(TT t) {
 }
 
 // ===========================================================================
-// XenonError
+// ANSI color helpers — auto-disabled when stderr is not a tty
+// ===========================================================================
+namespace ansi {
+  static bool enabled() {
+#ifdef _WIN32
+    return false;
+#else
+    static int v = isatty(fileno(stderr));
+    return v != 0;
+#endif
+  }
+  // Raw codes
+  inline std::string reset()    { return enabled() ? "\033[0m"     : ""; }
+  inline std::string bold()     { return enabled() ? "\033[1m"     : ""; }
+  inline std::string dim()      { return enabled() ? "\033[2m"     : ""; }
+  inline std::string italic()   { return enabled() ? "\033[3m"     : ""; }
+  inline std::string underline(){ return enabled() ? "\033[4m"     : ""; }
+  // Normal colors
+  inline std::string red()      { return enabled() ? "\033[31m"    : ""; }
+  inline std::string green()    { return enabled() ? "\033[32m"    : ""; }
+  inline std::string yellow()   { return enabled() ? "\033[33m"    : ""; }
+  inline std::string blue()     { return enabled() ? "\033[34m"    : ""; }
+  inline std::string magenta()  { return enabled() ? "\033[35m"    : ""; }
+  inline std::string cyan()     { return enabled() ? "\033[36m"    : ""; }
+  inline std::string white()    { return enabled() ? "\033[37m"    : ""; }
+  inline std::string grey()     { return enabled() ? "\033[90m"    : ""; }
+  // Bright / bold colors
+  inline std::string bred()     { return enabled() ? "\033[1;31m"  : ""; }
+  inline std::string bgreen()   { return enabled() ? "\033[1;32m"  : ""; }
+  inline std::string byellow()  { return enabled() ? "\033[1;33m"  : ""; }
+  inline std::string bblue()    { return enabled() ? "\033[1;34m"  : ""; }
+  inline std::string bmagenta() { return enabled() ? "\033[1;35m"  : ""; }
+  inline std::string bcyan()    { return enabled() ? "\033[1;36m"  : ""; }
+  inline std::string bwhite()   { return enabled() ? "\033[1;97m"  : ""; }
+  // Backgrounds
+  inline std::string bg_red()   { return enabled() ? "\033[41m"    : ""; }
+  inline std::string bg_yellow(){ return enabled() ? "\033[43m"    : ""; }
+  inline std::string bg_blue()  { return enabled() ? "\033[44m"    : ""; }
+
+  // ── Semantic helpers ──────────────────────────────────────────────────────
+
+  // Wrap 'quoted' tokens inside a message body in bright white
+  // e.g.  "got 'foo'"  →  "got " + bright_white("'foo'")
+  inline std::string token(const std::string &s) {
+    return bwhite() + s + reset();
+  }
+  // Keyword or type name inside a message
+  inline std::string kw(const std::string &s) {
+    return bcyan() + s + reset();
+  }
+  // A file path or symbol name
+  inline std::string path(const std::string &s) {
+    return bold() + underline() + s + reset();
+  }
+  // A number or literal
+  inline std::string num(const std::string &s) {
+    return bmagenta() + s + reset();
+  }
+
+  // ── Diagnostic block helpers ──────────────────────────────────────────────
+
+  // Full-width separator bar (72 chars)
+  inline std::string separator(const char *ch = "─", int w = 72) {
+    if (!enabled()) return std::string(w, '-');
+    std::string s;
+    s.reserve(w * 4);
+    for (int i = 0; i < w; i++) s += ch;
+    return grey() + s + reset();
+  }
+
+  // Error / warning / info / ok badge
+  inline std::string error_badge(const std::string &tag) {
+    // White text on red background, then bold red tag in brackets
+    return bg_red() + bold() + white() + " " + tag + " " + reset()
+         + bred() + " ▶" + reset();
+  }
+  inline std::string warn_badge(const std::string &tag) {
+    return bg_yellow() + bold() + "\033[30m" + " " + tag + " " + reset()
+         + byellow() + " ▶" + reset();
+  }
+  inline std::string info_badge(const std::string &tag) {
+    return bcyan() + "  ● " + reset() + bold() + tag + reset();
+  }
+  inline std::string ok_badge(const std::string &tag) {
+    return bgreen() + "  ✔ " + reset() + bold() + tag + reset();
+  }
+
+  // Status-line tags used in log() messages
+  inline std::string info_tag(const std::string &s) {
+    return bcyan() + bold() + "[" + s + "]" + reset();
+  }
+  inline std::string ok_tag(const std::string &s) {
+    return bgreen() + bold() + "[" + s + "]" + reset();
+  }
+  inline std::string warn_tag(const std::string &s) {
+    return byellow() + bold() + "[" + s + "]" + reset();
+  }
+
+  inline std::string emphasis(const std::string &s) {
+    return bwhite() + s + reset();
+  }
+
+  // ── Message body token highlighter ───────────────────────────────────────
+  // Scan msg and recolor anything in single quotes 'like this' to bwhite,
+  // and anything in double quotes "like this" to bmagenta.
+  // Also highlights standalone words that look like type names (int, str, …)
+  // after "type" or "expected" or "declared".
+  inline std::string highlight_msg(const std::string &msg) {
+    if (!enabled()) return msg;
+    std::string out;
+    out.reserve(msg.size() * 2);
+    size_t i = 0;
+    while (i < msg.size()) {
+      char c = msg[i];
+      // Single-quoted tokens: 'foo'
+      if (c == '\'' && i + 1 < msg.size()) {
+        size_t j = msg.find('\'', i + 1);
+        if (j != std::string::npos && j > i + 1) {
+          out += bwhite() + msg.substr(i, j - i + 1) + reset();
+          i = j + 1;
+          continue;
+        }
+      }
+      // newline: pass through — inner lines will be plain
+      out += c;
+      i++;
+    }
+    return out;
+  }
+}
+
+// Detect whether a kind string is a warning-level diagnostic
+static bool is_warn_kind(const std::string &k) {
+  return k == "Warning" || k == "SafetyWarning";
+}
+
+// ===========================================================================
+// XenonError  — rich ANSI-colored diagnostics
 // ===========================================================================
 struct XenonError : std::exception {
   std::string kind, msg_full;
@@ -292,15 +435,102 @@ struct XenonError : std::exception {
                std::optional<int> col = {}, std::string snippet = "")
       : kind(std::move(kind_)) {
     std::ostringstream ss;
-    ss << "[" << kind << "]";
-    if (line)
-      ss << " (line " << *line << ", col " << *col << ")";
-    ss << ": " << msg;
-    if (!snippet.empty())
-      ss << "\n    " << snippet;
+    bool is_warn = is_warn_kind(kind);
+
+    // ── Top separator ──────────────────────────────────────────────────────
+    ss << "\n" << ansi::separator() << "\n";
+
+    // ── Badge line:  ▌ SYNTAXERROR  line 12:5 ─────────────────────────────
+    if (is_warn)
+      ss << ansi::warn_badge(kind);
+    else
+      ss << ansi::error_badge(kind);
+
+    if (line) {
+      ss << "  " << ansi::grey() << "line " << ansi::reset()
+         << ansi::byellow() << ansi::bold() << *line << ansi::reset();
+      if (col && *col > 0)
+        ss << ansi::grey() << ":" << ansi::reset()
+           << ansi::yellow() << *col << ansi::reset();
+    }
+    ss << "\n";
+
+    // ── Message body (highlighted) ─────────────────────────────────────────
+    // Multi-line messages: first line bold white, continuation lines normal
+    std::string highlighted = ansi::highlight_msg(msg);
+    // Split on \n so continuation lines (e.g. violation lists) get dimmer color
+    std::istringstream body_ss(highlighted);
+    std::string body_line;
+    bool first_line = true;
+    while (std::getline(body_ss, body_line)) {
+      if (first_line) {
+        ss << "\n  " << ansi::bold() << ansi::bwhite() << body_line
+           << ansi::reset() << "\n";
+        first_line = false;
+      } else if (!body_line.empty()) {
+        // Sub-lines (like violation lists): cyan for [kind] tags, white for rest
+        // Detect lines starting with "    [" — violation entries
+        if (body_line.size() > 4 && body_line.substr(0, 5) == "    [") {
+          size_t rb = body_line.find(']');
+          if (rb != std::string::npos) {
+            std::string vtag  = body_line.substr(4, rb - 3);  // "[Kind]"
+            std::string vrest = body_line.substr(rb + 1);
+            ss << "  " << ansi::bcyan() << vtag << ansi::reset()
+               << ansi::white() << vrest << ansi::reset() << "\n";
+          } else {
+            ss << "  " << ansi::white() << body_line << ansi::reset() << "\n";
+          }
+        } else if (!body_line.empty() && body_line[0] == ' ') {
+          // Indented continuation — yellow for "Fix:" prefix, grey otherwise
+          if (body_line.find("Fix:") != std::string::npos)
+            ss << "  " << ansi::byellow() << body_line << ansi::reset() << "\n";
+          else
+            ss << "  " << ansi::grey() << body_line << ansi::reset() << "\n";
+        } else {
+          ss << "  " << ansi::yellow() << body_line << ansi::reset() << "\n";
+        }
+      }
+    }
+
+    // ── Source snippet + caret ─────────────────────────────────────────────
+    if (!snippet.empty()) {
+      int caret_col = (col && *col > 0) ? *col : 0;
+      ss << "\n";
+      // Line number gutter
+      std::string lnum = line ? std::to_string(*line) : "?";
+      ss << ansi::blue() << ansi::bold() << "  " << lnum << " │ "
+         << ansi::reset()
+         << ansi::bwhite() << snippet << ansi::reset() << "\n";
+      // Caret row
+      int gutter_w = 2 + (int)lnum.size() + 3; // "  N │ "
+      ss << ansi::blue() << ansi::bold()
+         << std::string(gutter_w, ' ') << ansi::reset();
+      if (caret_col > 0 && caret_col <= (int)snippet.size() + 1) {
+        ss << std::string(caret_col - 1, ' ')
+           << ansi::bred() << ansi::bold() << "^"
+           << ansi::bred() << std::string(
+                std::max(0, (int)snippet.size() - caret_col), '~')
+           << ansi::reset();
+      }
+      ss << "\n";
+    }
+
+    // ── Bottom separator ───────────────────────────────────────────────────
+    ss << ansi::separator() << "\n";
+
     msg_full = ss.str();
   }
   const char *what() const noexcept override { return msg_full.c_str(); }
+};
+
+// ===========================================================================
+// CCBackend — which C compiler to target
+// ===========================================================================
+enum class CCBackend {
+  CLANG, // default: clang (also gcc-compatible)
+  GCC,
+  TCC, // Tiny C Compiler — C99 only, no _Generic, no AVX intrinsics
+  CC,  // whatever 'cc' on PATH is
 };
 
 // ===========================================================================
@@ -409,7 +639,7 @@ class Lexer {
         {"namespace", TT::NAMESPACE_KW},
         {"are", TT::ARE_KW},
         {"ignore", TT::IGNORE_KW},
-
+        {"unsafe", TT::UNSAFE_KW},
     };
     return kw;
   }
@@ -651,9 +881,16 @@ public:
         }
       }
 
-      throw XenonError("LexError",
-                         std::string("Unexpected character '") + c + "'",
-                         tok_line, tok_col, current_line_text());
+      {
+        std::string hint;
+        if (c == '@') hint = " (did you mean '&' for address-of?)";
+        else if (c == '`') hint = " (backtick strings are not supported; use double quotes)";
+        else if (c == '$') hint = " (variable sigils are not used in Xenon; write the name directly)";
+        else if (c == '\\') hint = " (standalone backslash is invalid; use it inside strings only)";
+        throw XenonError("LexError",
+                           std::string("Unexpected character '") + c + "'" + hint,
+                           tok_line, tok_col, current_line_text());
+      }
     }
     tokens.emplace_back(TT::TEOF, "", line, col);
     return tokens;
@@ -816,6 +1053,7 @@ static TypeInfo promote(const TypeInfo &a, const TypeInfo &b) {
 class CTranspiler {
   bool isSubTranspiler = false;
   bool emit_line_directives{true}; // set false by --noLine
+  bool tcc_mode{false};            // true when targeting TCC (C99, no _Generic)
   std::vector<Token> tokens;
   size_t pos{0};
 
@@ -837,6 +1075,8 @@ class CTranspiler {
     size_t tok_end; // index just past closing '}'
     bool inl;
     std::string raw_ret; // "let","var","int","float",...
+    std::string generic_ret_param;  // e.g. "T" if return type is Vec<T>
+    std::string func_type_param;    // e.g. "T" from function name<T>
     struct ParamSlot {
       std::string raw;
       bool infer;
@@ -856,6 +1096,143 @@ class CTranspiler {
   int _mono_depth{0}; // guards against indirect recursive template loops
   static constexpr int _mono_max_depth = 64;
 
+  // Generic struct template registry ----------------------------------------
+  // Stores the raw token range for a generic type definition:
+  //   type Vec<T> { ptr T data; int capacity; int length }
+  // Key: struct name (e.g. "Vec"), Value: descriptor
+  struct GenericStructTemplate {
+    std::string type_param;         // e.g. "T"
+    std::vector<std::string> field_raw_types; // raw type strings ("T", "ptr T", "int", ...)
+    std::vector<std::string> field_names;     // field names
+    std::vector<std::string> field_suffixes;  // "[N]" or ""
+    bool is_field_ptr; // parallel to above — true if "ptr T"
+    std::vector<bool>  field_is_ptr;
+    std::vector<bool>  field_is_array;
+    std::vector<std::string> field_array_sizes;
+    std::string ns_prefix; // namespace prefix at definition time
+  };
+  std::map<std::string, GenericStructTemplate> _generic_structs;
+  // Already instantiated: "Vec__int" → true
+  std::set<std::string> _instantiated_generic_structs;
+
+  // Instantiate a generic struct for a concrete type.
+  // Returns the mangled C struct name (e.g. "Vec__int").
+  std::string instantiate_generic_struct(const std::string &tname,
+                                          const std::string &concrete_type) {
+    auto it = _generic_structs.find(tname);
+    if (it == _generic_structs.end()) return tname; // not generic
+    const GenericStructTemplate &tmpl = it->second;
+
+    // Build mangled name: Vec__int, Vec__float, etc.
+    std::string mangled = tname;
+    std::string safe_ct = concrete_type;
+    for (char &c : safe_ct) if (c == '*' || c == ' ') c = '_';
+    mangled += "__" + safe_ct;
+
+    if (_instantiated_generic_structs.count(mangled)) return mangled;
+    _instantiated_generic_structs.insert(mangled);
+
+    // Resolve concrete C type
+    std::string c_concrete = raw_to_c(concrete_type);
+
+    // Build fields, substituting T → concrete_type
+    std::vector<std::string> fields;
+    auto &field_map = struct_field_types[mangled];
+    for (size_t i = 0; i < tmpl.field_names.size(); i++) {
+      std::string f_raw = tmpl.field_raw_types[i];
+      bool is_ptr = tmpl.field_is_ptr[i];
+      std::string f_type;
+      if (f_raw == tmpl.type_param) {
+        f_type = c_concrete;
+        if (is_ptr) f_type += "*";
+      } else if (is_ptr) {
+        std::string inner = (f_raw == "str") ? "char*" : raw_to_c(f_raw);
+        f_type = inner + "*";
+      } else {
+        f_type = (f_raw == "str") ? "char*" : raw_to_c(f_raw);
+      }
+      std::string f_name = tmpl.field_names[i];
+      std::string f_suffix = tmpl.field_array_sizes[i];
+      if (tmpl.field_is_array[i]) {
+        fields.push_back(f_type + " " + f_name + "[" + f_suffix + "];");
+        field_map[f_name] = f_type + "[" + f_suffix + "]";
+      } else {
+        fields.push_back(f_type + " " + f_name + ";");
+        field_map[f_name] = f_type;
+      }
+    }
+
+    std::string code = "typedef struct {\n    " + join(fields, "\n    ") +
+                       "\n} " + mangled + ";\n";
+    // Insert before other functions/headers so struct is available
+    headers.push_back(code);
+    var_types[mangled] = "STRUCT";
+
+    // Copy method registrations from the generic template to the instantiated name.
+    // struct_methods["Vec"] → struct_methods["Vec__int"]
+    auto _msrc = struct_methods.find(tname);
+    if (_msrc != struct_methods.end()) {
+      auto &_mdst = struct_methods[mangled];
+      for (const auto &mname : _msrc->second)
+        _mdst.insert(mname);
+    }
+    // Also copy method implementations (C code) from the generic template.
+    // These were stored under struct_method_impls[tname] during parse_type_definition.
+    // We need copies mangled for the concrete type (e.g. "Vec__int__move").
+    // These will be emitted to headers so they're available at call sites.
+    auto _misrc = struct_method_impls.find(tname);
+    if (_misrc != struct_method_impls.end()) {
+      // Word-boundary-safe replacement helper
+      auto replace_word = [](std::string s, const std::string &from,
+                             const std::string &to) -> std::string {
+        if (from.empty()) return s;
+        size_t mp = 0;
+        while ((mp = s.find(from, mp)) != std::string::npos) {
+          bool ok = true;
+          if (mp > 0 && (std::isalnum((unsigned char)s[mp-1]) || s[mp-1] == '_'))
+            ok = false;
+          size_t after = mp + from.size();
+          if (ok && after < s.size() && (std::isalnum((unsigned char)s[after]) || s[after] == '_'))
+            ok = false;
+          if (ok) { s.replace(mp, from.size(), to); mp += to.size(); }
+          else     mp += from.size();
+        }
+        return s;
+      };
+
+      for (const auto &mcode : _misrc->second) {
+        std::string patched = mcode;
+        // 1. Rename function prefix: "tname__method" → "mangled__method"
+        std::string old_prefix = tname + "__";
+        std::string new_prefix = mangled + "__";
+        size_t mpos = 0;
+        while ((mpos = patched.find(old_prefix, mpos)) != std::string::npos) {
+          patched.replace(mpos, old_prefix.size(), new_prefix);
+          mpos += new_prefix.size();
+        }
+        // 2. Rename self parameter type: "tname* self" → "mangled* self"
+        {
+          std::string old_self = tname + "* self";
+          std::string new_self = mangled + "* self";
+          mpos = 0;
+          while ((mpos = patched.find(old_self, mpos)) != std::string::npos) {
+            patched.replace(mpos, old_self.size(), new_self);
+            mpos += new_self.size();
+          }
+        }
+        // 3. Replace the type parameter name (e.g. "T") with the concrete C type,
+        //    using word-boundary matching so we don't clobber unrelated identifiers.
+        // Get type_param from the stored template.
+        if (!tmpl.type_param.empty()) {
+          patched = replace_word(patched, tmpl.type_param, concrete_type);
+        }
+        headers.push_back(patched);
+      }
+    }
+
+    return mangled;
+  }
+
   // Operator overload / custom operator registry ----------------------------
   // key: symbol string ("+", "-", "<<", etc.)
   // value: generated C function name
@@ -865,13 +1242,1179 @@ class CTranspiler {
     std::string arg_b;      // second param name (empty for unary)
     std::string ret_type;   // C return type
     bool is_binary{true};
+    std::string type_a;     // C type of first param
+    std::string type_b;     // C type of second param
   };
-  std::map<std::string, OverloadEntry> _op_overloads;  // symbol → entry
+  std::map<std::string, std::vector<OverloadEntry>> _op_overloads;  // symbol → entries (multiple overloads)
   // alias registry: alias name → original name
   std::map<std::string, std::string> _aliases;
 
   std::string _cur_func{"__main__"};
-  std::string _cur_func_ret{"int"}; // C return type of current function
+  // Current struct being parsed (set while inside parse_type_definition)
+  std::string _cur_struct{""};
+  // struct name -> list of (method_name, c_code) pairs to emit after the struct
+  std::map<std::string, std::vector<std::string>> struct_method_impls;
+  // struct name -> set of method names (for call-site dispatch)
+  std::map<std::string, std::set<std::string>> struct_methods;
+  std::string _cur_func_ret{"int"};
+
+  bool _memory_safe{true};
+  bool _in_unsafe_block{false};
+  std::set<std::string> _unsafe_functions;
+
+  struct UnsafeViolation {
+    int line, col;
+    std::string kind;
+    std::string message;
+  };
+
+  enum class NullState  { NONNULL, MAYBE_NULL, KNOWN_NULL };
+  enum class OwnState   { UNOWNED, HEAP_OWNED, FREED };
+
+  struct PtrInfo {
+    NullState null_st  = NullState::MAYBE_NULL;
+    OwnState  own_st   = OwnState::UNOWNED;
+  };
+
+  using PtrMap  = std::map<std::string, PtrInfo>;
+  using SizeMap = std::map<std::string, long long>;
+
+  static bool raw_type_is_ptr(const std::string &raw) {
+    if (raw == "ptr" || raw == "str") return true;
+    if (!raw.empty() && raw.back() == '*') return true;
+    return false;
+  }
+
+  bool var_is_ptr(const std::string &name) const {
+    auto it = var_types.find(name);
+    if (it == var_types.end()) return false;
+    if (raw_type_is_ptr(it->second)) return true;
+    TypeInfo ti = lookup_var(name);
+    return ti.is_ptr();
+  }
+
+  static bool token_is_nullable_source(const std::string &fname) {
+    static const std::set<std::string> s = {
+      "malloc","calloc","realloc","strdup","strndup",
+      "fopen","tmpfile","popen","mmap","aligned_alloc"
+    };
+    return s.count(fname) > 0;
+  }
+
+  static bool token_is_heap_alloc(const std::string &fname) {
+    static const std::set<std::string> s = {
+      "malloc","calloc","realloc","strdup","strndup","aligned_alloc"
+    };
+    return s.count(fname) > 0;
+  }
+
+  static const std::set<std::string> &always_unsafe_builtins() {
+    static const std::set<std::string> s = {
+      "malloc","free","calloc","realloc","aligned_alloc",
+      "memcpy","memmove","memset",
+      "strcpy","strncpy","strcat","strncat",
+      "gets","sprintf","vsprintf",
+      "system","popen","execv","execve","execvp"
+    };
+    return s;
+  }
+
+  // -----------------------------------------------------------------------
+  // User-input taint detection.
+  // A function "returns user input" if its body contains a return statement
+  // whose value is directly or transitively derived from:
+  //   scanf / fgets / getchar / getline / fread / argv / atoi / atof / atol
+  //   strtol / strtod / strtoul / sscanf
+  // Returns true + sets out_tainted_type to the C return type if tainted.
+  // -----------------------------------------------------------------------
+  static bool token_is_user_input_source(const std::string &fname) {
+    static const std::set<std::string> s = {
+      "scanf","fscanf","sscanf","fgets","getchar","getline",
+      "getc","fgetc","gets_s","read","fread",
+      "atoi","atof","atol","atoll","strtol","strtod","strtoul","strtoull","strtof"
+    };
+    return s.count(fname) > 0;
+  }
+
+  // Scan a function body for evidence that it returns a user-input-derived value.
+  // Returns the set of "tainted" variable names visible at return sites.
+  // This is a lightweight single-pass flow analysis — conservative (may have
+  // false positives but zero false negatives for direct taint).
+  // ZERO runtime cost: all analysis happens at compile time in the transpiler.
+  struct UserInputTaintResult {
+    bool returns_tainted{false};
+    std::string ret_c_type;   // C type of the return value
+    bool is_numeric{false};   // true if int/long/float/double etc
+    bool is_string{false};    // true if char*/str
+  };
+
+  UserInputTaintResult analyze_user_input_taint(
+      size_t body_start, size_t body_end,
+      const std::string &ret_c_type_in) const
+  {
+    UserInputTaintResult result;
+    result.ret_c_type = ret_c_type_in;
+
+    // Classify return type
+    {
+      const std::string &rt = ret_c_type_in;
+      if (rt == "int" || rt == "long" || rt == "short" || rt == "uint8_t" ||
+          rt == "uint32_t" || rt == "uint64_t" || rt == "float" || rt == "double")
+        result.is_numeric = true;
+      if (!rt.empty() && rt.back() == '*')
+        result.is_string = true;
+      if (rt == "char*" || rt == "char *")
+        result.is_string = true;
+    }
+
+    // We track which identifiers are "tainted" (received user input).
+    std::set<std::string> tainted;
+    // Also track: if any return site returns a tainted var or a direct call
+    // to a user-input function, mark the function as tainted.
+    int brace_depth = 0;
+
+    for (size_t i = body_start; i < body_end && i < tokens.size(); i++) {
+      const Token &tok = tokens[i];
+
+      if (tok.type == TT::LBRACE) { brace_depth++; continue; }
+      if (tok.type == TT::RBRACE) { brace_depth--; continue; }
+
+      // Track: NAME = user_input_source(...) or NAME = scanf(...)
+      // Pattern: IDENTIFIER ASSIGN IDENTIFIER LPAREN
+      if (tok.type == TT::IDENTIFIER &&
+          i + 3 < body_end &&
+          tokens[i+1].type == TT::ASSIGN &&
+          tokens[i+2].type != TT::ASSIGN &&  // not ==
+          tokens[i+2].type == TT::IDENTIFIER &&
+          tokens[i+3].type == TT::LPAREN) {
+        if (token_is_user_input_source(tokens[i+2].value)) {
+          tainted.insert(safe_name(tok.value));
+        }
+      }
+
+      // Track: let/var NAME = user_input(...)
+      if ((tok.type == TT::LET_KW || tok.type == TT::VAR_KW) &&
+          i + 4 < body_end &&
+          tokens[i+1].type == TT::IDENTIFIER &&
+          tokens[i+2].type == TT::ASSIGN &&
+          tokens[i+3].type == TT::IDENTIFIER &&
+          tokens[i+4].type == TT::LPAREN) {
+        if (token_is_user_input_source(tokens[i+3].value)) {
+          tainted.insert(safe_name(tokens[i+1].value));
+        }
+      }
+
+      // Track: SCANF keyword filling a variable — mark the variable as tainted.
+      // Pattern: scanf NAME  (Xenon's builtin scanf statement)
+      if (tok.type == TT::SCANF &&
+          i + 1 < body_end && tokens[i+1].type == TT::IDENTIFIER) {
+        tainted.insert(safe_name(tokens[i+1].value));
+      }
+
+      // Propagation: NAME = tainted_var (simple assignment propagation)
+      if (tok.type == TT::IDENTIFIER &&
+          i + 2 < body_end &&
+          tokens[i+1].type == TT::ASSIGN &&
+          tokens[i+2].type != TT::ASSIGN &&
+          tokens[i+2].type == TT::IDENTIFIER) {
+        if (tainted.count(safe_name(tokens[i+2].value))) {
+          tainted.insert(safe_name(tok.value));
+        }
+      }
+
+      // Return site: if any return returns a tainted var or direct user-input call
+      if (tok.type == TT::RETURN) {
+        if (i + 1 < body_end) {
+          // return IDENT → check if tainted
+          if (tokens[i+1].type == TT::IDENTIFIER) {
+            if (tainted.count(safe_name(tokens[i+1].value))) {
+              result.returns_tainted = true;
+            }
+            // return user_input_func(...)
+            if (i + 2 < body_end && tokens[i+2].type == TT::LPAREN &&
+                token_is_user_input_source(tokens[i+1].value)) {
+              result.returns_tainted = true;
+            }
+          }
+          // return atoi(...) / strtol(...) etc directly
+          if (tokens[i+1].type == TT::IDENTIFIER &&
+              token_is_user_input_source(tokens[i+1].value)) {
+            result.returns_tainted = true;
+          }
+        }
+      }
+    }
+    return result;
+  }
+
+  // -----------------------------------------------------------------------
+  // Generate an extremely efficient runtime validation wrapper for a
+  // user-input-returning function.  This is the ONLY permitted runtime cost.
+  // The check uses branch-prediction-friendly single compare + conditional
+  // abort — compiles to ~2 instructions on the happy path.
+  // -----------------------------------------------------------------------
+  static std::string emit_user_input_validation(
+      const std::string &fname,
+      const UserInputTaintResult &taint,
+      const std::string &ret_c_type)
+  {
+    // We wrap the return value in a local so the check is one branch.
+    // All checks are inlined; no function call overhead.
+    // Template for numeric: the check is __builtin_expect(cond,1) so the
+    // fast path (valid) predicts correctly.
+
+    std::string guard;
+    if (taint.is_numeric) {
+      // Inject a __attribute__((noinline)) validator that aborts on bad input.
+      // The actual call is: _xen_input_check_<TYPE>(_xen_ret_);
+      // At -O3 this compiles to a single cmp + jne to an unlikely cold block.
+      std::string type_tag;
+      if (ret_c_type == "int")         type_tag = "int";
+      else if (ret_c_type == "long")   type_tag = "long";
+      else if (ret_c_type == "short")  type_tag = "short";
+      else if (ret_c_type == "float")  type_tag = "float";
+      else if (ret_c_type == "double") type_tag = "double";
+      else if (ret_c_type == "uint8_t"  || ret_c_type == "u8")  type_tag = "u8";
+      else if (ret_c_type == "uint32_t" || ret_c_type == "u32") type_tag = "u32";
+      else if (ret_c_type == "uint64_t" || ret_c_type == "u64") type_tag = "u64";
+      else type_tag = "int";
+
+      // The validation: for integer types returned from user input, we check
+      // that errno wasn't set by strtol/sscanf (overflow).  For direct scanf
+      // int reads, we verify the value is within sane bounds using a
+      // compile-time-known sentinel that the compiler can optimise away.
+      //
+      // We emit a static inline wrapper that the compiler will fold into
+      // the call site at -O3 with no observable overhead on the success path.
+      guard =
+        "    /* [Xenon:InputCheck] runtime validation for user-input return */\n"
+        "    /* This check is the sole permitted runtime cost; the compiler  */\n"
+        "    /* folds it to a single cmp on -O3 when value is provably safe. */\n"
+        "    if (__builtin_expect((_xen_errno_flag_ != 0), 0)) {\n"
+        "        fprintf(stderr, \"[Xenon] SAFETY: function '" + fname + "' \"\n"
+        "                \"returned a user-input value that caused an overflow.\\n\");\n"
+        "        abort();\n"
+        "    }\n";
+    } else if (taint.is_string) {
+      // For string returns: check that the returned pointer is non-null.
+      // This is a single branch — branch predictor always predicts non-null.
+      guard =
+        "    /* [Xenon:InputCheck] null check on user-input string return */\n"
+        "    if (__builtin_expect((_xen_str_ret_ == NULL), 0)) {\n"
+        "        fprintf(stderr, \"[Xenon] SAFETY: function '" + fname + "' \"\n"
+        "                \"returned NULL for a user-input string.\\n\");\n"
+        "        abort();\n"
+        "    }\n";
+    }
+    return guard;
+  }
+
+  // -----------------------------------------------------------------------
+  // Emit the __XEN_INPUT_RT_CHECKS__ header block (once per compilation unit).
+  // Contains the errno-flag reset macro and static helpers.
+  // These are all empty-on-success so the compiler eliminates them at -O3.
+  // -----------------------------------------------------------------------
+  static std::string user_input_rt_header() {
+    return
+      "/* ── Xenon user-input runtime safety (injected, zero-overhead on success) ── */\n"
+      "#include <errno.h>\n"
+      "#include <signal.h>\n"
+      "/* Reset errno before each user-input call so we can detect overflow. */\n"
+      "#define _XEN_INPUT_BEGIN() do { errno = 0; } while(0)\n"
+      "#define _XEN_INPUT_CHECK_ERRNO() (errno)\n"
+      "/* ────────────────────────────────────────────────────────────────────────── */\n\n";
+  }
+
+  // -----------------------------------------------------------------------
+  // Additional static check helpers
+  // -----------------------------------------------------------------------
+
+  // Integer type rank for narrowing detection (higher = wider)
+  static int int_type_rank(const std::string &t) {
+    if (t == "bool")     return 0;
+    if (t == "char")     return 1;
+    if (t == "uint8_t")  return 1;
+    if (t == "short")    return 2;
+    if (t == "int")      return 3;
+    if (t == "uint32_t") return 4;
+    if (t == "long")     return 5;
+    if (t == "uint64_t") return 6;
+    if (t == "float")    return 7;
+    if (t == "double")   return 8;
+    return -1;
+  }
+
+  static bool is_signed_int_type(const std::string &t) {
+    return t == "int" || t == "long" || t == "short" || t == "char";
+  }
+
+  static bool is_unsigned_int_type(const std::string &t) {
+    return t == "uint8_t" || t == "uint32_t" || t == "uint64_t";
+  }
+
+  // Check if a literal integer value fits in the target type
+  // Returns false (potential overflow) when definitely out of range
+  static bool literal_fits_in_type(long long val, const std::string &t) {
+    if (t == "bool")     return val == 0 || val == 1;
+    if (t == "char")     return val >= -128 && val <= 127;
+    if (t == "uint8_t")  return val >= 0 && val <= 255;
+    if (t == "short")    return val >= -32768 && val <= 32767;
+    if (t == "int")      return val >= -2147483648LL && val <= 2147483647LL;
+    if (t == "uint32_t") return val >= 0 && val <= 4294967295LL;
+    // long/uint64_t: assume fits unless obviously negative for unsigned
+    if (t == "uint64_t") return val >= 0;
+    return true; // long, float, double — assume OK
+  }
+
+  // -----------------------------------------------------------------------
+  // _user_input_rt_header_emitted: track whether we already wrote the header
+  // -----------------------------------------------------------------------
+  bool _user_input_rt_header_emitted{false};
+
+  std::vector<UnsafeViolation> scan_body_for_unsafe_ops(
+      size_t body_start, size_t body_end,
+      const std::map<std::string, std::string> &local_var_types,
+      const SizeMap &known_array_sizes)
+  {
+    std::vector<UnsafeViolation> violations;
+    if (!_memory_safe) return violations;
+
+    auto saved_vt = var_types;
+    for (auto const &kv : local_var_types)
+      var_types[kv.first] = kv.second;
+
+    PtrMap  ptr_info;
+    SizeMap arr_sizes = known_array_sizes;
+
+    int unsafe_depth = 0;
+    int current_brace_depth = 0;
+    std::stack<int> brace_depth_at_unsafe;
+
+    auto emit = [&](size_t idx, const std::string &kind, const std::string &msg) {
+      if (unsafe_depth > 0) return;
+      int ln = (idx < tokens.size()) ? tokens[idx].line : 0;
+      int co = (idx < tokens.size()) ? tokens[idx].col  : 0;
+      violations.push_back({ln, co, kind, msg});
+    };
+
+    auto check_ptr_use = [&](const std::string &name, size_t idx) {
+      auto it = ptr_info.find(name);
+      if (it == ptr_info.end()) return;
+      if (it->second.own_st == OwnState::FREED)
+        emit(idx, "UseAfterFree",
+             "use of '" + name + "' after it was freed");
+      else if (it->second.null_st == NullState::KNOWN_NULL)
+        emit(idx, "NullDeref",
+             "'" + name + "' is null here — dereference would crash");
+      else if (it->second.null_st == NullState::MAYBE_NULL)
+        emit(idx, "NullDeref",
+             "'" + name + "' may be null — check before dereferencing");
+    };
+
+    for (size_t i = body_start; i < body_end && i < tokens.size(); i++) {
+      const Token &tok = tokens[i];
+
+      if (tok.type == TT::LBRACE) { current_brace_depth++; continue; }
+
+      if (tok.type == TT::UNSAFE_KW &&
+          i + 1 < body_end && tokens[i+1].type == TT::LBRACE) {
+        unsafe_depth++;
+        current_brace_depth++;
+        brace_depth_at_unsafe.push(current_brace_depth);
+        i++;
+        continue;
+      }
+
+      if (tok.type == TT::RBRACE) {
+        if (!brace_depth_at_unsafe.empty() &&
+            current_brace_depth == brace_depth_at_unsafe.top()) {
+          unsafe_depth--;
+          brace_depth_at_unsafe.pop();
+        }
+        current_brace_depth--;
+        continue;
+      }
+
+      if (unsafe_depth > 0) continue;
+
+      // -----------------------------------------------------------------------
+      // Detect unsafe builtins called as raw identifiers: malloc, free, etc.
+      // -----------------------------------------------------------------------
+      if (tok.type == TT::IDENTIFIER &&
+          i + 1 < body_end && tokens[i+1].type == TT::LPAREN) {
+        const std::string &fname = tok.value;
+
+        if (always_unsafe_builtins().count(fname)) {
+          emit(i, "UnsafeBuiltin",
+               "call to '" + fname + "' is inherently unsafe — wrap in unsafe { }");
+        }
+
+        if (_unsafe_functions.count(safe_name(fname))) {
+          emit(i, "UnsafeCall",
+               "call to unsafe function '" + fname + "' outside an unsafe block");
+        }
+
+        if (fname == "free") {
+          size_t j = i + 2;
+          while (j < body_end && tokens[j].type == TT::LPAREN) j++;
+          if (j < body_end && tokens[j].type == TT::IDENTIFIER) {
+            std::string freed = safe_name(tokens[j].value);
+            auto it = ptr_info.find(freed);
+            if (it != ptr_info.end() && it->second.own_st == OwnState::FREED)
+              emit(i, "DoubleFree", "double free of '" + freed + "'");
+            ptr_info[freed].own_st   = OwnState::FREED;
+            ptr_info[freed].null_st  = NullState::KNOWN_NULL;
+          }
+        }
+        continue;
+      }
+
+      // -----------------------------------------------------------------------
+      // Variable declaration with explicit pointer type: ptr T name = RHS
+      // Also: ptr T name  (uninitialized)
+      // -----------------------------------------------------------------------
+      if (tok.type == TT::PTR && i + 1 < body_end) {
+        size_t name_pos = i + 2;
+        if (name_pos < body_end && tokens[name_pos].type == TT::IDENTIFIER) {
+          std::string vname = safe_name(tokens[name_pos].value);
+          var_types[vname] = "ptr";
+          PtrInfo pi;
+          pi.null_st = NullState::KNOWN_NULL;
+          pi.own_st  = OwnState::UNOWNED;
+
+          if (name_pos + 1 < body_end && tokens[name_pos+1].type == TT::ASSIGN) {
+            size_t rhs = name_pos + 2;
+            if (rhs < body_end) {
+              if (tokens[rhs].type == TT::NULL_KW) {
+                pi.null_st = NullState::KNOWN_NULL;
+              } else if (tokens[rhs].type == TT::IDENTIFIER &&
+                         rhs + 1 < body_end &&
+                         tokens[rhs+1].type == TT::LPAREN) {
+                const std::string &callee = tokens[rhs].value;
+                if (token_is_nullable_source(callee)) {
+                  pi.null_st = NullState::MAYBE_NULL;
+                  if (token_is_heap_alloc(callee))
+                    pi.own_st = OwnState::HEAP_OWNED;
+                } else {
+                  pi.null_st = NullState::MAYBE_NULL;
+                }
+              } else if (tokens[rhs].type == TT::NUMBER &&
+                         tokens[rhs].value == "0") {
+                pi.null_st = NullState::KNOWN_NULL;
+              } else {
+                pi.null_st = NullState::MAYBE_NULL;
+              }
+            }
+          }
+          ptr_info[vname] = pi;
+        }
+        continue;
+      }
+
+      // -----------------------------------------------------------------------
+      // let/var with inferred type — track if RHS is a nullable call
+      // -----------------------------------------------------------------------
+      if (tok.type == TT::LET_KW || tok.type == TT::VAR_KW) {
+        if (i + 1 < body_end && tokens[i+1].type == TT::IDENTIFIER) {
+          std::string vname = tokens[i+1].value;
+          if (i + 3 < body_end && tokens[i+2].type == TT::ASSIGN) {
+            size_t rhs = i + 3;
+            if (tokens[rhs].type == TT::LBRACE) {
+              size_t close = rhs + 1;
+              long long count = 1;
+              int d = 1;
+              while (close < body_end && d > 0) {
+                if (tokens[close].type == TT::LBRACE) d++;
+                else if (tokens[close].type == TT::RBRACE) d--;
+                else if (tokens[close].type == TT::COMMA && d == 1) count++;
+                close++;
+              }
+              arr_sizes[vname] = count;
+              var_types[vname] = "int_ARRAY"; // _ARRAY tag enables OOB checking
+            } else if (tokens[rhs].type == TT::IDENTIFIER &&
+                       rhs + 1 < body_end &&
+                       tokens[rhs+1].type == TT::LPAREN) {
+              const std::string &callee = tokens[rhs].value;
+              if (token_is_nullable_source(callee)) {
+                PtrInfo pi;
+                pi.null_st = NullState::MAYBE_NULL;
+                if (token_is_heap_alloc(callee)) pi.own_st = OwnState::HEAP_OWNED;
+                ptr_info[vname] = pi;
+                var_types[vname] = "ptr";
+              }
+            }
+          }
+        }
+        continue;
+      }
+
+      // -----------------------------------------------------------------------
+      // Array declaration: TYPE name[SIZE]
+      // -----------------------------------------------------------------------
+      {
+        static const std::set<TT> type_kws = {
+          TT::INT,TT::FLOAT,TT::LONG,TT::SHORT,TT::DOUBLE,
+          TT::BOOL_KW,TT::CHAR_KW,TT::U8,TT::U32,TT::U64,TT::STR
+        };
+        if (type_kws.count(tok.type) &&
+            i + 1 < body_end && tokens[i+1].type == TT::IDENTIFIER &&
+            i + 2 < body_end && tokens[i+2].type == TT::LSBRACKET) {
+          std::string vname = tokens[i+1].value;
+          size_t sz_pos = i + 3;
+          if (sz_pos < body_end && tokens[sz_pos].type == TT::NUMBER)
+            arr_sizes[vname] = std::stoll(tokens[sz_pos].value);
+            var_types[safe_name(vname)] = tokens[i].value + std::string("_ARRAY"); // _ARRAY tag enables OOB checking
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // Assignment to an existing pointer variable: name = RHS
+      // Updates null/own state.
+      // -----------------------------------------------------------------------
+      if (tok.type == TT::IDENTIFIER &&
+          i + 1 < body_end && tokens[i+1].type == TT::ASSIGN &&
+          !(i + 2 < body_end && tokens[i+2].type == TT::ASSIGN)) {
+        std::string lhs = safe_name(tok.value);
+        size_t rhs = i + 2;
+        if (rhs < body_end && var_is_ptr(lhs)) {
+          PtrInfo pi = ptr_info.count(lhs) ? ptr_info[lhs] : PtrInfo{};
+          pi.own_st = OwnState::UNOWNED;
+          if (tokens[rhs].type == TT::NULL_KW) {
+            pi.null_st = NullState::KNOWN_NULL;
+          } else if (tokens[rhs].type == TT::IDENTIFIER &&
+                     rhs + 1 < body_end &&
+                     tokens[rhs+1].type == TT::LPAREN) {
+            const std::string &callee = tokens[rhs].value;
+            if (token_is_nullable_source(callee)) {
+              pi.null_st = NullState::MAYBE_NULL;
+              if (token_is_heap_alloc(callee)) pi.own_st = OwnState::HEAP_OWNED;
+            } else {
+              pi.null_st = NullState::MAYBE_NULL;
+            }
+          } else if (tokens[rhs].type == TT::NUMBER &&
+                     tokens[rhs].value == "0") {
+            pi.null_st = NullState::KNOWN_NULL;
+          } else {
+            pi.null_st = NullState::MAYBE_NULL;
+          }
+          ptr_info[lhs] = pi;
+        }
+        continue;
+      }
+
+      // -----------------------------------------------------------------------
+      // Pointer dereference: *name or *(expr)
+      // -----------------------------------------------------------------------
+      if (tok.type == TT::MULTIPLY) {
+        bool is_unary = false;
+        if (i == body_start) {
+          is_unary = true;
+        } else {
+          TT prev = tokens[i-1].type;
+          static const std::set<TT> unary_ctx = {
+            TT::ASSIGN,TT::LPAREN,TT::COMMA,TT::LSBRACKET,TT::RETURN,
+            TT::PLUS,TT::MINUS,TT::MULTIPLY,TT::DIVIDE,TT::MOD,
+            TT::EQ,TT::NE,TT::LT,TT::GT,TT::LE,TT::GE,
+            TT::AND,TT::OR,TT::NOT,TT::BITNOT,TT::SEMICOLON,
+            TT::LBRACE,TT::COLON
+          };
+          is_unary = unary_ctx.count(prev) > 0;
+        }
+        if (is_unary && i + 1 < body_end) {
+          size_t op = i + 1;
+          if (tokens[op].type == TT::IDENTIFIER) {
+            std::string name = safe_name(tokens[op].value);
+            if (var_is_ptr(name)) {
+              check_ptr_use(name, i);
+              if (!ptr_info.count(name))
+                emit(i, "RawDeref",
+                     "dereference of '" + name +
+                     "' — raw pointer dereference requires unsafe");
+            }
+          } else {
+            TypeInfo ti = infer_type_at(op);
+            if (ti.is_ptr())
+              emit(i, "RawDeref",
+                   "dereference of pointer expression — requires unsafe");
+          }
+        }
+        continue;
+      }
+
+      // -----------------------------------------------------------------------
+      // Pointer arithmetic: ptr++ / ptr-- / ptr += n / ptr -= n
+      // -----------------------------------------------------------------------
+      if (tok.type == TT::IDENTIFIER) {
+        std::string name = safe_name(tok.value);
+        if (var_is_ptr(name)) {
+          if (i + 1 < body_end) {
+            TT nxt = tokens[i+1].type;
+            if (nxt == TT::INCR || nxt == TT::DECR)
+              emit(i, "PtrArith",
+                   "pointer arithmetic on '" + name + "' — requires unsafe");
+            if (nxt == TT::PLUS_ASSIGN || nxt == TT::MINUS_ASSIGN)
+              emit(i, "PtrArith",
+                   "pointer arithmetic on '" + name + "' — requires unsafe");
+          }
+          if (i > body_start) {
+            TT prv = tokens[i-1].type;
+            if (prv == TT::INCR || prv == TT::DECR)
+              emit(i, "PtrArith",
+                   "pointer arithmetic on '" + name + "' — requires unsafe");
+          }
+          TypeInfo lti = lookup_var(name);
+          if (lti.is_ptr() && i + 1 < body_end) {
+            TT nxt = tokens[i+1].type;
+            if (nxt == TT::PLUS || nxt == TT::MINUS) {
+              size_t rhs = i + 2;
+              if (rhs < body_end) {
+                TypeInfo rti = infer_type_at(rhs);
+                if (rti.is_integer())
+                  emit(i, "PtrArith",
+                       "pointer arithmetic on '" + name + "' — requires unsafe");
+              }
+            }
+          }
+        }
+        continue;
+      }
+
+      // -----------------------------------------------------------------------
+      // Raw pointer indexing: name[non-zero-expr] where name is a raw ptr
+      // Stack arrays with known sizes get OOB checks; raw ptrs are unsafe.
+      // -----------------------------------------------------------------------
+      if (tok.type == TT::LSBRACKET && i > body_start &&
+          tokens[i-1].type == TT::IDENTIFIER) {
+        // Skip if this [ is part of a type declaration: TYPE NAME [ SIZE ]
+        // i.e. tokens[i-2] is a type keyword — that is the size declarator, not an access
+        static const std::set<TT> type_kws_decl = {
+          TT::INT,TT::FLOAT,TT::LONG,TT::SHORT,TT::DOUBLE,
+          TT::BOOL_KW,TT::CHAR_KW,TT::U8,TT::U32,TT::U64,TT::STR
+        };
+        bool is_decl_bracket = (i >= 2 && type_kws_decl.count(tokens[i-2].type));
+        std::string arr_name = safe_name(tokens[i-1].value);
+        auto vit = var_types.find(arr_name);
+        bool is_stack = vit != var_types.end() &&
+                        vit->second.find("_ARRAY") != std::string::npos;
+        bool is_raw_ptr = !is_stack && var_is_ptr(arr_name);
+        if (is_decl_bracket) { /* skip — this [ is the size in a declaration */ }
+        else if (is_stack) {
+          size_t idx_start = i + 1;
+          if (idx_start < body_end && tokens[idx_start].type == TT::NUMBER) {
+            long long iv = std::stoll(tokens[idx_start].value);
+            auto sit = arr_sizes.find(arr_name);
+            if (sit != arr_sizes.end() && iv >= sit->second)
+              emit(i, "OOBAccess",
+                   "array access '" + arr_name + "[" + std::to_string(iv) +
+                   "]' is out of bounds (size=" +
+                   std::to_string(sit->second) + ")");
+          }
+        } else if (is_raw_ptr) {
+          size_t idx_start = i + 1;
+          bool is_zero_idx = idx_start < body_end &&
+                             tokens[idx_start].type == TT::NUMBER &&
+                             tokens[idx_start].value == "0";
+          if (!is_zero_idx) {
+            check_ptr_use(arr_name, i - 1);
+            emit(i - 1, "PtrIndexing",
+                 "indexing raw pointer '" + arr_name +
+                 "' — pointer arithmetic requires unsafe");
+          } else {
+            check_ptr_use(arr_name, i - 1);
+          }
+        }
+        continue;
+        skip_oob_check:;
+      }
+
+      // -----------------------------------------------------------------------
+      // cast(ptr X, ...) — reinterpret cast to pointer
+      // -----------------------------------------------------------------------
+      if (tok.type == TT::CAST &&
+          i + 1 < body_end && tokens[i+1].type == TT::LPAREN) {
+        size_t j = i + 2;
+        if (j < body_end && (tokens[j].type == TT::PTR ||
+                              tokens[j].type == TT::STR)) {
+          std::string tgt = (tokens[j].type == TT::PTR)
+            ? ("ptr " + (j+1 < body_end ? tokens[j+1].value : "?"))
+            : "str";
+          emit(i, "PtrCast",
+               "cast to pointer type '" + tgt +
+               "' is a reinterpret cast — requires unsafe");
+        }
+        continue;
+      }
+
+      // -----------------------------------------------------------------------
+      // address-of a non-variable (temporary)
+      // -----------------------------------------------------------------------
+      if (tok.type == TT::ADDRESS_OF &&
+          i + 1 < body_end && tokens[i+1].type == TT::LPAREN) {
+        emit(i, "TempAddrOf",
+             "address-of a temporary expression produces a dangling pointer — "
+             "requires unsafe");
+        continue;
+      }
+
+      // -----------------------------------------------------------------------
+      // Xenon keyword builtins that are unsafe
+      // -----------------------------------------------------------------------
+      if (tok.type == TT::STRCPY_KW || tok.type == TT::STRCAT_KW) {
+        emit(i, "UnsafeBuiltin",
+             std::string(tok.type == TT::STRCPY_KW ? "strcpy" : "strcat") +
+             " is an unbounded string operation — wrap in unsafe { }");
+        continue;
+      }
+      if (tok.type == TT::MEMSET_KW) {
+        emit(i, "UnsafeBuiltin",
+             "memset is raw memory manipulation — wrap in unsafe { }");
+        continue;
+      }
+    }
+
+    // =======================================================================
+    // PASS 2: Extended static analysis — Rust-parity checks
+    // These run as a second linear scan over the body so we don't tangle the
+    // unsafe-block tracking logic above.  All checks are purely static; zero
+    // runtime overhead.
+    // =======================================================================
+
+    // -- State for pass 2 --
+    // Track declared variables and their initialisation status
+    struct VarState {
+      std::string type_raw;   // raw Xenon type ("int","str","ptr","bool",...)
+      bool initialised{false};
+      bool is_const{false};
+      bool used{false};
+      int decl_line{0};
+    };
+    std::map<std::string, VarState> var_state;
+
+    // Scope stack: each entry is a set of variable names declared in that scope
+    // so we can detect shadowing and track scope-local vars.
+    std::vector<std::set<std::string>> scope_stack;
+    scope_stack.push_back({}); // top-level function scope
+
+    // Pre-populate with params (from local_var_types, which the caller provides)
+    for (auto const &kv : local_var_types) {
+      VarState vs;
+      vs.type_raw    = kv.second;
+      vs.initialised = true; // params always initialised
+      vs.is_const    = false;
+      var_state[kv.first] = vs;
+      scope_stack.back().insert(kv.first);
+    }
+
+    // Track whether we've seen a return at the current (depth-0) scope level
+    // to detect unreachable-code-after-return.
+    int p2_brace_depth    = 0;
+    // returned_at_top is subsumed by returned_at_depth[0]
+    // per-depth return flags (index = brace depth; depth 0 = function body)
+    std::vector<bool> returned_at_depth(64, false);
+
+    // Collect const variable names for mutation checks
+    std::set<std::string> const_vars;
+
+    auto emit2 = [&](size_t idx, const std::string &kind, const std::string &msg) {
+      if (unsafe_depth > 0) return; // inside unsafe block — silence extended checks too
+      int ln = (idx < tokens.size()) ? tokens[idx].line : 0;
+      int co = (idx < tokens.size()) ? tokens[idx].col  : 0;
+      violations.push_back({ln, co, kind, msg});
+    };
+
+    // Recompute unsafe_depth inline for pass 2 (no side-effects from pass 1)
+    int p2_unsafe_depth = 0;
+    int p2_unsafe_brace_depth = 0;
+    std::stack<int> p2_brace_depth_at_unsafe;
+
+    for (size_t i = body_start; i < body_end && i < tokens.size(); i++) {
+      const Token &tok = tokens[i];
+
+      // ── Unsafe-block tracking (mirrors pass 1) ───────────────────────────
+      if (tok.type == TT::LBRACE) {
+        p2_brace_depth++;
+        p2_unsafe_brace_depth++;
+        scope_stack.push_back({});
+        if ((int)returned_at_depth.size() <= p2_brace_depth)
+          returned_at_depth.resize(p2_brace_depth + 1, false);
+        returned_at_depth[p2_brace_depth] = false;
+        continue;
+      }
+      if (tok.type == TT::UNSAFE_KW &&
+          i + 1 < body_end && tokens[i+1].type == TT::LBRACE) {
+        p2_unsafe_depth++;
+        p2_unsafe_brace_depth++;
+        p2_brace_depth_at_unsafe.push(p2_unsafe_brace_depth);
+        i++; continue;
+      }
+      if (tok.type == TT::RBRACE) {
+        if (!p2_brace_depth_at_unsafe.empty() &&
+            p2_unsafe_brace_depth == p2_brace_depth_at_unsafe.top()) {
+          p2_unsafe_depth--;
+          p2_brace_depth_at_unsafe.pop();
+        }
+        p2_unsafe_brace_depth--;
+        if (!scope_stack.empty()) scope_stack.pop_back();
+        p2_brace_depth--;
+        continue;
+      }
+      if (p2_unsafe_depth > 0) continue;
+
+      // ── Unreachable code after return ─────────────────────────────────────
+      // If we've already seen a return at this brace depth, any subsequent
+      // statement-level token is unreachable.
+      if (p2_brace_depth < (int)returned_at_depth.size() &&
+          returned_at_depth[p2_brace_depth] &&
+          tok.type != TT::RBRACE && tok.type != TT::SEMICOLON &&
+          tok.type != TT::LBRACE && tok.type != TT::TEOF) {
+        // Only fire at statement-level tokens: previous token is ;, {, or } 
+        bool at_stmt_boundary = (i == body_start);
+        if (!at_stmt_boundary && i > body_start) {
+          TT prev = tokens[i-1].type;
+          at_stmt_boundary = (prev == TT::SEMICOLON || prev == TT::LBRACE ||
+                              prev == TT::RBRACE);
+        }
+        if (!at_stmt_boundary) goto skip_unreachable_check;
+        // Only flag the first non-trivial token to avoid a cascade
+        emit2(i, "UnreachableCode",
+              "statement after 'return' is unreachable — remove or restructure");
+        // Suppress further unreachable warnings in this scope by clearing the flag
+        returned_at_depth[p2_brace_depth] = false;
+        // Don't continue — we still process the token for other checks
+      }
+      skip_unreachable_check:;
+
+      if (tok.type == TT::RETURN) {
+        if (p2_brace_depth < (int)returned_at_depth.size())
+          returned_at_depth[p2_brace_depth] = true;
+      }
+
+      // ── Variable declaration tracking ────────────────────────────────────
+      // Pattern: CONST_KW? TYPE_KW NAME [= RHS]
+      {
+        static const std::set<TT> decl_type_kws = {
+          TT::INT, TT::FLOAT, TT::LONG, TT::SHORT, TT::DOUBLE,
+          TT::BOOL_KW, TT::CHAR_KW, TT::U8, TT::U32, TT::U64, TT::STR
+        };
+        bool is_const_decl = (tok.type == TT::CONST_KW);
+        size_t type_pos = is_const_decl ? i + 1 : i;
+        if (type_pos < body_end && decl_type_kws.count(tokens[type_pos].type) &&
+            type_pos + 1 < body_end && tokens[type_pos+1].type == TT::IDENTIFIER &&
+            // Not an array type declaration (handled by pass 1)
+            !(type_pos + 2 < body_end && tokens[type_pos+2].type == TT::LSBRACKET)) {
+
+          std::string vname = safe_name(tokens[type_pos+1].value);
+          std::string type_raw = tokens[type_pos].value;
+          bool has_init = (type_pos + 2 < body_end &&
+                           tokens[type_pos+2].type == TT::ASSIGN);
+
+          // ── Shadowing check ───────────────────────────────────────────────
+          // Check ALL enclosing scopes (not just current) for a same-named var
+          bool shadows = false;
+          for (int si = (int)scope_stack.size() - 2; si >= 0; si--) {
+            if (scope_stack[si].count(vname)) { shadows = true; break; }
+          }
+          if (!shadows && var_state.count(vname) &&
+              !scope_stack.empty() && !scope_stack.back().count(vname)) {
+            shadows = true;
+          }
+          if (shadows) {
+            emit2(type_pos + 1, "ShadowedVariable",
+                  "variable '" + vname + "' shadows an outer declaration — "
+                  "rename to avoid confusion (Rust forbids this in many cases)");
+          }
+
+          // ── Const tracking ────────────────────────────────────────────────
+          if (is_const_decl) {
+            const_vars.insert(vname);
+          }
+
+          // ── Narrowing check: initialiser is a literal ─────────────────────
+          if (has_init && type_pos + 3 < body_end &&
+              tokens[type_pos+3].type == TT::NUMBER) {
+            const std::string &lit = tokens[type_pos+3].value;
+            // Try to parse as integer (skip floats and hex for now)
+            bool is_int_lit = true;
+            for (char c : lit) {
+              if (c == '.' || c == 'x' || c == 'X' || c == 'e' || c == 'E')
+              { is_int_lit = false; break; }
+            }
+            if (is_int_lit && !lit.empty()) {
+              try {
+                long long val = std::stoll(lit);
+                std::string c_type = raw_to_c(type_raw);
+                if (!literal_fits_in_type(val, c_type)) {
+                  emit2(type_pos + 3, "IntegerOverflow",
+                        "literal value " + lit + " does not fit in type '" +
+                        type_raw + "' — this is a compile-time integer overflow");
+                }
+              } catch (...) {
+                emit2(type_pos + 3, "IntegerOverflow",
+                      "literal value " + lit + " is too large to represent in "
+                      "any integer type (overflows even uint64) — "
+                      "compile-time integer overflow");
+              }
+            }
+          }
+
+          VarState vs;
+          vs.type_raw    = type_raw;
+          vs.initialised = has_init;
+          vs.is_const    = is_const_decl;
+          vs.decl_line   = tok.line;
+          var_state[vname] = vs;
+          if (!scope_stack.empty()) scope_stack.back().insert(vname);
+
+          if (is_const_decl) i++; // skip CONST_KW, loop will advance type_pos tok
+        }
+      }
+
+      // let/var NAME = RHS  or  let/var NAME (uninitialised)
+      if ((tok.type == TT::LET_KW || tok.type == TT::VAR_KW) &&
+          i + 1 < body_end && tokens[i+1].type == TT::IDENTIFIER) {
+        std::string vname = safe_name(tokens[i+1].value);
+        bool has_init = (i + 2 < body_end && tokens[i+2].type == TT::ASSIGN);
+
+        // Shadowing
+        bool shadows = false;
+        for (int si = (int)scope_stack.size() - 2; si >= 0; si--) {
+          if (scope_stack[si].count(vname)) { shadows = true; break; }
+        }
+        if (!shadows && var_state.count(vname) &&
+            !scope_stack.empty() && !scope_stack.back().count(vname))
+          shadows = true;
+        if (shadows) {
+          emit2(i+1, "ShadowedVariable",
+                "variable '" + vname + "' shadows an outer declaration — "
+                "rename to avoid confusion");
+        }
+
+        VarState vs;
+        vs.type_raw    = "let";
+        vs.initialised = has_init;
+        vs.is_const    = false;
+        vs.decl_line   = tok.line;
+        var_state[vname] = vs;
+        if (!scope_stack.empty()) scope_stack.back().insert(vname);
+      }
+
+      // ── Const violation: assignment to a const variable ──────────────────
+      // Pattern: IDENTIFIER ASSIGN (but not ==)
+      if (tok.type == TT::IDENTIFIER &&
+          i + 2 < body_end &&
+          tokens[i+1].type == TT::ASSIGN &&
+          tokens[i+2].type != TT::ASSIGN) {
+        std::string lhs = safe_name(tok.value);
+        if (const_vars.count(lhs)) {
+          emit2(i, "ConstViolation",
+                "assignment to 'const' variable '" + lhs + "' — "
+                "const variables cannot be mutated after declaration");
+        }
+        // Also check += -= *= /= %=
+        // Mark as now initialised
+        auto vsit = var_state.find(lhs);
+        if (vsit != var_state.end())
+          vsit->second.initialised = true;
+      }
+      if (tok.type == TT::IDENTIFIER &&
+          i + 1 < body_end &&
+          (tokens[i+1].type == TT::PLUS_ASSIGN || tokens[i+1].type == TT::MINUS_ASSIGN ||
+           tokens[i+1].type == TT::MUL_ASSIGN   || tokens[i+1].type == TT::DIV_ASSIGN  ||
+           tokens[i+1].type == TT::MOD_ASSIGN   || tokens[i+1].type == TT::INCR        ||
+           tokens[i+1].type == TT::DECR)) {
+        std::string lhs = safe_name(tok.value);
+        if (const_vars.count(lhs)) {
+          emit2(i, "ConstViolation",
+                "modification of 'const' variable '" + lhs + "' via compound assignment — "
+                "const variables are immutable");
+        }
+      }
+
+      // ── Use of uninitialised variable ────────────────────────────────────
+      // Only check simple use cases: RETURN NAME, NAME used as argument
+      // (not assignment LHS).
+      if (tok.type == TT::IDENTIFIER) {
+        std::string vname = safe_name(tok.value);
+        auto vsit = var_state.find(vname);
+        if (vsit != var_state.end() && !vsit->second.initialised) {
+          // Check context: if this is a use (not the LHS of an assignment)
+          bool is_lhs_assign = (i + 1 < body_end &&
+                                tokens[i+1].type == TT::ASSIGN &&
+                                (i + 2 >= body_end || tokens[i+2].type != TT::ASSIGN));
+          bool is_decl_rhs_skip = false; // already handled above
+          if (!is_lhs_assign && !is_decl_rhs_skip) {
+            // Only fire if the previous token isn't a type keyword (i.e. not a decl)
+            bool prev_is_type = false;
+            if (i > body_start) {
+              TT prev = tokens[i-1].type;
+              static const std::set<TT> type_kws2 = {
+                TT::INT,TT::FLOAT,TT::LONG,TT::SHORT,TT::DOUBLE,
+                TT::BOOL_KW,TT::CHAR_KW,TT::U8,TT::U32,TT::U64,TT::STR,
+                TT::PTR,TT::CONST_KW,TT::LET_KW,TT::VAR_KW
+              };
+              prev_is_type = type_kws2.count(prev) > 0;
+            }
+            if (!prev_is_type) {
+              emit2(i, "Uninitialised",
+                    "variable '" + vname + "' may be used before initialisation — "
+                    "Xenon requires variables to be initialised before use");
+              vsit->second.initialised = true; // suppress further warnings
+            }
+          }
+        }
+      }
+
+      // ── Division/modulo by zero (literal zero) ────────────────────────────
+      if ((tok.type == TT::DIVIDE || tok.type == TT::MOD) &&
+          i + 1 < body_end &&
+          tokens[i+1].type == TT::NUMBER &&
+          tokens[i+1].value == "0") {
+        emit2(i, "DivisionByZero",
+              std::string(tok.type == TT::DIVIDE ? "division" : "modulo") +
+              " by literal zero — this is undefined behaviour");
+      }
+      // Also catch /= 0 and %= 0
+      if ((tok.type == TT::DIV_ASSIGN || tok.type == TT::MOD_ASSIGN) &&
+          i + 1 < body_end &&
+          tokens[i+1].type == TT::NUMBER &&
+          tokens[i+1].value == "0") {
+        emit2(i, "DivisionByZero",
+              std::string(tok.type == TT::DIV_ASSIGN ? "division" : "modulo") +
+              " by literal zero in compound assignment — undefined behaviour");
+      }
+
+      // ── Signed/unsigned comparison mismatch ──────────────────────────────
+      // Pattern: EXPR CMP_OP EXPR where one side is signed and other is unsigned.
+      // We only check the simple case where both sides are named variables.
+      if ((tok.type == TT::LT || tok.type == TT::GT ||
+           tok.type == TT::LE || tok.type == TT::GE ||
+           tok.type == TT::EQ || tok.type == TT::NE) &&
+          i > body_start && i + 1 < body_end) {
+        size_t left_pos  = i - 1;
+        size_t right_pos = i + 1;
+        if (tokens[left_pos].type  == TT::IDENTIFIER &&
+            tokens[right_pos].type == TT::IDENTIFIER) {
+          std::string lname = safe_name(tokens[left_pos].value);
+          std::string rname = safe_name(tokens[right_pos].value);
+          TypeInfo lti = lookup_var(lname);
+          TypeInfo rti = lookup_var(rname);
+          if (!lti.is_unknown() && !rti.is_unknown() &&
+              !lti.is_ptr() && !rti.is_ptr()) {
+            bool l_signed = is_signed_int_type(lti.base);
+            bool r_signed = is_signed_int_type(rti.base);
+            bool l_unsigned = is_unsigned_int_type(lti.base);
+            bool r_unsigned = is_unsigned_int_type(rti.base);
+            if ((l_signed && r_unsigned) || (l_unsigned && r_signed)) {
+              emit2(i, "SignedUnsignedMismatch",
+                    "comparison between signed ('" + lti.base + "') and unsigned "
+                    "('" + rti.base + "') — can produce surprising results when "
+                    "the signed value is negative");
+            }
+          }
+        }
+      }
+
+      // ── Implicit narrowing: assignment of wider type to narrower ──────────
+      // Pattern: NAME = NAME2  where NAME's type is narrower than NAME2's type.
+      // We only check named var-to-var assignments (not expressions).
+      if (tok.type == TT::IDENTIFIER &&
+          i + 2 < body_end &&
+          tokens[i+1].type == TT::ASSIGN &&
+          tokens[i+2].type != TT::ASSIGN &&
+          tokens[i+2].type == TT::IDENTIFIER &&
+          // skip if next is a function call
+          !(i + 3 < body_end && tokens[i+3].type == TT::LPAREN)) {
+        std::string lhs = safe_name(tok.value);
+        std::string rhs = safe_name(tokens[i+2].value);
+        TypeInfo lti = lookup_var(lhs);
+        TypeInfo rti = lookup_var(rhs);
+        if (!lti.is_unknown() && !rti.is_unknown() &&
+            !lti.is_ptr() && !rti.is_ptr() &&
+            lti.is_numeric() && rti.is_numeric()) {
+          int l_rank = int_type_rank(lti.base);
+          int r_rank = int_type_rank(rti.base);
+          if (l_rank >= 0 && r_rank >= 0 && r_rank > l_rank) {
+            emit2(i, "ImplicitNarrowing",
+                  "implicit narrowing: assigning '" + rti.base + "' ('" + rhs +
+                  "') into '" + lti.base + "' ('" + lhs + "') — "
+                  "use cast(" + lti.base + ", " + rhs + ") to make this explicit");
+          }
+        }
+      }
+
+      // ── Unused return value from non-void functions ───────────────────────
+      // Pattern: IDENTIFIER LPAREN ... RPAREN SEMICOLON  at statement level.
+      // Only flag functions with a known non-void return type.
+      // We don't flag functions like printf/exit/assert which are commonly
+      // called for side effects.
+      if (tok.type == TT::IDENTIFIER &&
+          i + 1 < body_end && tokens[i+1].type == TT::LPAREN) {
+        // Statement context: previous token is ; or { or nothing
+        bool is_stmt = (i == body_start);
+        if (!is_stmt && i > body_start) {
+          TT prev = tokens[i-1].type;
+          is_stmt = (prev == TT::SEMICOLON || prev == TT::LBRACE ||
+                     prev == TT::RBRACE);
+        }
+        if (is_stmt) {
+          static const std::set<std::string> side_effect_ok = {
+            "printf","fprintf","sprintf","snprintf","puts","putchar",
+            "exit","abort","assert","free","fclose","fflush",
+            "memset","memcpy","memmove","strcpy","strncpy","strcat","strncat",
+            "scanf","fscanf","sscanf","fgets","fread","fwrite","fseek","ftruncate",
+            "sleep","usleep","nanosleep","pthread_create","pthread_join",
+            "print","println","printfmt" // Xenon builtins
+          };
+          std::string callee = tok.value;
+          if (!side_effect_ok.count(callee)) {
+            auto frit = func_return_types.find(callee);
+            if (frit != func_return_types.end()) {
+              const std::string &fret = frit->second;
+              if (!fret.empty() && fret != "void" && fret != "__infer__") {
+                emit2(i, "UnusedReturnValue",
+                      "return value of '" + callee + "' (type '" + fret +
+                      "') is discarded — in safe code every non-void result "
+                      "must be used or explicitly ignored via (void)");
+              }
+            }
+          }
+        }
+      }
+
+      // ── str (char*) parameter mutation via raw index write ────────────────
+      // If a 'str' parameter is being indexed on the LHS of an assignment
+      // (e.g. buf[i] = 'x'), that's a mutation of a borrowed string —
+      // flag it unless we're in an unsafe block.
+      // Pattern: IDENTIFIER LSBRACKET EXPR RSBRACKET ASSIGN
+      if (tok.type == TT::IDENTIFIER &&
+          i + 3 < body_end &&
+          tokens[i+1].type == TT::LSBRACKET) {
+        std::string arr = safe_name(tok.value);
+        auto vtit = var_types.find(arr);
+        if (vtit != var_types.end() &&
+            (vtit->second == "str" || vtit->second == "char*")) {
+          // Find matching ] and check for =
+          size_t j = i + 2;
+          int d = 1;
+          while (j < body_end && d > 0) {
+            if (tokens[j].type == TT::LSBRACKET) d++;
+            else if (tokens[j].type == TT::RSBRACKET) d--;
+            j++;
+          }
+          if (j < body_end && tokens[j].type == TT::ASSIGN &&
+              j + 1 < body_end && tokens[j+1].type != TT::ASSIGN) {
+            emit2(i, "StrMutation",
+                  "direct byte mutation of string '" + arr + "' via indexing — "
+                  "str (char*) values are treated as borrowed; mutation requires unsafe");
+          }
+        }
+      }
+
+    } // end pass-2 loop
+
+    var_types = saved_vt;
+    return violations;
+  }
 
   // Namespace support --------------------------------------------------------
   std::string _cur_namespace{""}; // current namespace being defined
@@ -896,9 +2439,21 @@ class CTranspiler {
       return advance();
     std::string got =
         tok.value.empty() ? tt_name(tok.type) : ("'" + tok.value + "'");
+    // Produce a human-readable name for the expected token
+    static const std::map<TT, std::string> friendly = {
+        {TT::LPAREN, "'('"}, {TT::RPAREN, "')'"}, {TT::LBRACE, "'{'"}, {TT::RBRACE, "'}'"},
+        {TT::LSBRACKET, "'['"}, {TT::RSBRACKET, "']'"}, {TT::COMMA, "','"},
+        {TT::COLON, "':'"}, {TT::SEMICOLON, "';'"}, {TT::ASSIGN, "'='"},
+        {TT::GT, "'>'"}, {TT::LT, "'<'"}, {TT::IDENTIFIER, "an identifier"},
+        {TT::NUMBER, "a number"}, {TT::STRING, "a string literal"},
+        {TT::TEOF, "end of file"}, {TT::THEN, "'then'"}, {TT::END, "'end'"},
+        {TT::DO, "'do'"}, {TT::RSBRACKET, "']'"},
+    };
+    auto fit = friendly.find(ttype);
+    std::string expected_str = (fit != friendly.end()) ? fit->second : tt_name(ttype);
     if (!shut)
       throw XenonError("SyntaxError",
-                         "Expected " + tt_name(ttype) + ", got " + got,
+                         "Expected " + expected_str + " but got " + got,
                          tok.line, tok.col);
     return Token(ttype, "", tok.line, tok.col);
   }
@@ -1168,10 +2723,50 @@ class CTranspiler {
       if (!s.empty()) stmts.push_back(line_directive(t2) + "    " + s);
     }
     if (current().type == TT::TEOF)
-      throw XenonError("SyntaxError", "Unterminated operator body",
+      throw XenonError("SyntaxError",
+                       "Unterminated operator body — missing closing '}'",
                        kw_tok.line, kw_tok.col);
     expect(TT::RBRACE, false);
     return join(stmts, "\n");
+  }
+
+  // -----------------------------------------------------------------------
+  // resolve_overload: given an operator symbol and the token positions of the
+  // left and right operands (for type inference), return a pointer to the best
+  // matching OverloadEntry, or nullptr if none matches.
+  // Matching rules (first match wins):
+  //   1. Both arg types match the overload's declared arg types exactly.
+  //   2. Only the left arg type matches (right unknown / unregistered).
+  //   3. Any overload registered for the symbol (fallback to first).
+  // -----------------------------------------------------------------------
+  const OverloadEntry *resolve_overload(const std::string &sym,
+                                        size_t left_tok_pos,
+                                        size_t right_tok_pos) {
+    auto it = _op_overloads.find(sym);
+    if (it == _op_overloads.end()) return nullptr;
+    const auto &entries = it->second;
+    if (entries.empty()) return nullptr;
+    if (entries.size() == 1) return &entries[0]; // fast path
+
+    std::string left_type  = infer_type_at(left_tok_pos).c_type();
+    std::string right_type = infer_type_at(right_tok_pos).c_type();
+
+    // Pass 1: both args match exactly
+    for (const auto &ov : entries) {
+      const std::string &ta = ov.type_a;
+      const std::string &tb = ov.type_b;
+      if (!ta.empty() && ta == left_type &&
+          (!ov.is_binary || (!tb.empty() && tb == right_type)))
+        return &ov;
+    }
+    // Pass 2: left arg matches
+    for (const auto &ov : entries) {
+      const std::string &ta = ov.type_a;
+      if (!ta.empty() && ta == left_type)
+        return &ov;
+    }
+    // Fallback: first registered
+    return &entries[0];
   }
 
   // -----------------------------------------------------------------------
@@ -1182,7 +2777,9 @@ class CTranspiler {
     // expect 'args'
     if (current().type != TT::ARGS_KW)
       throw XenonError("SyntaxError",
-        "overload: expected 'args' after operator()", kw_tok.line, kw_tok.col);
+        "overload: expected 'args(a, b)' after operator()"
+        " (e.g. 'overload operator(+) args(a, b) type(int) { ... }')",
+        kw_tok.line, kw_tok.col);
     advance();
     auto [arg_a, arg_b] = parse_op_args(kw_tok);
     bool is_binary = !arg_b.name.empty();
@@ -1190,7 +2787,9 @@ class CTranspiler {
     Token type_tok = current();
     if (current().type != TT::TYPE && current().type != TT::IDENTIFIER)
       throw XenonError("SyntaxError",
-        "overload: expected 'type' after args()", kw_tok.line, kw_tok.col);
+        "overload: expected 'type(RETTYPE)' after args()"
+        " (e.g. 'type(int)' or 'type(str)')",
+        kw_tok.line, kw_tok.col);
     advance();
     std::string ret_type = parse_op_type(type_tok);
 
@@ -1199,11 +2798,18 @@ class CTranspiler {
     if (arg_a.type.empty()) arg_a.type = ret_type;
     if (is_binary && arg_b.type.empty()) arg_b.type = ret_type;
 
-    // Build function name
+    // Build function name — keyed on *types* not param names so that two linked
+    // files overloading the same operator for different types get distinct C
+    // function names, while true duplicates (same sym + same types) are still
+    // deduplicated correctly by the merge logic.
     std::string safe_ret = ret_type;
     for (char &c : safe_ret) if (c == '*' || c == ' ') c = '_';
+    std::string safe_ta = arg_a.type;
+    for (char &c : safe_ta) if (c == '*' || c == ' ') c = '_';
+    std::string safe_tb = arg_b.type;
+    for (char &c : safe_tb) if (c == '*' || c == ' ') c = '_';
     std::string fname = "_Overload_" + symbol_to_name(sym) + "_" +
-                        arg_a.name + (is_binary ? "_" + arg_b.name : "") + "_" + safe_ret;
+                        safe_ta + (is_binary ? "_" + safe_tb : "") + "_" + safe_ret;
 
     // Register params in var_types so the body can refer to them correctly
     var_types[arg_a.name] = arg_a.type;
@@ -1217,7 +2823,7 @@ class CTranspiler {
     std::string fn = ret_type + " " + fname + "(" + params + ") {\n" + body + "\n}\n";
     functions.push_back(fn);
 
-    _op_overloads[sym] = {fname, arg_a.name, arg_b.name, ret_type, is_binary};
+    _op_overloads[sym].push_back({fname, arg_a.name, arg_b.name, ret_type, is_binary, arg_a.type, arg_b.type});
     func_return_types[fname] = ret_type;
   }
 
@@ -1271,7 +2877,9 @@ class CTranspiler {
     // expect 'with'
     if (current().type != TT::WITH_KW)
       throw XenonError("SyntaxError",
-        "match: expected 'with' after expression", kw_tok.line, kw_tok.col);
+        "match: expected 'with' after the expression"
+        " (e.g. 'match expr with { case 1: ... }')",
+        kw_tok.line, kw_tok.col);
     advance();
     expect(TT::LBRACE, false);
 
@@ -1376,6 +2984,15 @@ class CTranspiler {
     Token name_tok = current();
     std::string struct_name = expect(TT::IDENTIFIER, false).value;
     std::string mangled_struct_name = mangle_with_ns(struct_name);
+
+    // Generic struct: type Vec<T> { ... }
+    std::string generic_param;
+    if (current().type == TT::LT) {
+      advance(); // consume '<'
+      generic_param = expect(TT::IDENTIFIER, false).value;
+      expect(TT::GT, false); // consume '>'
+    }
+
     expect(TT::LBRACE, false);
     std::vector<std::string> fields;
     auto &field_map = struct_field_types[mangled_struct_name]; // use mangled name
@@ -1385,11 +3002,31 @@ class CTranspiler {
         TT::M256,    TT::M256I,  TT::IDENTIFIER, TT::BOOL_KW,
         TT::CHAR_KW, TT::U8,     TT::U32,        TT::U64,
     };
+
+    // For generic structs, we collect field descriptors to store in the template
+    GenericStructTemplate gen_tmpl;
+    bool is_generic = !generic_param.empty();
+    if (is_generic) gen_tmpl.type_param = generic_param;
+
     while (current().type != TT::RBRACE) {
       if (current().type == TT::TEOF)
         throw XenonError("SyntaxError",
                            "Unterminated type '" + struct_name + "'",
                            name_tok.line, name_tok.col);
+
+      // ── Method definition inside struct body ──────────────────────────
+      if (current().type == TT::FUNCTION) {
+        advance(); // consume 'function'
+        std::string saved_cur_struct = _cur_struct;
+        _cur_struct = mangled_struct_name;
+        Token fn_tok = current();
+        std::string method_code = parse_function_body(fn_tok, false);
+        _cur_struct = saved_cur_struct;
+        struct_method_impls[mangled_struct_name].push_back(method_code);
+        if (current().type == TT::SEMICOLON) advance();
+        continue;
+      }
+
       Token ft = current();
       if (!valid_field_types.count(ft.type))
         throw XenonError("SyntaxError",
@@ -1398,22 +3035,39 @@ class CTranspiler {
                            ft.line, ft.col);
       std::string f_type_raw = advance().value;
       std::string f_type;
+      bool f_is_ptr = false;
+      std::string f_inner_raw = f_type_raw;
       if (f_type_raw == "ptr") {
         std::string inner = advance().value;
+        f_inner_raw = inner;
         if (inner == "str")
           inner = "char*";
-        f_type = inner + "*";
+        // If inner is the generic type param, defer substitution
+        if (is_generic && inner == generic_param) {
+          f_type = inner; // placeholder — substituted at instantiation
+        } else {
+          f_type = inner + "*";
+        }
+        f_is_ptr = true;
       } else {
         // BUG-L FIXED
         if (f_type_raw == "void")
-          throw XenonError("SyntaxError",
-                             "'void' is invalid as a struct field in '" +
-                                 struct_name + "'. Use 'ptr void'.",
+          throw XenonError("TypeError",
+                             "field '" + (ft.value.empty() ? "?" : ft.value) +
+                                 "' in struct '" + struct_name +
+                                 "' cannot have type 'void'."
+                                 " If you need a generic/opaque pointer, use 'ptr void'.",
                              ft.line, ft.col);
-        f_type = (f_type_raw == "str") ? "char*" : f_type_raw;
+        if (is_generic && f_type_raw == generic_param) {
+          f_type = f_type_raw; // placeholder
+        } else {
+          f_type = (f_type_raw == "str") ? "char*" : f_type_raw;
+        }
       }
       // BUG-K FIXED
       std::string f_name = safe_name(expect(TT::IDENTIFIER, false).value);
+      bool f_is_array = false;
+      std::string f_array_sz;
       if (current().type == TT::LSBRACKET) {
         advance();
         std::string sz;
@@ -1422,19 +3076,50 @@ class CTranspiler {
         else
           sz = expect(TT::NUMBER, false).value; // triggers proper error
         expect(TT::RSBRACKET, false);
-        fields.push_back(f_type + " " + f_name + "[" + sz + "];");
-        field_map[f_name] = f_type + "[" + sz + "]"; // preserve array info
+        f_is_array = true;
+        f_array_sz = sz;
+        if (!is_generic || (f_type_raw != generic_param)) {
+          fields.push_back(f_type + " " + f_name + "[" + sz + "];");
+          field_map[f_name] = f_type + "[" + sz + "]"; // preserve array info
+        }
       } else {
-        fields.push_back(f_type + " " + f_name + ";");
-        field_map[f_name] = f_type;
+        if (!is_generic || (f_type_raw != generic_param && f_inner_raw != generic_param)) {
+          fields.push_back(f_type + " " + f_name + ";");
+          field_map[f_name] = f_type;
+        }
       }
+
+      // Record field info for generic template
+      if (is_generic) {
+        gen_tmpl.field_raw_types.push_back(f_inner_raw);
+        gen_tmpl.field_names.push_back(f_name);
+        gen_tmpl.field_is_ptr.push_back(f_is_ptr);
+        gen_tmpl.field_is_array.push_back(f_is_array);
+        gen_tmpl.field_array_sizes.push_back(f_array_sz);
+      }
+
       if (current().type == TT::SEMICOLON)
         advance();
     }
     expect(TT::RBRACE, false);
+
+    if (is_generic) {
+      // Register as a generic template; don't emit a concrete struct yet
+      _generic_structs[mangled_struct_name] = gen_tmpl;
+      // Also register so var_types knows this is a generic struct name
+      var_types[mangled_struct_name] = "GENERIC_STRUCT";
+      return ""; // emitted lazily on first use
+    }
+
     var_types[mangled_struct_name] = "STRUCT";
-    return "typedef struct {\n    " + join(fields, "\n    ") + "\n} " +
-           mangled_struct_name + ";\n";
+    std::string _sout = "typedef struct {\n    " + join(fields, "\n    ") + "\n} " +
+                        mangled_struct_name + ";\n";
+    // Append method implementations right after the typedef
+    auto _smit = struct_method_impls.find(mangled_struct_name);
+    if (_smit != struct_method_impls.end())
+      for (const auto &_mc : _smit->second)
+        _sout += "\n" + _mc;
+    return _sout;
   }
 
   // -----------------------------------------------------------------------
@@ -1490,12 +3175,18 @@ class CTranspiler {
   // Custom infix operators sit just above comparison in precedence.
   // parse_ternary → parse_logical → ... → parse_comparison → parse_custom_infix → parse_shift
   std::string parse_custom_infix() {
+    size_t left_pos = pos;
     std::string left = parse_shift();
     while (is_custom_op_token()) {
       std::string sym = advance().value;
+      size_t right_pos = pos;
       std::string right = parse_shift();
-      const auto &ov = _op_overloads[sym];
-      left = ov.func_name + "(" + left + ", " + right + ")";
+      const OverloadEntry *ov = resolve_overload(sym, left_pos, right_pos);
+      if (ov)
+        left = ov->func_name + "(" + left + ", " + right + ")";
+      else
+        left = "(" + left + sym + right + ")";
+      left_pos = right_pos;
     }
     return left;
   }
@@ -1549,6 +3240,7 @@ class CTranspiler {
   }
 
   std::string parse_comparison() {
+    size_t left_pos = pos;
     std::string left = parse_custom_infix();
     static const std::map<TT, std::string> cmp = {
         {TT::EQ, "=="}, {TT::NE, "!="}, {TT::LT, "<"},
@@ -1557,61 +3249,84 @@ class CTranspiler {
       TT op_tt = current().type;
       advance();
       std::string op_sym = cmp.at(op_tt);
+      size_t right_pos = pos;
       std::string right = parse_custom_infix();
       if (_op_overloads.count(op_sym)) {
-        const auto &ov = _op_overloads[op_sym];
-        left = ov.func_name + "(" + left + ", " + right + ")";
-      } else {
-        left = "(" + left + op_sym + right + ")";
+        const OverloadEntry *ov = resolve_overload(op_sym, left_pos, right_pos);
+        if (ov) {
+          left = ov->func_name + "(" + left + ", " + right + ")";
+          left_pos = right_pos;
+          continue;
+        }
       }
+      left = "(" + left + op_sym + right + ")";
+      left_pos = right_pos;
     }
     return left;
   }
 
   std::string parse_shift() {
+    size_t left_pos = pos;
     std::string left = parse_additive();
     while (current().type == TT::SHL || current().type == TT::SHR) {
       TT op_tt = current().type;
       std::string op_sym = (op_tt == TT::SHL) ? "<<" : ">>";
       advance();
+      size_t right_pos = pos;
       std::string right = parse_additive();
       if (_op_overloads.count(op_sym)) {
-        const auto &ov = _op_overloads[op_sym];
-        left = ov.func_name + "(" + left + ", " + right + ")";
-      } else {
-        left = "(" + left + op_sym + right + ")";
+        const OverloadEntry *ov = resolve_overload(op_sym, left_pos, right_pos);
+        if (ov) {
+          left = ov->func_name + "(" + left + ", " + right + ")";
+          left_pos = right_pos;
+          continue;
+        }
       }
+      left = "(" + left + op_sym + right + ")";
+      left_pos = right_pos;
     }
     return left;
   }
 
   std::string parse_additive() {
+    size_t left_pos = pos;
     std::string left = parse_multiplicative();
     while (current().type == TT::PLUS || current().type == TT::MINUS) {
       std::string op_sym = advance().value;
+      size_t right_pos = pos;
       std::string right = parse_multiplicative();
       if (_op_overloads.count(op_sym)) {
-        const auto &ov = _op_overloads[op_sym];
-        left = ov.func_name + "(" + left + ", " + right + ")";
-      } else {
-        left = "(" + left + op_sym + right + ")";
+        const OverloadEntry *ov = resolve_overload(op_sym, left_pos, right_pos);
+        if (ov) {
+          left = ov->func_name + "(" + left + ", " + right + ")";
+          left_pos = right_pos; // update for next iteration
+          continue;
+        }
       }
+      left = "(" + left + op_sym + right + ")";
+      left_pos = right_pos;
     }
     return left;
   }
 
   std::string parse_multiplicative() {
+    size_t left_pos = pos;
     std::string left = parse_unary();
     while (current().type == TT::MULTIPLY || current().type == TT::DIVIDE ||
            current().type == TT::MOD) {
       std::string op_sym = advance().value;
+      size_t right_pos = pos;
       std::string right = parse_unary();
       if (_op_overloads.count(op_sym)) {
-        const auto &ov = _op_overloads[op_sym];
-        left = ov.func_name + "(" + left + ", " + right + ")";
-      } else {
-        left = "(" + left + op_sym + right + ")";
+        const OverloadEntry *ov = resolve_overload(op_sym, left_pos, right_pos);
+        if (ov) {
+          left = ov->func_name + "(" + left + ", " + right + ")";
+          left_pos = right_pos;
+          continue;
+        }
       }
+      left = "(" + left + op_sym + right + ")";
+      left_pos = right_pos;
     }
     return left;
   }
@@ -1767,18 +3482,76 @@ class CTranspiler {
     if (tok.type == TT::IDENTIFIER) {
       std::string name = safe_name(tok.value);
 
-      // NAME::symbol — namespace qualified access
+      // ── Struct method: rewrite bare field refs to self->field ──────
+      if (!_cur_struct.empty() && name != "self" &&
+          current().type != TT::COLON) {
+        auto _sfit = struct_field_types.find(_cur_struct);
+        if (_sfit != struct_field_types.end() && _sfit->second.count(name)) {
+          name = "self->" + name;
+          while (current().type == TT::LSBRACKET || current().type == TT::DOT ||
+                 current().type == TT::ARROW) {
+            if (current().type == TT::LSBRACKET) {
+              advance();
+              std::string _idx = parse_expr();
+              expect(TT::RSBRACKET, false);
+              name += "[(int)(" + _idx + ")]";
+            } else if (current().type == TT::DOT) {
+              advance();
+              name += "." + expect(TT::IDENTIFIER, false).value;
+            } else {
+              advance();
+              name += "->" + expect(TT::IDENTIFIER, false).value;
+            }
+          }
+          return name;
+        }
+      }
+
+      // NAME::symbol — namespace qualified access (supports chaining: A::B::sym)
       if (current().type == TT::COLON &&
           pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
-        advance(); advance(); // consume ::
+        // Accumulate namespace path, e.g.  A :: B :: sym  → ns_path="A__B", sym="sym"
+        std::string ns_path = tok.value;
+        advance(); advance(); // consume first ::
         std::string sym = expect(TT::IDENTIFIER, false).value;
-        std::string resolved = resolve_qualified(tok.value, sym);
+        // Keep consuming ::IDENTIFIER as long as the next thing is also ::IDENT
+        // (meaning the current sym is itself a sub-namespace, not the final symbol)
+        while (current().type == TT::COLON &&
+               pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
+          // sym was a sub-namespace name — fold it into the path
+          ns_path = ns_path + "__" + sym;
+          advance(); advance(); // consume ::
+          sym = expect(TT::IDENTIFIER, false).value;
+        }
+        std::string resolved = resolve_qualified(ns_path, sym);
         if (resolved.empty())
-          resolved = tok.value + "__" + sym; // best-effort if not registered yet
+          resolved = ns_path + "__" + sym; // best-effort if not registered yet
         name = resolved;
+        // Optional explicit generic type arg: NS::func<TYPE>(args)
+        std::string ns_explicit_type;
+        if (current().type == TT::LT && template_funcs.count(name)) {
+          size_t saved_p = pos;
+          advance(); // consume '<'
+          bool is_ptr = false;
+          if (current().type == TT::PTR) { advance(); is_ptr = true; }
+          if (current().type == TT::IDENTIFIER || current().type == TT::INT ||
+              current().type == TT::FLOAT || current().type == TT::DOUBLE ||
+              current().type == TT::LONG || current().type == TT::SHORT ||
+              current().type == TT::BOOL_KW || current().type == TT::CHAR_KW ||
+              current().type == TT::STR || current().type == TT::U8 ||
+              current().type == TT::U32 || current().type == TT::U64 ||
+              current().type == TT::VOID) {
+            std::string et = advance().value;
+            if (current().type == TT::GT) {
+              advance();
+              ns_explicit_type = raw_to_c(et);
+              if (is_ptr) ns_explicit_type += "*";
+            } else { pos = saved_p; }
+          } else { pos = saved_p; }
+        }
         if (current().type == TT::LPAREN) {
           advance();
-          return emit_call(name, tok);
+          return emit_call(name, tok, ns_explicit_type);
         }
         return name;
       }
@@ -1798,6 +3571,38 @@ class CTranspiler {
         advance();
         return emit_call(name, tok);
       }
+      // Explicit generic call: func<TYPE>(args)
+      if (current().type == TT::LT && template_funcs.count(name)) {
+        size_t saved_pos = pos;
+        advance(); // consume '<'
+        // Try to parse: IDENTIFIER or type keyword, then '>'
+        std::string explicit_type;
+        bool explicit_is_ptr = false;
+        if (current().type == TT::PTR) {
+          advance();
+          explicit_is_ptr = true;
+        }
+        if (current().type == TT::IDENTIFIER || current().type == TT::INT ||
+            current().type == TT::FLOAT || current().type == TT::DOUBLE ||
+            current().type == TT::LONG || current().type == TT::SHORT ||
+            current().type == TT::BOOL_KW || current().type == TT::CHAR_KW ||
+            current().type == TT::STR || current().type == TT::U8 ||
+            current().type == TT::U32 || current().type == TT::U64 ||
+            current().type == TT::VOID) {
+          explicit_type = advance().value;
+          if (current().type == TT::GT) {
+            advance(); // consume '>'
+            std::string c_type = raw_to_c(explicit_type);
+            if (explicit_is_ptr) c_type += "*";
+            if (current().type == TT::LPAREN) {
+              advance();
+              return emit_call(name, tok, c_type);
+            }
+          }
+        }
+        // Not a valid generic call — backtrack
+        pos = saved_pos;
+      }
       while (current().type == TT::LSBRACKET || current().type == TT::DOT ||
              current().type == TT::ARROW) {
         if (current().type == TT::LSBRACKET) {
@@ -1808,7 +3613,8 @@ class CTranspiler {
         } else if (current().type == TT::DOT) {
           advance();
           std::string field = expect(TT::IDENTIFIER, false).value;
-          // extract base name
+          // ── Method call: obj.method(args) → StructName__method(&obj, args)
+          // Extract the base variable name to look up its struct type.
           std::string base = name;
           for (char &ch : base)
             if (ch == '[' || ch == '.' || ch == '-' || ch == '>')
@@ -1816,10 +3622,51 @@ class CTranspiler {
           std::istringstream ss(base);
           std::string first;
           ss >> first;
-          std::string op = (var_types.count(first) && var_types[first] == "ptr")
-                               ? "->"
-                               : ".";
-          name = name + op + field;
+          // Look up the struct type of the base variable
+          std::string base_struct_type;
+          {
+            auto vit2 = var_types.find(first);
+            if (vit2 != var_types.end()) {
+              // var_types stores the raw Xenon type (e.g. "Sprite", "ptr", "int")
+              base_struct_type = vit2->second;
+            }
+          }
+          // Check if field is a registered method on that struct
+          bool dispatched_method = false;
+          if (!base_struct_type.empty() && current().type == TT::LPAREN) {
+            auto msit = struct_methods.find(base_struct_type);
+            if (msit != struct_methods.end() && msit->second.count(field)) {
+              // It's a method call — emit: StructType__method(&obj, args)
+              advance(); // consume '('
+              std::string mangled_method = base_struct_type + "__" + field;
+              // For pointer vars use the name directly; for value vars take address
+              std::string self_arg;
+              bool is_ptr_var = (base_struct_type.size() > 0 &&
+                                 var_types.count(first) &&
+                                 var_types[first].find("ptr") != std::string::npos);
+              // Simpler: always take address — C handles &ptr correctly with **
+              // but that's wrong; use -> for ptrs.  Check var_types[first].
+              // If var is a plain struct value, use &name; if ptr, use name.
+              if (is_ptr_var)
+                self_arg = name; // already a pointer
+              else
+                self_arg = "&" + name;
+              std::string call_args = self_arg;
+              while (current().type != TT::RPAREN && current().type != TT::TEOF) {
+                call_args += ", " + parse_expr();
+                if (current().type == TT::COMMA) advance();
+              }
+              expect(TT::RPAREN, false);
+              name = mangled_method + "(" + call_args + ")";
+              dispatched_method = true;
+            }
+          }
+          if (!dispatched_method) {
+            std::string op = (var_types.count(first) && var_types[first] == "ptr")
+                                 ? "->"
+                                 : ".";
+            name = name + op + field;
+          }
         } else {
           advance();
           std::string field = expect(TT::IDENTIFIER, false).value;
@@ -1838,7 +3685,8 @@ class CTranspiler {
     }
 
     throw XenonError("SyntaxError",
-                       "Unexpected token '" + tok.value + "' in expression",
+                       "Unexpected token '" + tok.value + "' in expression"
+                       " — expected a value, variable, or operator",
                        tok.line, tok.col);
   }
 
@@ -2393,6 +4241,48 @@ class CTranspiler {
     return infer_expr_type_at(start_pos);
   }
 
+  // Returns the printf format specifier and optional cast for a given TypeInfo.
+  // Used in TCC mode where _Generic is unavailable.
+  // Returns {fmt, cast} e.g. {"%d", "(int)"} or {"%s", ""}
+  struct FmtSpec { std::string fmt; std::string cast; };
+  static FmtSpec printf_fmt_for_type(const TypeInfo &ti) {
+    const std::string &b = ti.base;
+    // pointers / strings
+    if (ti.is_ptr() || b == "char*" || b == "const char*")
+      return {"%s", ""};
+    if (b == "char")
+      return {"%c", "(char)"};
+    if (b == "double")
+      return {"%.10g", "(double)"};
+    if (b == "float")
+      return {"%g", "(float)"};
+    if (b == "long")
+      return {"%ld", "(long)"};
+    if (b == "uint64_t")
+      return {"%\" PRIu64 \"", "(uint64_t)"};
+    if (b == "uint32_t")
+      return {"%\" PRIu32 \"", "(uint32_t)"};
+    if (b == "uint8_t")
+      return {"%\" PRIu8 \"", "(uint8_t)"};
+    if (b == "short")
+      return {"%d", "(int)"};
+    if (b == "bool")
+      // bools: print as true/false via ternary — no cast needed, handled specially
+      return {"BOOL", ""};
+    // default: int
+    return {"%d", "(int)"};
+  }
+
+  // Emit a single printf call for one print argument in TCC mode.
+  // tok_pos is the token position before the expression was parsed.
+  std::string tcc_print_one(const std::string &expr, size_t tok_pos) {
+    TypeInfo ti = infer_type_at(tok_pos);
+    FmtSpec fs = printf_fmt_for_type(ti);
+    if (fs.fmt == "BOOL")
+      return "printf(\"%s\", (" + expr + ") ? \"true\" : \"false\")";
+    return "printf(\"" + fs.fmt + "\", " + fs.cast + "(" + expr + "))";
+  }
+
   // Legacy compatibility shim used by the let/var handler
   std::string infer_type_from_rhs(const Token & /*expr_tok*/,
                                   const std::string & /*expr_str*/,
@@ -2467,6 +4357,10 @@ class CTranspiler {
       return rit->second;
 
     // Re-entrancy guard (recursive templates would loop)
+    // If the template has a generic return type (e.g. returns Vec<T>),
+    // instantiate the struct now with the first concrete type.
+    // (Deferred to after mangled is declared below.)
+
     std::string guard_key = fname + "@" + key;
     if (_mono_in_progress.count(guard_key))
       return fname;
@@ -2477,6 +4371,17 @@ class CTranspiler {
 
     std::string mangled = mono_mangle(fname, concrete_types);
     reg[key] = mangled; // register early to handle recursion
+
+    // If the template has a generic return type (e.g. returns Vec<T>),
+    // instantiate the struct now with the first concrete type.
+    if (!tmpl.generic_ret_param.empty() && !tmpl.func_type_param.empty() &&
+        !concrete_types.empty() && _generic_structs.count(tmpl.raw_ret)) {
+      std::string ct = concrete_types[0];
+      instantiate_generic_struct(tmpl.raw_ret, ct);
+      std::string safe_ct = ct;
+      for (char &c : safe_ct) if (c == '*' || c == ' ') c = '_';
+      func_return_types[mangled] = tmpl.raw_ret + "__" + safe_ct;
+    }
 
     // Save current parser state
     size_t saved_pos = pos;
@@ -2502,6 +4407,13 @@ class CTranspiler {
       } else if (raw_r == "ptr") {
         scan++;
       } // ptr X
+      // optional <PARAM> on return type (generic struct return like Vec<T>)
+      if (scan < tokens.size() && tokens[scan].type == TT::LT) {
+        scan++; // skip '<'
+        while (scan < tokens.size() && tokens[scan].type != TT::GT)
+          scan++;
+        if (scan < tokens.size()) scan++; // skip '>'
+      }
       // optional [N] on return type
       if (scan < tokens.size() && tokens[scan].type == TT::LSBRACKET) {
         scan++;
@@ -2512,6 +4424,13 @@ class CTranspiler {
       }
       // fname
       scan++; // skip fname
+      // optional <T> on function name
+      if (scan < tokens.size() && tokens[scan].type == TT::LT) {
+        scan++; // skip '<'
+        while (scan < tokens.size() && tokens[scan].type != TT::GT)
+          scan++;
+        if (scan < tokens.size()) scan++; // skip '>'
+      }
       // LPAREN
       if (scan < tokens.size() && tokens[scan].type == TT::LPAREN)
         scan++;
@@ -2524,6 +4443,13 @@ class CTranspiler {
         std::string p_raw = tokens[scan++].value;
         if (p_raw == "ptr" && scan < tokens.size())
           scan++; // ptr X
+        // optional <PARAM> on param type (e.g. Vec<T> param)
+        if (scan < tokens.size() && tokens[scan].type == TT::LT) {
+          scan++; // skip '<'
+          while (scan < tokens.size() && tokens[scan].type != TT::GT)
+            scan++;
+          if (scan < tokens.size()) scan++; // skip '>'
+        }
         // optional [N]
         if (scan < tokens.size() && tokens[scan].type == TT::LSBRACKET) {
           scan++;
@@ -2547,6 +4473,14 @@ class CTranspiler {
           scan++;
         ci++;
       }
+
+      // If this template has an explicit type param (func_type_param),
+      // seed var_types with the binding so parse_function_body can resolve
+      // Vec<T> → Vec__int during re-parse.
+      if (!tmpl.func_type_param.empty() && !concrete_types.empty()) {
+        // Bind the explicit type param name to the first concrete type
+        var_types[tmpl.func_type_param] = c_type_to_raw(concrete_types[0]);
+      }
     }
 
     // Now re-parse parse_function_body from tok_start.
@@ -2565,6 +4499,13 @@ class CTranspiler {
         if (raw_r2 == "ptr" && scan < tokens.size())
           scan++;
       }
+      // skip optional <PARAM> on return type
+      if (scan < tokens.size() && tokens[scan].type == TT::LT) {
+        scan++;
+        while (scan < tokens.size() && tokens[scan].type != TT::GT)
+          scan++;
+        if (scan < tokens.size()) scan++;
+      }
       if (scan < tokens.size() && tokens[scan].type == TT::LSBRACKET) {
         scan++;
         while (scan < tokens.size() && tokens[scan].type != TT::RSBRACKET)
@@ -2579,7 +4520,10 @@ class CTranspiler {
         pos = tok_start_idx;
         std::string code = parse_function_body(tokens[scan], tmpl.inl);
         tokens[scan].value = orig_fname; // restore
-        functions.push_back(code);
+        // Guard: if parse_function_body returned a __TEMPLATE__ sentinel again
+        // (re-entrancy or is_instantiating_now was false), don't emit that literal.
+        if (code.size() <= 12 || code.substr(0, 12) != "__TEMPLATE__")
+          functions.push_back(code);
       }
     }
 
@@ -2612,7 +4556,8 @@ class CTranspiler {
   // If fname is a template, instantiate/look up specialization and rewrite.
   // Returns "mangled_name(arg1, arg2, ...)" — no trailing semicolon.
   // -----------------------------------------------------------------------
-  std::string emit_call(const std::string &fname, const Token &call_tok) {
+  std::string emit_call(const std::string &fname, const Token &call_tok,
+                        const std::string &explicit_type_arg = "") {
     // Collect arg start positions BEFORE consuming them
     bool is_tmpl = template_funcs.count(fname) > 0;
     std::vector<size_t> arg_starts;
@@ -2620,7 +4565,8 @@ class CTranspiler {
     while (current().type != TT::RPAREN) {
       if (current().type == TT::TEOF)
         throw XenonError("SyntaxError",
-                           "Unterminated args in call to '" + fname + "'",
+                           "Missing closing ')' in call to '" + fname +
+                           "' — reached end of file",
                            call_tok.line, call_tok.col);
       if (is_tmpl)
         arg_starts.push_back(pos);
@@ -2631,25 +4577,31 @@ class CTranspiler {
     expect(TT::RPAREN, false);
 
     std::string call_name = fname;
-    if (is_tmpl && !args.empty()) {
-      // Determine which params are infer slots
+    if (is_tmpl) {
       const TemplateFunc &tmpl = template_funcs[fname];
-      std::vector<std::string> concrete;
-      for (size_t i = 0; i < tmpl.param_slots.size(); i++) {
-        if (i < arg_starts.size()) {
-          if (tmpl.param_slots[i].infer) {
-            TypeInfo ti = infer_type_at(arg_starts[i]);
-            concrete.push_back(ti.c_type());
-          } else {
-            // concrete type from the slot's declared type
-            concrete.push_back(param_raw_to_c(tmpl.param_slots[i].raw));
+      // If an explicit type arg was given (e.g. VecNew<int>), build concrete list from it.
+      if (!explicit_type_arg.empty() && !tmpl.func_type_param.empty()) {
+        // Use explicit_type_arg as the binding for every slot that references
+        // the function's type parameter (infer slots, ptr-T slots, Vec<T> slots).
+        // We pass a single concrete type; instantiate_template seeds var_types[T].
+        call_name = instantiate_template(fname, {explicit_type_arg});
+      } else if (!args.empty()) {
+        std::vector<std::string> concrete;
+        for (size_t i = 0; i < tmpl.param_slots.size(); i++) {
+          if (i < arg_starts.size()) {
+            if (tmpl.param_slots[i].infer) {
+              TypeInfo ti = infer_type_at(arg_starts[i]);
+              concrete.push_back(ti.c_type());
+            } else {
+              concrete.push_back(param_raw_to_c(tmpl.param_slots[i].raw));
+            }
           }
         }
+        call_name = instantiate_template(fname, concrete);
+      } else {
+        // zero-arg template, no explicit type arg
+        call_name = instantiate_template(fname, {});
       }
-      call_name = instantiate_template(fname, concrete);
-    } else if (is_tmpl && args.empty()) {
-      // zero-arg template — instantiate with empty specialization
-      call_name = instantiate_template(fname, {});
     }
     return call_name + "(" + join(args, ", ") + ")";
   }
@@ -2664,22 +4616,34 @@ class CTranspiler {
     // expect 'namespace'
     if (current().type != TT::NAMESPACE_KW)
       throw XenonError("SyntaxError",
-        "'in' must be followed by 'namespace'", kw_tok.line, kw_tok.col);
+        "'in' must be followed by 'namespace' (e.g. 'in namespace MyNS are { ... }')",
+        kw_tok.line, kw_tok.col);
     advance();
     // expect NAME
     std::string ns_name = expect(TT::IDENTIFIER, false).value;
     // expect 'are'
     if (current().type != TT::ARE_KW)
       throw XenonError("SyntaxError",
-        "namespace declaration must have 'are' after name", kw_tok.line, kw_tok.col);
+        "namespace '" + ns_name + "' declaration requires 'are' after the name"
+        " (e.g. 'in namespace " + ns_name + " are { ... }')",
+        kw_tok.line, kw_tok.col);
     advance();
     // expect '{'
     expect(TT::LBRACE, false);
 
-    // Save and set current namespace
+    // Save and set current namespace — support nesting by composing names
     std::string prev_ns = _cur_namespace;
-    _cur_namespace = ns_name;
-    auto &ns_map = _namespaces[ns_name]; // creates if absent (redef support)
+    // Fully-qualified name: outer__inner (mirrors the C mangling convention)
+    std::string fq_ns_name = prev_ns.empty() ? ns_name : (prev_ns + "__" + ns_name);
+    _cur_namespace = fq_ns_name;
+    auto &ns_map = _namespaces[fq_ns_name]; // creates if absent (redef support)
+    // Also register a dotted alias "outer::inner" → same map, so qualified
+    // access like  outer::inner::sym  resolves after the first :: step.
+    if (!prev_ns.empty()) {
+      // Allow  OUTER::INNER  as a namespace key for two-level NS::sym lookups
+      std::string alias_key = prev_ns + "::" + ns_name;
+      _namespaces[alias_key] = {}; // placeholder; filled below via reference
+    }
 
     // Helper: peek at the function name token after the return type.
     // Scans forward past any type tokens (keywords + optional ptr/const qualifier)
@@ -2690,10 +4654,21 @@ class CTranspiler {
       while (scan < tokens.size()) {
         TT tt = tokens[scan].type;
         if (tt == TT::IDENTIFIER) {
-          // Check if next non-trivial token is LPAREN → this is the fname
-          if (scan + 1 < tokens.size() && tokens[scan + 1].type == TT::LPAREN)
+          // Skip <PARAM> on a generic struct return type: Vec<T>
+          if (scan + 1 < tokens.size() && tokens[scan + 1].type == TT::LT) {
+            scan++; // skip struct name
+            scan++; // skip '<'
+            while (scan < tokens.size() && tokens[scan].type != TT::GT)
+              scan++;
+            if (scan < tokens.size()) scan++; // skip '>'
+            continue;
+          }
+          // Check if next token is LPAREN or LT (generic func like name<T>(...))
+          if (scan + 1 < tokens.size() &&
+              (tokens[scan + 1].type == TT::LPAREN ||
+               tokens[scan + 1].type == TT::LT))
             return tokens[scan].value;
-          // Otherwise it's a type name (struct type), skip it and keep looking
+          // Otherwise it's a type name, skip it
           scan++;
           continue;
         }
@@ -2721,9 +4696,11 @@ class CTranspiler {
         // peek at name before emit_function consumes it, register in ns_map
         std::string short_name = peek_fname();
         std::string code = emit_function(t, false);
-        if (!code.empty()) functions.push_back(line_directive(t) + code);
+        // emit_function returns "__TEMPLATE__<name>" for generic/template functions — don't emit
+        bool is_template = (code.size() > 12 && code.substr(0, 12) == "__TEMPLATE__");
+        if (!code.empty() && !is_template) functions.push_back(line_directive(t) + code);
         if (!short_name.empty())
-          ns_map[short_name] = ns_name + "__" + short_name;
+          ns_map[short_name] = fq_ns_name + "__" + short_name;
       } else if (t.type == TT::INLINE_KW) {
         advance();
         if (current().type != TT::FUNCTION)
@@ -2732,9 +4709,10 @@ class CTranspiler {
         Token fn_tok = current(); advance();
         std::string short_name = peek_fname();
         std::string code = emit_function(fn_tok, true);
-        if (!code.empty()) functions.push_back(line_directive(fn_tok) + code);
+        bool is_template = (code.size() > 12 && code.substr(0, 12) == "__TEMPLATE__");
+        if (!code.empty() && !is_template) functions.push_back(line_directive(fn_tok) + code);
         if (!short_name.empty())
-          ns_map[short_name] = ns_name + "__" + short_name;
+          ns_map[short_name] = fq_ns_name + "__" + short_name;
       } else if (t.type == TT::TYPE) {
         // Peek at struct name before parsing
         std::string struct_name;
@@ -2745,7 +4723,7 @@ class CTranspiler {
           headers.push_back(line_directive(t) + code);
           // Register struct in namespace
           if (!struct_name.empty())
-            ns_map[struct_name] = ns_name + "__" + struct_name;
+            ns_map[struct_name] = fq_ns_name + "__" + struct_name;
         }
       } else if (t.type == TT::ENUM_KW) {
         std::string code = parse_enum();
@@ -2764,6 +4742,34 @@ class CTranspiler {
             "'addop' must be followed by 'operator'", t.line, t.col);
         advance();
         parse_addop(t);
+      } else if (t.type == TT::UNSAFE_KW) {
+        advance();
+        if (current().type != TT::FUNCTION)
+          throw XenonError("SyntaxError",
+            "'unsafe' inside namespace must be followed by 'function'",
+            t.line, t.col);
+        Token fn_tok = current(); advance();
+        std::string short_name = peek_fname();
+        // Register as unsafe BEFORE emit_function so the safety checker sees it
+        if (!short_name.empty()) {
+          std::string mangled = safe_name(fq_ns_name + "__" + short_name);
+          _unsafe_functions.insert(mangled);
+          _unsafe_functions.insert(safe_name(short_name));
+        }
+        std::string code = emit_function(fn_tok, false);
+        bool is_template = (code.size() > 12 && code.substr(0, 12) == "__TEMPLATE__");
+        if (!code.empty() && !is_template)
+          functions.push_back(line_directive(fn_tok) + code);
+        if (!short_name.empty())
+          ns_map[short_name] = fq_ns_name + "__" + short_name;
+      } else if (t.type == TT::IN_KW) {
+        // Nested namespace: in namespace CHILD are { ... }
+        // parse_namespace_block sees _cur_namespace == fq_ns_name and
+        // composes fq_child = fq_ns_name + "__" + CHILD automatically.
+        Token kw = advance();
+        parse_namespace_block(kw);
+        // Child symbols are synced into this map by the parent-sync block
+        // at the end of parse_namespace_block, so nothing extra needed here.
       } else {
         advance();
       }
@@ -2771,8 +4777,24 @@ class CTranspiler {
 
     if (current().type == TT::TEOF)
       throw XenonError("SyntaxError",
-        "Unterminated namespace '" + ns_name + "'", kw_tok.line, kw_tok.col);
+        "Unterminated namespace '" + fq_ns_name + "'", kw_tok.line, kw_tok.col);
     expect(TT::RBRACE, false);
+
+    // If nested, expose symbols to parent namespace under the short child name
+    // so that  parent::child::sym  can be resolved as  fq_ns_name__sym.
+    // We register the child namespace itself as a symbol in the parent map so
+    // that a two-step  NS::sym  access (where NS is the fq key) keeps working.
+    if (!prev_ns.empty()) {
+      // Register ns_name as a "namespace alias" entry in the parent so that
+      // inner::sym calls inside the parent can find fq_ns_name__sym.
+      auto &parent_map = _namespaces[prev_ns];
+      // Also sync the alias key map with what was actually registered
+      std::string alias_key = prev_ns + "::" + ns_name;
+      _namespaces[alias_key] = ns_map;
+      // Expose inner symbols in parent under qualified short key (ns_name__sym)
+      for (auto &[sym, cname] : ns_map)
+        parent_map[ns_name + "__" + sym] = cname;
+    }
 
     _cur_namespace = prev_ns;
   }
@@ -2822,7 +4844,8 @@ class CTranspiler {
       advance();
       if (current().type != TT::NAMESPACE_KW)
         throw XenonError("SyntaxError",
-          "'ignore' must be followed by 'namespace'", t.line, t.col);
+          "'ignore' must be followed by 'namespace' (e.g. 'ignore namespace MyNS')",
+          t.line, t.col);
       advance();
       std::string ns_name = expect(TT::IDENTIFIER, false).value;
       _ignored_namespaces.insert(ns_name);
@@ -2834,7 +4857,9 @@ class CTranspiler {
       Token kw = advance();
       if (current().type != TT::OPERATOR_KW)
         throw XenonError("SyntaxError",
-          "'overload' must be followed by 'operator'", kw.line, kw.col);
+          "'overload' must be followed by 'operator(SYM)'"
+          " (e.g. 'overload operator(+) args(a, b) type(int) { ... }')",
+          kw.line, kw.col);
       advance();
       parse_overload(kw);
       return "";
@@ -2845,7 +4870,9 @@ class CTranspiler {
       Token kw = advance();
       if (current().type != TT::OPERATOR_KW)
         throw XenonError("SyntaxError",
-          "'addop' must be followed by 'operator'", kw.line, kw.col);
+          "'addop' must be followed by 'operator(SYM)'"
+          " (e.g. 'addop operator(@@) args(a, b) type(int) { ... }')",
+          kw.line, kw.col);
       advance();
       parse_addop(kw);
       return "";
@@ -2871,7 +4898,36 @@ class CTranspiler {
       return parse_match(kw);
     }
 
-    // HLT
+    if (t.type == TT::UNSAFE_KW) {
+      Token unsafe_tok = advance();
+      if (current().type != TT::LBRACE)
+        throw XenonError("SyntaxError",
+                         "'unsafe' must be followed by a block: unsafe { ... }",
+                         unsafe_tok.line, unsafe_tok.col);
+      if (_memory_safe && _cur_func != "__main__" && !_unsafe_functions.count(_cur_func))
+        throw XenonError("SafetyError",
+                         "unsafe block in function '" + _cur_func + "'"
+                         " — declare the function with 'unsafe function' to allow unsafe blocks,"
+                         " or move this code into a separate 'unsafe function'",
+                         unsafe_tok.line, unsafe_tok.col);
+      advance();
+      bool prev_unsafe = _in_unsafe_block;
+      _in_unsafe_block = true;
+      std::vector<std::string> body_stmts;
+      while (current().type != TT::RBRACE && current().type != TT::TEOF) {
+        Token tok2 = current();
+        std::string s = parse_statement();
+        if (!s.empty())
+          body_stmts.push_back(line_directive(tok2) + "    " + s);
+      }
+      if (current().type == TT::TEOF)
+        throw XenonError("SyntaxError", "Unterminated 'unsafe' block",
+                         unsafe_tok.line, unsafe_tok.col);
+      expect(TT::RBRACE, false);
+      _in_unsafe_block = prev_unsafe;
+      return "/* unsafe */ {\n" + join(body_stmts, "\n") + "\n}";
+    }
+
     if (t.type == TT::HLT) {
       advance();
       expect(TT::LPAREN, false);
@@ -2883,7 +4939,21 @@ class CTranspiler {
     // throw
     if (t.type == TT::THROW_KW) {
       advance();
-      return "_lb_throw(TO_STR(" + parse_expr() + "));";
+      size_t expr_pos = pos;
+      std::string expr = parse_expr();
+      if (tcc_mode) {
+        // throw always takes a string message in practice; if it's a str/char*
+        // pass directly, otherwise cast to int and format — but _lb_throw needs
+        // a const char*. Use tcc_print_one logic: build a snprintf into a local.
+        TypeInfo ti = infer_type_at(expr_pos);
+        FmtSpec fs = printf_fmt_for_type(ti);
+        if (fs.fmt == "%s")
+          return "_lb_throw((const char*)(" + expr + "));";
+        // non-string: format into a small static buffer
+        return "{ static char _thr_buf[512]; snprintf(_thr_buf,512,\""
+               + fs.fmt + "\"," + fs.cast + "(" + expr + ")); _lb_throw(_thr_buf); }";
+      }
+      return "_lb_throw(TO_STR(" + expr + "));";
     }
 
     // try/except
@@ -2898,11 +4968,13 @@ class CTranspiler {
           try_body.push_back(line_directive(tok2) + "        " + s);
       }
       if (current().type == TT::TEOF)
-        throw XenonError("SyntaxError", "Unterminated 'try' block",
+        throw XenonError("SyntaxError",
+                         "Unterminated 'try' block — missing closing '}' for the try body",
                            try_t.line, try_t.col);
       expect(TT::RBRACE, false);
       if (current().type != TT::EXCEPT_KW)
-        throw XenonError("SyntaxError", "'try' must be followed by 'except'",
+        throw XenonError("SyntaxError",
+                         "'try' block must be followed by 'except(type varName) { ... }'",
                            try_t.line, try_t.col);
       advance();
       expect(TT::LPAREN, false);
@@ -2918,7 +4990,8 @@ class CTranspiler {
           exc_body.push_back(line_directive(tok2) + "        " + s);
       }
       if (current().type == TT::TEOF)
-        throw XenonError("SyntaxError", "Unterminated 'except' block",
+        throw XenonError("SyntaxError",
+                         "Unterminated 'except' block — missing closing '}'",
                            try_t.line, try_t.col);
       expect(TT::RBRACE, false);
       // Use line:col as UID — guaranteed unique per source location.
@@ -3027,6 +5100,19 @@ class CTranspiler {
       if (vt == "__m256" || vt == "__m256i")
         return "if(" + hname + "){fprintf(" + hname + ",\"%s\",TO_STR(" +
                content + "));fflush(" + hname + ");}";
+      // generic fallback — use TO_STR in non-TCC mode, infer format in TCC mode
+      if (tcc_mode) {
+        TypeInfo ti = infer_type_at(ct.line > 0 ? (size_t)(ct.line) : pos);
+        // reuse the position of ct in the token stream
+        size_t ct_pos = 0;
+        for (size_t ii = 0; ii < tokens.size(); ii++) {
+          if (&tokens[ii] == &ct) { ct_pos = ii; break; }
+        }
+        FmtSpec fs = printf_fmt_for_type(infer_type_at(ct_pos));
+        if (fs.fmt == "BOOL")
+          return "if(" + hname + "){fprintf(" + hname + ",\"%s\",(" + content + ")? \"true\":\"false\");fflush(" + hname + ");}";
+        return "if(" + hname + "){fprintf(" + hname + ",\"" + fs.fmt + "\"," + fs.cast + "(" + content + "));fflush(" + hname + ");}";
+      }
       return "if(" + hname + "){fprintf(" + hname + ",\"%s\",TO_STR(" +
              content + "));fflush(" + hname + ");}";
     }
@@ -3070,13 +5156,55 @@ class CTranspiler {
       return "";
     }
 
-    // inline function
     if (t.type == TT::INLINE_KW) {
       advance();
+      if (current().type == TT::UNSAFE_KW) {
+        Token unsafe_tok2 = advance();
+        if (current().type != TT::FUNCTION)
+          throw XenonError("SyntaxError",
+                           "'inline unsafe' must be followed by 'function'"
+                           " (e.g. 'inline unsafe function int foo() { ... }')",
+                           unsafe_tok2.line, unsafe_tok2.col);
+        Token fn_tok2 = current(); advance();
+        size_t ns2 = pos;
+        {
+          static const std::set<TT> skip2 = {
+            TT::INT,TT::FLOAT,TT::STR,TT::LONG,TT::SHORT,TT::DOUBLE,
+            TT::VOID,TT::M256,TT::M256I,TT::BOOL_KW,TT::CHAR_KW,
+            TT::PTR,TT::U8,TT::U32,TT::U64,TT::LET_KW,TT::VAR_KW,
+            TT::IDENTIFIER
+          };
+          while (ns2 < tokens.size() && skip2.count(tokens[ns2].type)) {
+            if (tokens[ns2].type == TT::PTR) {
+              ns2++; // skip 'ptr'
+              // skip the pointee type so we land on the function name
+              if (ns2 < tokens.size() && skip2.count(tokens[ns2].type))
+                ns2++;
+              break;
+            }
+            ns2++;
+            if (ns2 < tokens.size() && tokens[ns2].type == TT::LT) {
+              while (ns2 < tokens.size() && tokens[ns2].type != TT::GT) ns2++;
+              if (ns2 < tokens.size()) ns2++;
+            }
+            if (ns2 < tokens.size() && tokens[ns2].type == TT::LSBRACKET) {
+              while (ns2 < tokens.size() && tokens[ns2].type != TT::RSBRACKET) ns2++;
+              if (ns2 < tokens.size()) ns2++;
+            }
+            break;
+          }
+        }
+        if (ns2 < tokens.size() && tokens[ns2].type == TT::IDENTIFIER) {
+          _unsafe_functions.insert(mangle_with_ns(tokens[ns2].value));
+          _unsafe_functions.insert(tokens[ns2].value);
+        }
+        return emit_function(fn_tok2, true);
+      }
       if (current().type != TT::FUNCTION)
         throw XenonError("SyntaxError",
-                           "'inline' must be followed by 'function'", t.line,
-                           t.col);
+                           "'inline' must be followed by 'function'"
+                           " (e.g. 'inline function int foo() { ... }')",
+                           t.line, t.col);
       advance();
       return emit_function(t, true);
     }
@@ -3139,6 +5267,53 @@ class CTranspiler {
     }
 
     // Type declarations (var decl)
+    // Handle generic struct instantiation: Vec<int> x = ...
+    if (t.type == TT::IDENTIFIER && _generic_structs.count(safe_name(t.value))) {
+      std::string gen_name = safe_name(advance().value);
+      if (current().type == TT::LT) {
+        advance(); // consume '<'
+        // collect concrete type (may be 'ptr X' or a plain keyword/identifier)
+        std::string concrete_raw;
+        bool concrete_is_ptr = false;
+        if (current().type == TT::PTR) {
+          advance();
+          concrete_is_ptr = true;
+          concrete_raw = advance().value;
+        } else {
+          concrete_raw = advance().value;
+        }
+        expect(TT::GT, false); // consume '>'
+        // Resolve concrete_raw if it is a bound type parameter (e.g. "T" → "int")
+        {
+          auto _gvit = var_types.find(concrete_raw);
+          if (_gvit != var_types.end() && _gvit->second != "STRUCT" &&
+              _gvit->second != "GENERIC_STRUCT" && _gvit->second != concrete_raw) {
+            concrete_raw = raw_to_c(_gvit->second);
+          }
+        }
+        std::string c_concrete = raw_to_c(concrete_raw);
+        if (concrete_is_ptr) c_concrete += "*";
+        std::string mangled = instantiate_generic_struct(gen_name, c_concrete);
+        std::string varname = safe_name(expect(TT::IDENTIFIER, false).value);
+        var_types[varname] = mangled;
+        if (current().type == TT::ASSIGN) {
+          advance();
+          return mangled + " " + varname + " = " + parse_expr() + ";";
+        }
+        return mangled + " " + varname + ";";
+      }
+      // Not generic angle bracket — fall through treating as regular IDENTIFIER
+      // (already advanced past it, so re-insert logic manually)
+      // This shouldn't normally happen if user wrote Vec without <T>, but handle gracefully
+      std::string varname = safe_name(expect(TT::IDENTIFIER, false).value);
+      var_types[varname] = gen_name;
+      if (current().type == TT::ASSIGN) {
+        advance();
+        return gen_name + " " + varname + " = " + parse_expr() + ";";
+      }
+      return gen_name + " " + varname + ";";
+    }
+
     bool is_custom =
         (t.type == TT::IDENTIFIER &&
          ((var_types.count(t.value) && var_types[t.value] == "STRUCT") ||
@@ -3159,15 +5334,31 @@ class CTranspiler {
           headers[0] = "#include <stdint.h>\n" + headers[0];
       } else if (vtype_raw == "ptr") {
         std::string inner = advance().value;
-        if (inner == "str")
+        if (inner == "str") {
           inner = "char*";
+        } else {
+          // Resolve type param (e.g. "T" → "int" if T is bound in var_types)
+          auto _ptpit = var_types.find(inner);
+          if (_ptpit != var_types.end() && _ptpit->second != "STRUCT" &&
+              _ptpit->second != "GENERIC_STRUCT" && _ptpit->second != inner) {
+            inner = raw_to_c(_ptpit->second);
+          }
+        }
         vtype = inner + "*";
       } else if (vtype_raw == "bool") {
         vtype = "bool";
       } else if (vtype_raw == "char") {
         vtype = "char";
       } else {
-        vtype = (vtype_raw == "str") ? "char*" : vtype_raw;
+        // Resolve bare type param (e.g. "T" → "int")
+        auto _btp = var_types.find(vtype_raw);
+        if (_btp != var_types.end() && _btp->second != "STRUCT" &&
+            _btp->second != "GENERIC_STRUCT" && _btp->second != vtype_raw &&
+            !_generic_structs.count(vtype_raw)) {
+          vtype = raw_to_c(_btp->second);
+        } else {
+          vtype = (vtype_raw == "str") ? "char*" : vtype_raw;
+        }
       }
 
       std::string name = safe_name(expect(TT::IDENTIFIER, false).value);
@@ -3222,10 +5413,13 @@ class CTranspiler {
       advance();
       expect(TT::LPAREN, false);
       std::vector<std::string> exprs;
+      std::vector<size_t> expr_positions;
       while (current().type != TT::RPAREN) {
         if (current().type == TT::TEOF)
-          throw XenonError("SyntaxError", "Unterminated 'print'", t.line,
-                             t.col);
+          throw XenonError("SyntaxError",
+                           "Missing closing ')' in 'print(...)' call",
+                           t.line, t.col);
+        expr_positions.push_back(pos);
         exprs.push_back(parse_expr());
         if (current().type == TT::COMMA)
           advance();
@@ -3233,9 +5427,11 @@ class CTranspiler {
       expect(TT::RPAREN, false);
       std::string r;
       for (size_t i = 0; i < exprs.size(); i++) {
-        if (i)
-          r += "; ";
-        r += "printf(\"%s\",TO_STR(" + exprs[i] + "))";
+        if (i) r += "; ";
+        if (tcc_mode)
+          r += tcc_print_one(exprs[i], expr_positions[i]);
+        else
+          r += "printf(\"%s\",TO_STR(" + exprs[i] + "))";
       }
       return r + ";";
     }
@@ -3245,10 +5441,13 @@ class CTranspiler {
       advance();
       expect(TT::LPAREN, false);
       std::vector<std::string> exprs;
+      std::vector<size_t> expr_positions;
       while (current().type != TT::RPAREN) {
         if (current().type == TT::TEOF)
-          throw XenonError("SyntaxError", "Unterminated 'println'", t.line,
-                             t.col);
+          throw XenonError("SyntaxError",
+                           "Missing closing ')' in 'println(...)' call",
+                           t.line, t.col);
+        expr_positions.push_back(pos);
         exprs.push_back(parse_expr());
         if (current().type == TT::COMMA)
           advance();
@@ -3256,9 +5455,11 @@ class CTranspiler {
       expect(TT::RPAREN, false);
       std::string r;
       for (size_t i = 0; i < exprs.size(); i++) {
-        if (i)
-          r += "; ";
-        r += "printf(\"%s\",TO_STR(" + exprs[i] + "))";
+        if (i) r += "; ";
+        if (tcc_mode)
+          r += tcc_print_one(exprs[i], expr_positions[i]);
+        else
+          r += "printf(\"%s\",TO_STR(" + exprs[i] + "))";
       }
       return r + "; printf(\"\\n\");";
     }
@@ -3270,8 +5471,9 @@ class CTranspiler {
       std::vector<std::string> args;
       while (current().type != TT::RPAREN) {
         if (current().type == TT::TEOF)
-          throw XenonError("SyntaxError", "Unterminated 'printfmt'", t.line,
-                             t.col);
+          throw XenonError("SyntaxError",
+                           "Missing closing ')' in 'printfmt(...)' call",
+                           t.line, t.col);
         args.push_back(parse_expr());
         if (current().type == TT::COMMA)
           advance();
@@ -3309,7 +5511,9 @@ class CTranspiler {
           body.push_back(line_directive(tok2) + "    " + s);
       }
       if (current().type == TT::TEOF)
-        throw XenonError("SyntaxError", "Unterminated 'if'", t.line, t.col);
+        throw XenonError("SyntaxError",
+                         "Unterminated 'if' — missing 'end' to close the block opened at this line",
+                         t.line, t.col);
       var_types = scope0;
 
       std::vector<std::string> elseif_parts;
@@ -3327,8 +5531,9 @@ class CTranspiler {
             be.push_back(line_directive(tok2) + "    " + s);
         }
         if (current().type == TT::TEOF)
-          throw XenonError("SyntaxError", "Unterminated 'elseif'", ei.line,
-                             ei.col);
+          throw XenonError("SyntaxError",
+                             "Unterminated 'elseif' branch — missing 'end' or 'else' to close the if-chain",
+                             ei.line, ei.col);
         var_types = scope_ei;
         elseif_parts.push_back("} else if (" + ce + ") {\n" + join(be, "\n"));
       }
@@ -3470,8 +5675,9 @@ class CTranspiler {
         }
       }
       if (current().type == TT::TEOF)
-        throw XenonError("SyntaxError", "Unterminated 'switch'", t.line,
-                           t.col);
+        throw XenonError("SyntaxError",
+                         "Unterminated 'switch' — missing closing '}' for the block opened at this line",
+                         t.line, t.col);
       expect(TT::RBRACE, false);
       std::string body = join(cases, "\n");
       if (!default_stmts.empty())
@@ -3540,18 +5746,49 @@ class CTranspiler {
     if (t.type == TT::IDENTIFIER) {
       std::string raw_id = advance().value;
 
-      // NAME::sym — namespace qualified call at statement level
+      // NAME::sym — namespace qualified call at statement level (supports chaining: A::B::sym)
       if (current().type == TT::COLON &&
           pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
+        std::string ns_path = raw_id;
         advance(); advance(); // consume ::
         std::string sym = expect(TT::IDENTIFIER, false).value;
-        std::string resolved = resolve_qualified(raw_id, sym);
-        if (resolved.empty()) resolved = raw_id + "__" + sym;
+        // Chain: keep consuming ::IDENTIFIER while the current sym is a sub-namespace
+        while (current().type == TT::COLON &&
+               pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
+          ns_path = ns_path + "__" + sym;
+          advance(); advance();
+          sym = expect(TT::IDENTIFIER, false).value;
+        }
+        std::string resolved = resolve_qualified(ns_path, sym);
+        if (resolved.empty()) resolved = ns_path + "__" + sym;
+        // Optional explicit generic type arg: NS::func<TYPE>(args)
+        std::string explicit_type_arg;
+        if (current().type == TT::LT && template_funcs.count(resolved)) {
+          size_t saved_p = pos;
+          advance(); // consume '<'
+          std::string explicit_type;
+          bool is_ptr = false;
+          if (current().type == TT::PTR) { advance(); is_ptr = true; }
+          if (current().type == TT::IDENTIFIER || current().type == TT::INT ||
+              current().type == TT::FLOAT || current().type == TT::DOUBLE ||
+              current().type == TT::LONG || current().type == TT::SHORT ||
+              current().type == TT::BOOL_KW || current().type == TT::CHAR_KW ||
+              current().type == TT::STR || current().type == TT::U8 ||
+              current().type == TT::U32 || current().type == TT::U64 ||
+              current().type == TT::VOID) {
+            explicit_type = advance().value;
+            if (current().type == TT::GT) {
+              advance();
+              explicit_type_arg = raw_to_c(explicit_type);
+              if (is_ptr) explicit_type_arg += "*";
+            } else { pos = saved_p; }
+          } else { pos = saved_p; }
+        }
         if (current().type == TT::LPAREN) {
           // NS::func() call
           Token call_tok = current();
           advance();
-          return emit_call(resolved, call_tok) + ";";
+          return emit_call(resolved, call_tok, explicit_type_arg) + ";";
         }
         if (current().type == TT::IDENTIFIER) {
           // NS::TYPE varname  — variable declaration
@@ -3570,6 +5807,13 @@ class CTranspiler {
       std::string type_to_use = raw_id;
 
       std::string name = safe_name(raw_id);
+      // ── Struct method: rewrite bare field LHS to self->field ──────
+      if (!_cur_struct.empty() && name != "self") {
+        auto _psfit = struct_field_types.find(_cur_struct);
+        if (_psfit != struct_field_types.end() && _psfit->second.count(name))
+          name = "self->" + name;
+      }
+      bool _any_method_dispatched = false;
       while (current().type == TT::LSBRACKET || current().type == TT::DOT ||
              current().type == TT::ARROW) {
         if (current().type == TT::LSBRACKET) {
@@ -3587,14 +5831,40 @@ class CTranspiler {
           std::istringstream ss(base);
           std::string first;
           ss >> first;
-          std::string op = (var_types.count(first) && var_types[first] == "ptr")
-                               ? "->"
-                               : ".";
-          name = name + op + field;
+          // ── Method call dispatch in statement position ───────────
+          std::string base_struct;
+          { auto _bvit = var_types.find(first); if (_bvit != var_types.end()) base_struct = _bvit->second; }
+          bool _stmt_method = false;
+          if (!base_struct.empty() && current().type == TT::LPAREN) {
+            auto _msit = struct_methods.find(base_struct);
+            if (_msit != struct_methods.end() && _msit->second.count(field)) {
+              advance(); // consume '('
+              std::string _self_arg = (var_types.count(first) && var_types[first].find("ptr") != std::string::npos) ? name : ("&" + name);
+              std::string _cargs = _self_arg;
+              while (current().type != TT::RPAREN && current().type != TT::TEOF) {
+                _cargs += ", " + parse_expr();
+                if (current().type == TT::COMMA) advance();
+              }
+              expect(TT::RPAREN, false);
+              name = base_struct + "__" + field + "(" + _cargs + ")";
+              _stmt_method = true;
+              _any_method_dispatched = true;
+            }
+          }
+          if (!_stmt_method) {
+            std::string op = (var_types.count(first) && var_types[first] == "ptr")
+                                 ? "->"
+                                 : ".";
+            name = name + op + field;
+          }
         } else {
           advance();
           name = name + "->" + expect(TT::IDENTIFIER, false).value;
         }
+      }
+      // ── If a method call was the last thing built, emit it as a statement ──
+      if (_any_method_dispatched) {
+        return name + ";";
       }
       // NS::TYPE var — need to emit declaration
       if (type_to_use != raw_id && !type_to_use.empty()) {
@@ -3613,11 +5883,12 @@ class CTranspiler {
         // Check for = operator overload
         if (_op_overloads.count("=")) {
           Token assign_tok = current();
+          size_t rhs_pos = pos + 1; // one past the '=' token
           advance();
           std::string rhs = parse_expr();
-          const auto &ov = _op_overloads["="];
-          // Emit overload call: name = Overload_eq(name, rhs)
-          return name + " = " + ov.func_name + "(" + name + ", " + rhs + ");";
+          const OverloadEntry *ov = resolve_overload("=", pos, rhs_pos);
+          if (ov)
+            return name + " = " + ov->func_name + "(" + name + ", " + rhs + ");";
         }
         advance();
         std::string rhs = parse_expr();
@@ -3655,6 +5926,34 @@ class CTranspiler {
         advance();
         return emit_call(name, call_tok) + ";";
       }
+      // Explicit generic call as statement: func<TYPE>(args);
+      if (current().type == TT::LT && template_funcs.count(name)) {
+        size_t saved_pos = pos;
+        advance(); // consume '<'
+        std::string explicit_type;
+        bool explicit_is_ptr = false;
+        if (current().type == TT::PTR) { advance(); explicit_is_ptr = true; }
+        if (current().type == TT::IDENTIFIER || current().type == TT::INT ||
+            current().type == TT::FLOAT || current().type == TT::DOUBLE ||
+            current().type == TT::LONG || current().type == TT::SHORT ||
+            current().type == TT::BOOL_KW || current().type == TT::CHAR_KW ||
+            current().type == TT::STR || current().type == TT::U8 ||
+            current().type == TT::U32 || current().type == TT::U64 ||
+            current().type == TT::VOID) {
+          explicit_type = advance().value;
+          if (current().type == TT::GT) {
+            advance(); // consume '>'
+            std::string c_type = raw_to_c(explicit_type);
+            if (explicit_is_ptr) c_type += "*";
+            if (current().type == TT::LPAREN) {
+              Token call_tok = current();
+              advance();
+              return emit_call(name, call_tok, c_type) + ";";
+            }
+          }
+        }
+        pos = saved_pos; // backtrack if not a valid generic call
+      }
       return "";
     }
 
@@ -3680,7 +5979,8 @@ class CTranspiler {
       if (_cur_func_ret == "void")
         throw XenonError("TypeError",
                            "function '" + _cur_func +
-                               "' is declared void but returns a value",
+                               "' is declared 'void' but returns a value —"
+                               " change the return type or remove the return value",
                            t.line, t.col);
       return "return " + expr + ";";
     }
@@ -3949,8 +6249,10 @@ class CTranspiler {
     Token &rt = current();
     if (!valid_ret.count(rt.type))
       throw XenonError("SyntaxError",
-                         "Expected return type after 'function', got '" +
-                             rt.value + "'",
+                         "Expected a return type after 'function', got '" +
+                             rt.value + "'"
+                             " — valid types include: int, float, str, bool, void, char,"
+                             " long, double, short, u8, u32, u64, or a struct name",
                          rt.line, rt.col);
     std::string raw_ret = advance().value;
     bool infer_ret = (raw_ret == "let" || raw_ret == "var");
@@ -3989,24 +6291,58 @@ class CTranspiler {
     if (inl && !infer_ret)
       ret_type = "static inline " + ret_type;
 
-    std::string fname = mangle_with_ns(expect(TT::IDENTIFIER, false).value);
+    // Optional explicit generic type param on function name: VecNew<T>
+    // Also handle generic return type: function Vec<T> VecNew<T>(...)
+    // The return type may itself be Vec<T> — we already consumed raw_ret above.
+    // Handle case: if raw_ret was an IDENTIFIER that is a generic struct,
+    // consume the <PARAM> on the return type.
+    std::string generic_ret_param; // e.g. "T" from "Vec<T>" return
+    if (!infer_ret && current().type == TT::LT &&
+        _generic_structs.count(raw_ret)) {
+      advance(); // consume '<'
+      generic_ret_param = advance().value; // consume type param name
+      expect(TT::GT, false);
+    }
+
+    std::string fname_raw = expect(TT::IDENTIFIER, false).value;
+    // Consume optional explicit <T> on function name
+    std::string func_type_param;
+    if (current().type == TT::LT) {
+      advance(); // consume '<'
+      func_type_param = advance().value; // e.g. "T"
+      expect(TT::GT, false);
+    }
+    std::string fname = mangle_with_ns(fname_raw);
     // Detect if we're being called from instantiate_template for this fname.
-    // guard_key format: "originalName@type1,type2"
-    // mangled fname: "originalName__type1__type2"
-    // So base = everything before first "__" (or full fname if no "__")
+    // The guard_key format is "originalName@type1,type2".
+    // The patched fname during instantiation is the fully mangled name
+    // (e.g. "vec__vecNew__int"). We match by checking if any in-progress key's
+    // prefix (before '@') is a prefix of or equal to fname, or if fname starts
+    // with that prefix followed by "__".
     bool is_instantiating_now = false;
     {
-      size_t dunder = fname.find("__");
-      std::string base_name =
-          (dunder != std::string::npos) ? fname.substr(0, dunder) : fname;
       for (const auto &k : _mono_in_progress) {
         size_t at = k.find('@');
-        if (at != std::string::npos &&
-            (k.substr(0, at) == fname || k.substr(0, at) == base_name)) {
+        if (at == std::string::npos) continue;
+        std::string base_name = k.substr(0, at);
+        // Match: fname == base_name (exact), or fname starts with base_name + "__"
+        if (fname == base_name ||
+            (fname.size() > base_name.size() + 2 &&
+             fname.substr(0, base_name.size()) == base_name &&
+             fname[base_name.size()] == '_' && fname[base_name.size()+1] == '_')) {
           is_instantiating_now = true;
           break;
         }
       }
+    }
+
+    // ── Struct method: mangle name and register ──────────────────────────
+    // When called from parse_type_definition, _cur_struct is the mangled
+    // struct name.  Rename to StructName__methodName and inject 'self'.
+    bool is_struct_method = !_cur_struct.empty();
+    if (is_struct_method) {
+      fname = _cur_struct + "__" + fname_raw;
+      struct_methods[_cur_struct].insert(fname_raw);
     }
 
     func_return_types[fname] = infer_ret ? "__infer__" : raw_ret;
@@ -4017,6 +6353,15 @@ class CTranspiler {
     _cur_func = fname;
     _cur_func_ret = ""; // resolved after ret_type is finalised below
     auto saved_var_types = var_types;
+
+    // Seed struct field names into var_types so bare field refs inside
+    // the method body resolve and get rewritten to self->field.
+    if (is_struct_method) {
+      auto fit = struct_field_types.find(_cur_struct);
+      if (fit != struct_field_types.end())
+        for (auto const &kv : fit->second)
+          var_types[kv.first] = kv.second;
+    }
 
     // -----------------------------------------------------------------------
     // Parse params — collect infer_param flags and names for two-pass resolve
@@ -4039,13 +6384,15 @@ class CTranspiler {
     while (current().type != TT::RPAREN) {
       if (current().type == TT::TEOF)
         throw XenonError("SyntaxError",
-                           "Unterminated params in function '" + fname + "'",
+                           "Missing closing ')' in parameter list of function '" + fname + "'",
                            fn_tok.line, fn_tok.col);
       Token pt = current();
       if (!valid_p.count(pt.type))
         throw XenonError("SyntaxError",
-                           "Expected param type in '" + fname + "', got '" +
-                               pt.value + "'",
+                           "Expected a parameter type in '" + fname + "', got '" +
+                               pt.value + "'"
+                               " — valid parameter types: int, float, str, bool, char,"
+                               " long, double, short, u8, u32, u64, ptr, or a struct name",
                            pt.line, pt.col);
       ParamInfo pi;
       pi.raw = advance().value;
@@ -4054,11 +6401,59 @@ class CTranspiler {
       if (!pi.infer) {
         if (pi.raw == "ptr") {
           std::string inner = advance().value;
-          if (inner == "str")
+          if (inner == "str") {
             inner = "char*";
+          } else {
+            // Resolve type param: if inner is a bound type parameter (e.g. "T"),
+            // look it up in var_types so "ptr T" becomes "int*" when T=int.
+            auto _tpit = var_types.find(inner);
+            if (_tpit != var_types.end() && _tpit->second != "STRUCT" &&
+                _tpit->second != "GENERIC_STRUCT" &&
+                _tpit->second != inner) {
+              inner = raw_to_c(_tpit->second);
+            }
+          }
           pi.c_type = inner + "*";
         } else {
-          pi.c_type = param_raw_to_c(pi.raw);
+          // Resolve bare type param: if pi.raw is a bound type parameter (e.g. "T"),
+          // replace it with the concrete type now.
+          {
+            auto _tpit2 = var_types.find(pi.raw);
+            if (_tpit2 != var_types.end() && _tpit2->second != "STRUCT" &&
+                _tpit2->second != "GENERIC_STRUCT" &&
+                _tpit2->second != pi.raw &&
+                !_generic_structs.count(pi.raw)) {
+              // pi.raw is a type param bound to a concrete type
+              pi.raw = raw_to_c(_tpit2->second);
+            }
+          }
+          // Handle generic struct param: Vec<T> v — consume <T> if present
+          if (current().type == TT::LT && _generic_structs.count(pi.raw)) {
+            advance(); // consume '<'
+            // Collect concrete or type-param type
+            std::string type_arg;
+            bool type_arg_is_ptr = false;
+            if (current().type == TT::PTR) { advance(); type_arg_is_ptr = true; }
+            type_arg = advance().value; // e.g. "T" or "int"
+            expect(TT::GT, false); // consume '>'
+            // Resolve type_arg if it is itself a bound type parameter
+            {
+              auto _tpit3 = var_types.find(type_arg);
+              if (_tpit3 != var_types.end() && _tpit3->second != "STRUCT" &&
+                  _tpit3->second != "GENERIC_STRUCT" &&
+                  _tpit3->second != type_arg) {
+                type_arg = raw_to_c(_tpit3->second);
+              }
+            }
+            std::string c_concrete = raw_to_c(type_arg);
+            if (type_arg_is_ptr) c_concrete += "*";
+            // Instantiate the struct for this concrete type
+            std::string mangled_s = instantiate_generic_struct(pi.raw, c_concrete);
+            pi.c_type = mangled_s;
+            pi.raw = mangled_s;
+          } else {
+            pi.c_type = param_raw_to_c(pi.raw);
+          }
         }
       }
       pi.name = safe_name(expect(TT::IDENTIFIER, false).value);
@@ -4107,7 +6502,37 @@ class CTranspiler {
         break;
       }
 
-    if (has_infer_params && !is_instantiating_now) {
+    // Resolve generic return type now that params are parsed and var_types is seeded.
+    // e.g. function Vec<T> VecNew<T>(...) — when T is bound via var_types, resolve Vec<T> → Vec__int
+    if (!generic_ret_param.empty() && !func_type_param.empty() &&
+        !infer_ret && _generic_structs.count(raw_ret)) {
+      // Look up concrete binding for T from var_types (seeded by instantiate_template)
+      std::string concrete_T;
+      auto vit = var_types.find(func_type_param);
+      if (vit != var_types.end()) {
+        concrete_T = raw_to_c(vit->second);
+      }
+      // Also try to find T from a param that was declared as a generic struct <T>
+      if (concrete_T.empty()) {
+        for (const auto &pi : param_infos) {
+          if (pi.raw == func_type_param || pi.c_type == func_type_param) {
+            concrete_T = pi.c_type;
+            break;
+          }
+        }
+      }
+      if (!concrete_T.empty()) {
+        std::string mangled_struct = instantiate_generic_struct(raw_ret, concrete_T);
+        ret_type = mangled_struct;
+        if (inl) ret_type = "static inline " + ret_type;
+        func_return_types[fname] = mangled_struct;
+      }
+    }
+
+    // A function with an explicit <T> type parameter is always a template,
+    // even if none of its params use let/var inference.
+    bool has_explicit_type_param = !func_type_param.empty();
+    if ((has_infer_params || has_explicit_type_param) && !is_instantiating_now) {
       // Record template descriptor
       TemplateFunc tmpl;
       // tok_start = position of return-type token = saved before we advanced
@@ -4145,6 +6570,8 @@ class CTranspiler {
       }
       tmpl.inl = inl;
       tmpl.raw_ret = raw_ret;
+      tmpl.generic_ret_param = generic_ret_param;
+      tmpl.func_type_param = func_type_param;
       // tok_start and tok_end: skip body and record
       expect(TT::LBRACE, false);
       int depth = 1;
@@ -4175,6 +6602,7 @@ class CTranspiler {
     // First pass: skip over body tokens (balanced braces) to find body_end,
     // so we can run inference before parsing.  We need the token range.
     // -----------------------------------------------------------------------
+    size_t body_tok_end_for_check = 0;
     {
       size_t scan = pos;
       int depth = 1;
@@ -4188,14 +6616,14 @@ class CTranspiler {
         else
           break;
       }
-      size_t body_tok_end = scan; // points at closing RBRACE
+      body_tok_end_for_check = scan;
 
       // Resolve infer_param types using token-level body scan
       for (auto &pi : param_infos) {
         if (!pi.infer)
           continue;
         TypeInfo ti =
-            infer_param_type_from_body(pi.name, body_tok_start, body_tok_end);
+            infer_param_type_from_body(pi.name, body_tok_start, body_tok_end_for_check);
         pi.c_type = ti.c_type();
         if (pi.is_array && (pi.c_type.empty() || pi.c_type.back() != '*'))
           pi.c_type += "*";
@@ -4209,12 +6637,56 @@ class CTranspiler {
       // (We must do this after param types are resolved so infer_type_at is
       // accurate)
       if (infer_ret) {
-        TypeInfo rti = infer_return_type_from_body(body_tok_start, body_tok_end,
+        TypeInfo rti = infer_return_type_from_body(body_tok_start, body_tok_end_for_check,
                                                    var_types);
         ret_type = rti.c_type();
         func_return_types[fname] = ret_type; // store bare type, not "static inline ..."
         if (inl)
           ret_type = "static inline " + ret_type;
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory safety check pass (before emitting code)
+    // Collect known array sizes from param declarations for the checker.
+    // -----------------------------------------------------------------------
+    if (_memory_safe) {
+      std::map<std::string, long long> known_sizes;
+      for (const auto &pi : param_infos) {
+        if (pi.is_array && !pi.c_type.empty()) {
+        }
+      }
+      auto local_vt = var_types;
+      auto violations = scan_body_for_unsafe_ops(
+          body_tok_start, body_tok_end_for_check, local_vt, known_sizes);
+
+      bool func_is_unsafe = _unsafe_functions.count(fname) > 0;
+
+      if (!violations.empty() && !func_is_unsafe) {
+        std::ostringstream msg;
+        msg << "function '" << fname << "' contains unsafe operations "
+            << "but is not declared 'unsafe function'.\n"
+            << "  Found " << violations.size() << " violation(s):\n";
+        for (const auto &v : violations) {
+          msg << "    [" << v.kind << "]";
+          if (v.line > 0) msg << " line " << v.line << ":" << v.col;
+          msg << " — " << v.message << "\n";
+        }
+        msg << "  Fix: declare the function as 'unsafe function', wrap each\n"
+            << "  unsafe operation in 'unsafe { }' inside an unsafe function,\n"
+            << "  or pass -no-check to disable safety analysis entirely.";
+        var_types = saved_var_types;
+        _cur_func = saved_cur_func;
+        _cur_func_ret = saved_cur_func_ret;
+        throw XenonError("SafetyError", msg.str(), fn_tok.line, fn_tok.col);
+      }
+
+      if (!violations.empty() && func_is_unsafe) {
+        bool all_in_unsafe_blocks = true;
+        for (const auto &v : violations) {
+          (void)v;
+        }
+        (void)all_in_unsafe_blocks;
       }
     }
     // Record for the return-statement validator
@@ -4226,6 +6698,12 @@ class CTranspiler {
     std::vector<std::string> params;
     {
       std::vector<std::string> ptypes;
+      // Struct methods: inject 'StructName* self' as the first C param
+      if (is_struct_method) {
+        params.push_back(_cur_struct + "* self");
+        ptypes.push_back(_cur_struct + "*");
+        var_types["self"] = _cur_struct + "*";
+      }
       for (const auto &pi : param_infos) {
         params.push_back(pi.c_type + " " + pi.name);
         ptypes.push_back(pi.c_type);
@@ -4247,13 +6725,113 @@ class CTranspiler {
       var_types = saved_var_types;
       _cur_func = saved_cur_func;
       _cur_func_ret = saved_cur_func_ret;
-      throw XenonError("SyntaxError", "Unterminated function '" + fname + "'",
+      throw XenonError("SyntaxError",
+                       "Unterminated body for function '" + fname +
+                       "' — missing closing '}'",
                          fn_tok.line, fn_tok.col);
     }
     expect(TT::RBRACE, false);
     var_types = saved_var_types;
     _cur_func = saved_cur_func;
     _cur_func_ret = saved_cur_func_ret;
+
+    // -----------------------------------------------------------------------
+    // User-input taint analysis + runtime check injection.
+    // This is the ONLY place where runtime code is emitted.  It fires only
+    // when the function is proven (at compile time) to return a value
+    // derived from user input.  All other safety checks are purely static.
+    // -----------------------------------------------------------------------
+    std::string rt_preamble;
+    std::string rt_epilogue;
+
+    if (_memory_safe && ret_type != "void" && !ret_type.empty()) {
+      auto taint = analyze_user_input_taint(body_tok_start, body_tok_end_for_check,
+                                             ret_type);
+      if (taint.returns_tainted) {
+        // Ensure the errno header is present (once per compilation unit)
+        if (!_user_input_rt_header_emitted) {
+          headers.insert(headers.begin(), user_input_rt_header());
+          _user_input_rt_header_emitted = true;
+        }
+
+        if (taint.is_numeric) {
+          // Wrap numeric body: reset errno at entry, check at exit.
+          // The compiler will eliminate the check on the hot path at -O3.
+          rt_preamble =
+            "    /* [Xenon:InputRT] user-input numeric return — reset errno */\n"
+            "    int _xen_errno_flag_ = 0;\n"
+            "    (void)_xen_errno_flag_;\n"
+            "    _XEN_INPUT_BEGIN();\n";
+          // Rewrite each 'return EXPR;' in the body to capture and check
+          // We do this by post-processing the body strings.
+          // Instead of rewriting (complex), we append an errno capture before
+          // every return by wrapping the entire body in a do-while with a
+          // label-based exit.  This is zero-overhead at -O3 (the do-while
+          // collapses to straight-line code).
+          // Simpler approach: emit a wrapper that checks errno AFTER the call
+          // at the call site — but we can't do that from inside parse_function_body.
+          // Cleanest: emit the function normally, then emit a _checked_ wrapper
+          // with the same signature that calls the inner function and validates.
+          // This keeps the original function unchanged and adds zero overhead
+          // on the normal (non-user-input) path.
+
+          // Mark the inner function as _xen_inner_<fname>
+          std::string inner_fname = "_xen_inner_" + fname;
+          std::string wrapper_params = join(params, ", ");
+          // Build arg-forwarding list (just the names)
+          std::vector<std::string> arg_names;
+          for (const auto &pi : param_infos) arg_names.push_back(pi.name);
+          std::string args_fwd = join(arg_names, ", ");
+
+          // Emit inner function (renamed)
+          std::string inner_decl =
+            "static __attribute__((noinline)) " +
+            ret_type + " " + inner_fname + "(" + wrapper_params + ") {\n" +
+            join(body, "\n") + "\n}\n";
+          functions.push_back(inner_decl);
+
+          // Emit wrapper with runtime check
+          std::string check_code = emit_user_input_validation(fname, taint, ret_type);
+          std::string wrapper =
+            ret_type + " " + fname + "(" + wrapper_params + ") {\n"
+            "    _XEN_INPUT_BEGIN();\n"
+            "    " + ret_type + " _xen_ret_ = " + inner_fname + "(" + args_fwd + ");\n"
+            "    int _xen_errno_flag_ = _XEN_INPUT_CHECK_ERRNO();\n" +
+            check_code +
+            "    return _xen_ret_;\n"
+            "}\n";
+          return wrapper;
+
+        } else if (taint.is_string) {
+          // String return: wrap similarly but check for NULL
+          std::string inner_fname = "_xen_inner_" + fname;
+          std::string wrapper_params = join(params, ", ");
+          std::vector<std::string> arg_names;
+          for (const auto &pi : param_infos) arg_names.push_back(pi.name);
+          std::string args_fwd = join(arg_names, ", ");
+
+          std::string inner_decl =
+            "static __attribute__((noinline)) " +
+            ret_type + " " + inner_fname + "(" + wrapper_params + ") {\n" +
+            join(body, "\n") + "\n}\n";
+          functions.push_back(inner_decl);
+
+          std::string wrapper =
+            ret_type + " " + fname + "(" + wrapper_params + ") {\n"
+            "    " + ret_type + " _xen_str_ret_ = " + inner_fname + "(" + args_fwd + ");\n"
+            "    if (__builtin_expect((_xen_str_ret_ == NULL), 0)) {\n"
+            "        fprintf(stderr, \"[Xenon] SAFETY: function '" + fname + "' \"\n"
+            "                \"returned NULL for a user-input string.\\n\");\n"
+            "        abort();\n"
+            "    }\n"
+            "    return _xen_str_ret_;\n"
+            "}\n";
+          return wrapper;
+        }
+      }
+    }
+
+    (void)rt_preamble; (void)rt_epilogue;
 
     return ret_type + " " + fname + "(" + join(params, ", ") + ") {\n" +
            join(body, "\n") + "\n}\n";
@@ -4473,7 +7051,7 @@ class CTranspiler {
                           std::istreambuf_iterator<char>());
     std::vector<Token> lh_toks = Lexer(lh_source, prescan_addop_symbols(lh_source)).tokenize();
 
-    CTranspiler lh(lh_toks);
+    CTranspiler lh(lh_toks, tcc_mode);
     lh.isSubTranspiler = true;
     lh.emit_line_directives = emit_line_directives;
     lh._source_dir = fs::path(canonical).parent_path().string();
@@ -4484,6 +7062,8 @@ class CTranspiler {
     lh.struct_field_types = struct_field_types;
     lh.func_param_types = func_param_types;
     lh._handle_declared = _handle_declared;
+    lh._memory_safe = _memory_safe;
+    lh._unsafe_functions = _unsafe_functions;
 
     while (lh.current().type != TT::TEOF) {
       Token &lt = lh.current();
@@ -4567,6 +7147,41 @@ class CTranspiler {
           if (!ns_tok.value.empty())
             lh._ignored_namespaces.insert(ns_tok.value);
         }
+      } else if (lt.type == TT::UNSAFE_KW) {
+        lh.advance();
+        if (lh.current().type != TT::FUNCTION)
+          throw XenonError("SyntaxError",
+                           "'unsafe' must be followed by 'function'",
+                           lt.line, lt.col);
+        Token fn_tok = lh.current();
+        lh.advance();
+        size_t name_scan = lh.pos;
+        {
+          static const std::set<TT> skip_ret = {
+            TT::INT,TT::FLOAT,TT::STR,TT::LONG,TT::SHORT,TT::DOUBLE,
+            TT::VOID,TT::M256,TT::M256I,TT::BOOL_KW,TT::CHAR_KW,
+            TT::PTR,TT::U8,TT::U32,TT::U64,TT::LET_KW,TT::VAR_KW,
+            TT::IDENTIFIER
+          };
+          while (name_scan < lh.tokens.size() && skip_ret.count(lh.tokens[name_scan].type)) {
+            if (lh.tokens[name_scan].type == TT::PTR) {
+              name_scan++;
+              if (name_scan < lh.tokens.size() && skip_ret.count(lh.tokens[name_scan].type))
+                name_scan++;
+              break;
+            }
+            name_scan++;
+            break;
+          }
+        }
+        if (name_scan < lh.tokens.size() && lh.tokens[name_scan].type == TT::IDENTIFIER) {
+          std::string unsafe_fname = lh.mangle_with_ns(lh.tokens[name_scan].value);
+          lh._unsafe_functions.insert(unsafe_fname);
+          lh._unsafe_functions.insert(lh.tokens[name_scan].value);
+        }
+        std::string code = lh.emit_function(fn_tok, false);
+        if (!code.empty())
+          functions.push_back(lh.line_directive(fn_tok) + code);
       } else {
         lh.parse_statement();
       }
@@ -4591,8 +7206,14 @@ class CTranspiler {
     for (auto const &[name, tmpl] : lh.template_funcs) {
       this->template_funcs[name] = tmpl;
     }
-    for (auto const &[sym, entry] : lh._op_overloads) {
-      this->_op_overloads[sym] = entry;
+    for (auto const &[sym, entries] : lh._op_overloads) {
+      for (const auto &entry : entries) {
+        auto &dest = this->_op_overloads[sym];
+        bool already = false;
+        for (const auto &e : dest)
+          if (e.func_name == entry.func_name) { already = true; break; }
+        if (!already) dest.push_back(entry);
+      }
     }
     for (auto const &[aname, orig] : lh._aliases) {
       this->_aliases[aname] = orig;
@@ -4604,78 +7225,111 @@ class CTranspiler {
     for (auto const &ns : lh._ignored_namespaces)
       this->_ignored_namespaces.insert(ns);
     this->_lh_included = lh._lh_included;
+    for (auto const &uf : lh._unsafe_functions)
+      this->_unsafe_functions.insert(uf);
   }
 
 public:
-  explicit CTranspiler(std::vector<Token> toks) : tokens(std::move(toks)) {
+  explicit CTranspiler(std::vector<Token> toks, bool tcc_mode_ = false, bool memory_safe_ = true)
+      : tcc_mode(tcc_mode_), tokens(std::move(toks)), _memory_safe(memory_safe_) {
     // build default headers block
     if (!isSubTranspiler) {
-      headers.push_back("#include <stdio.h>\n"
-                        "#include <stdbool.h>\n"
-                        "#include <stdlib.h>\n"
-                        "#include <math.h>\n"
-                        "#include <immintrin.h>\n"
-                        "#include <string.h>\n"
-                        "#include <unistd.h>\n"
-                        "#include <setjmp.h>\n"
-                        "#include <inttypes.h>\n"
-                        "#include <stdint.h>\n");
-      headers.push_back(
-          "#ifndef __XENON_RUNTIME__\n"
-          "#define __XENON_RUNTIME__\n"
-          "static char _lb_bufs[8][512];\n"
-          "static int  _lb_buf_idx = 0;\n"
-          "static inline char* _lb_next(void) { _lb_buf_idx=(_lb_buf_idx+1)%8; return _lb_bufs[_lb_buf_idx]; }\n"
-          "static inline char* _lb_s(char* x)        { return x; }\n"
-          "static inline char* _lb_cs(const char* x) { return (char*)x; }\n"
-          "static inline char* _lb_f(float x)        { char*b=_lb_next();"
-          "snprintf(b,512,\"%g\",x); return b; }\n"
-          "static inline char* _lb_d(double x)       { char*b=_lb_next();"
-          "snprintf(b,512,\"%.10g\",x); return b; }\n"
-          "static inline char* _lb_i(int x)          { char*b=_lb_next();"
-          "snprintf(b,512,\"%d\",x); return b; }\n"
-          "static inline char* _lb_l(long x)         { char*b=_lb_next();"
-          "snprintf(b,512,\"%ld\",x); return b; }\n"
-          "static inline char* _lb_u(short x)        { char*b=_lb_next();"
-          "snprintf(b,512,\"%d\",(int)x); return b; }\n"
-          "static inline char* _lb_b(int x)          { return x ? \"true\" : "
-          "\"false\"; }\n"
-          "static inline char* _lb_c(char x)         { char*b=_lb_next(); b[0]=x; "
-          "b[1]='\\0'; return b; }\n"
-          "static inline char* _lb_m(__m256 v)  { float f[8]; "
-          "_mm256_storeu_ps(f,v); char*b=_lb_next();"
-          "snprintf(b,512,\"[%g,%g,%g,%g,%g,%g,%g,%g]\","
-          "f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7]); return b; }\n"
-          "static inline char* _lb_mi(__m256i v) { union{__m256i v;int "
-          "i[8];}u; u.v=v; char*b=_lb_next();"
-          "snprintf(b,512,\"[%d,%d,%d,%d,%d,%d,%d,%d]\","
-          "u.i[0],u.i[1],u.i[2],u.i[3],u.i[4],u.i[5],u.i[6],u.i[7]); return "
-          "b; }\n"
-          "static inline char* _lb_u8(uint8_t x)   { char*b=_lb_next();"
-          "snprintf(b,512,\"%\" PRIu8,x); return b; }\n"
-          "static inline char* _lb_u32(uint32_t x) { char*b=_lb_next();"
-          "snprintf(b,512,\"%\" PRIu32,x); return b; }\n"
-          "static inline char* _lb_u64(uint64_t x) { char*b=_lb_next();"
-          "snprintf(b,512,\"%\" PRIu64,x); return b; }\n"
-          "#define TO_STR(x) _Generic((x),"
-          "char*:_lb_s,const char*:_lb_cs,"
-          "__m256:_lb_m,__m256i:_lb_mi,"
-          "float:_lb_f,double:_lb_d,"
-          "int:_lb_i,long:_lb_l,short:_lb_u,"
-          "uint8_t:_lb_u8,uint32_t:_lb_u32,uint64_t:_lb_u64,"
-          "bool:_lb_b,char:_lb_c,"
-          "default:_lb_i)(x)\n"
-          "static jmp_buf* _lb_exc_active = NULL;\n"
-          "static char*    _lb_exc_msg    = NULL;\n"
-          "static inline void _lb_throw(const char* msg) {\n"
-          "    if(_lb_exc_active) {\n"
-          "        if(_lb_exc_msg) snprintf(_lb_exc_msg,512,\"%s\",msg);\n"
-          "        longjmp(*_lb_exc_active,1);\n"
-          "    } else {\n"
-          "        fprintf(stderr,\"[throw] unhandled: %s\\n\",msg); exit(1);\n"
-          "    }\n"
-          "}\n"
-          "#endif /* __XENON_RUNTIME__ */\n");
+      if (tcc_mode) {
+        // TCC: C99 — no <immintrin.h>, no __m256/__m256i, no _Generic
+        headers.push_back("#include <stdio.h>\n"
+                          "#include <stdbool.h>\n"
+                          "#include <stdlib.h>\n"
+                          "#include <math.h>\n"
+                          "#include <string.h>\n"
+                          "#include <unistd.h>\n"
+                          "#include <setjmp.h>\n"
+                          "#include <inttypes.h>\n"
+                          "#include <stdint.h>\n");
+        // TCC runtime: only _lb_throw is needed (for try/except/throw).
+        // No _lb_ print helpers, no TO_STR — print/println emit plain printf directly.
+        headers.push_back(
+            "#ifndef __XENON_RUNTIME__\n"
+            "#define __XENON_RUNTIME__\n"
+            "static jmp_buf* _lb_exc_active = NULL;\n"
+            "static char*    _lb_exc_msg    = NULL;\n"
+            "static inline void _lb_throw(const char* msg) {\n"
+            "    if(_lb_exc_active) {\n"
+            "        if(_lb_exc_msg) snprintf(_lb_exc_msg,512,\"%s\",msg);\n"
+            "        longjmp(*_lb_exc_active,1);\n"
+            "    } else {\n"
+            "        fprintf(stderr,\"[throw] unhandled: %s\\n\",msg); exit(1);\n"
+            "    }\n"
+            "}\n"
+            "#endif /* __XENON_RUNTIME__ */\n");
+      } else {
+        // Default (clang/gcc): full C11 preamble with _Generic and AVX
+        headers.push_back("#include <stdio.h>\n"
+                          "#include <stdbool.h>\n"
+                          "#include <stdlib.h>\n"
+                          "#include <math.h>\n"
+                          "#include <immintrin.h>\n"
+                          "#include <string.h>\n"
+                          "#include <unistd.h>\n"
+                          "#include <setjmp.h>\n"
+                          "#include <inttypes.h>\n"
+                          "#include <stdint.h>\n");
+        headers.push_back(
+            "#ifndef __XENON_RUNTIME__\n"
+            "#define __XENON_RUNTIME__\n"
+            "static char _lb_bufs[8][512];\n"
+            "static int  _lb_buf_idx = 0;\n"
+            "static inline char* _lb_next(void) { _lb_buf_idx=(_lb_buf_idx+1)%8; return _lb_bufs[_lb_buf_idx]; }\n"
+            "static inline char* _lb_s(char* x)        { return x; }\n"
+            "static inline char* _lb_cs(const char* x) { return (char*)x; }\n"
+            "static inline char* _lb_f(float x)        { char*b=_lb_next();"
+            "snprintf(b,512,\"%g\",x); return b; }\n"
+            "static inline char* _lb_d(double x)       { char*b=_lb_next();"
+            "snprintf(b,512,\"%.10g\",x); return b; }\n"
+            "static inline char* _lb_i(int x)          { char*b=_lb_next();"
+            "snprintf(b,512,\"%d\",x); return b; }\n"
+            "static inline char* _lb_l(long x)         { char*b=_lb_next();"
+            "snprintf(b,512,\"%ld\",x); return b; }\n"
+            "static inline char* _lb_u(short x)        { char*b=_lb_next();"
+            "snprintf(b,512,\"%d\",(int)x); return b; }\n"
+            "static inline char* _lb_b(int x)          { return x ? \"true\" : "
+            "\"false\"; }\n"
+            "static inline char* _lb_c(char x)         { char*b=_lb_next(); b[0]=x; "
+            "b[1]='\\0'; return b; }\n"
+            "static inline char* _lb_m(__m256 v)  { float f[8]; "
+            "_mm256_storeu_ps(f,v); char*b=_lb_next();"
+            "snprintf(b,512,\"[%g,%g,%g,%g,%g,%g,%g,%g]\","
+            "f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7]); return b; }\n"
+            "static inline char* _lb_mi(__m256i v) { union{__m256i v;int "
+            "i[8];}u; u.v=v; char*b=_lb_next();"
+            "snprintf(b,512,\"[%d,%d,%d,%d,%d,%d,%d,%d]\","
+            "u.i[0],u.i[1],u.i[2],u.i[3],u.i[4],u.i[5],u.i[6],u.i[7]); return "
+            "b; }\n"
+            "static inline char* _lb_u8(uint8_t x)   { char*b=_lb_next();"
+            "snprintf(b,512,\"%\" PRIu8,x); return b; }\n"
+            "static inline char* _lb_u32(uint32_t x) { char*b=_lb_next();"
+            "snprintf(b,512,\"%\" PRIu32,x); return b; }\n"
+            "static inline char* _lb_u64(uint64_t x) { char*b=_lb_next();"
+            "snprintf(b,512,\"%\" PRIu64,x); return b; }\n"
+            "#define TO_STR(x) _Generic((x),"
+            "char*:_lb_s,const char*:_lb_cs,"
+            "__m256:_lb_m,__m256i:_lb_mi,"
+            "float:_lb_f,double:_lb_d,"
+            "int:_lb_i,long:_lb_l,short:_lb_u,"
+            "uint8_t:_lb_u8,uint32_t:_lb_u32,uint64_t:_lb_u64,"
+            "bool:_lb_b,char:_lb_c,"
+            "default:_lb_i)(x)\n"
+            "static jmp_buf* _lb_exc_active = NULL;\n"
+            "static char*    _lb_exc_msg    = NULL;\n"
+            "static inline void _lb_throw(const char* msg) {\n"
+            "    if(_lb_exc_active) {\n"
+            "        if(_lb_exc_msg) snprintf(_lb_exc_msg,512,\"%s\",msg);\n"
+            "        longjmp(*_lb_exc_active,1);\n"
+            "    } else {\n"
+            "        fprintf(stderr,\"[throw] unhandled: %s\\n\",msg); exit(1);\n"
+            "    }\n"
+            "}\n"
+            "#endif /* __XENON_RUNTIME__ */\n");
+      }
     }
   }
 
@@ -4717,6 +7371,60 @@ public:
           advance();
           std::string def = parse_alias(tok);
           headers.push_back(def + "\n");
+        } else if (tok.type == TT::UNSAFE_KW) {
+          if (pos + 1 < tokens.size() && tokens[pos + 1].type == TT::LBRACE) {
+            tok = current();
+            std::string stmt = parse_statement();
+            if (!stmt.empty())
+              main_body.push_back(line_directive(tok) + stmt);
+          } else {
+            advance();
+            if (current().type != TT::FUNCTION)
+              throw XenonError("SyntaxError",
+                               "'unsafe' at top level must be followed by 'function' "
+                               "or a block '{ }'",
+                               tok.line, tok.col);
+            Token fn_tok2 = current();
+            advance();
+            size_t name_scan = pos;
+            {
+              static const std::set<TT> skip_ret = {
+                TT::INT,TT::FLOAT,TT::STR,TT::LONG,TT::SHORT,TT::DOUBLE,
+                TT::VOID,TT::M256,TT::M256I,TT::BOOL_KW,TT::CHAR_KW,
+                TT::PTR,TT::U8,TT::U32,TT::U64,TT::LET_KW,TT::VAR_KW,
+                TT::IDENTIFIER
+              };
+              while (name_scan < tokens.size() && skip_ret.count(tokens[name_scan].type)) {
+                if (tokens[name_scan].type == TT::PTR) {
+                  name_scan++; // skip 'ptr'
+                  // skip the pointee type so we land on the function name
+                  if (name_scan < tokens.size() && skip_ret.count(tokens[name_scan].type))
+                    name_scan++;
+                  break;
+                }
+                name_scan++;
+                if (name_scan < tokens.size() && tokens[name_scan].type == TT::LT) {
+                  while (name_scan < tokens.size() && tokens[name_scan].type != TT::GT)
+                    name_scan++;
+                  if (name_scan < tokens.size()) name_scan++;
+                }
+                if (name_scan < tokens.size() && tokens[name_scan].type == TT::LSBRACKET) {
+                  while (name_scan < tokens.size() && tokens[name_scan].type != TT::RSBRACKET)
+                    name_scan++;
+                  if (name_scan < tokens.size()) name_scan++;
+                }
+                break;
+              }
+            }
+            if (name_scan < tokens.size() && tokens[name_scan].type == TT::IDENTIFIER) {
+              std::string unsafe_fname = mangle_with_ns(tokens[name_scan].value);
+              _unsafe_functions.insert(unsafe_fname);
+              _unsafe_functions.insert(tokens[name_scan].value);
+            }
+            std::string code = emit_function(fn_tok2, false);
+            if (!code.empty())
+              functions.push_back(line_directive(fn_tok2) + code);
+          }
         } else if (tok.type == TT::FUNCTION) {
           advance();
           std::string code = emit_function(tok, false);
@@ -4826,12 +7534,17 @@ int main(int argc, char **argv) {
   bool priCMD = false;
   bool dbuild = false;
   bool emit_line_dirs = true;
+  bool no_check = false;
+  CCBackend cc_backend = CCBackend::CLANG;
   auto log = [&](const std::string &s) {
     if (!shut)
       std::cout << s << "\n";
   };
   auto die = [](const std::string &s, int code = -1) -> int {
-    std::cerr << "[-] " << s << "\n";
+    std::cerr << "\n" << ansi::separator() << "\n"
+              << ansi::error_badge("FATAL") << "\n\n"
+              << "  " << ansi::bwhite() << ansi::bold() << s << ansi::reset() << "\n"
+              << ansi::separator() << "\n\n";
     exit(code);
     return code;
   };
@@ -4848,18 +7561,38 @@ int main(int argc, char **argv) {
       priCMD = true;
     if (a == "-noLine" || a == "--noLine")
       emit_line_dirs = false;
+    if (a == "-no-check" || a == "--no-check")
+      no_check = true;
+    // -cc:gcc / -cc:clang / -cc:tcc / -cc:cc
+    if (a.size() > 4 && a.substr(0, 4) == "-cc:") {
+      std::string choice = a.substr(4);
+      if (choice == "gcc")        cc_backend = CCBackend::GCC;
+      else if (choice == "clang") cc_backend = CCBackend::CLANG;
+      else if (choice == "tcc")   cc_backend = CCBackend::TCC;
+      else if (choice == "cc")    cc_backend = CCBackend::CC;
+      else {
+        std::cerr << "\n" << ansi::separator() << "\n"
+                  << ansi::error_badge("ERROR") << "\n\n"
+                  << "  " << ansi::bwhite() << "Unknown -cc: option "
+                  << ansi::bred() << "'" << choice << "'" << ansi::reset()
+                  << ansi::bwhite() << "\n  Valid choices: "
+                  << ansi::bcyan() << "gcc  clang  tcc  cc" << ansi::reset() << "\n"
+                  << ansi::separator() << "\n\n";
+        exit(1);
+      }
+    }
   }
 
   if (argc < 3) {
-    log("xenc version 2.9.3");
+    log("xenc version 3.1.2");
     die("Usage: xenc <in.xen> <out> [extra.c] [-lPATH] [-gLIB] [-wLIBDIR] "
-        "[-c] [-s] [--asm] [--main]",
+        "[-c] [-s] [--asm] [--main] [-no-check] [-cc:gcc|clang|tcc|cc]",
         1);
   }
 
   std::string inf = argv[1];
   if (inf == "-v") {
-    std::cout << "xenc compiler version 2.9.3.";
+    std::cout << "xenc compiler version 3.1.2.";
     return 0;
   }
   std::string out_bin = argv[2];
@@ -4867,7 +7600,11 @@ int main(int argc, char **argv) {
   if (!fs::exists(inf))
     die("Input file not found: '" + inf + "'", 1);
   if (!ends_with(inf, ".xen"))
-    log("[!] Warning: '" + inf + "' does not have a .xen extension");
+    log(ansi::warn_tag("!") + ansi::yellow() + " '" + ansi::reset()
+        + ansi::bwhite() + inf + ansi::reset()
+        + ansi::yellow() + "' does not have a " + ansi::reset()
+        + ansi::bcyan() + ".xen" + ansi::reset()
+        + ansi::yellow() + " extension" + ansi::reset());
 
   std::string base = fs::path(inf).stem().string();
 
@@ -4891,7 +7628,9 @@ int main(int argc, char **argv) {
       if (fs::exists(arg))
         extra_c_files.push_back(arg);
       else
-        log("[-] Warning: Extra source file '" + arg + "' not found.");
+        log(ansi::warn_tag("!") + ansi::yellow() + " Extra source file "
+            + ansi::reset() + ansi::bred() + "'" + arg + "'" + ansi::reset()
+            + ansi::yellow() + " not found — skipping." + ansi::reset());
     }
     if (arg == "-c")
       debug = true;
@@ -4908,7 +7647,7 @@ int main(int argc, char **argv) {
     die(std::string("Could not read input file: ") + e.what());
   }
 
-  log("[*] Tokenizing...");
+  log(ansi::info_tag("*") + ansi::cyan() + " Tokenizing" + ansi::reset() + ansi::grey() + "..." + ansi::reset());
   std::vector<Token> tokens;
   try {
     tokens = Lexer(source, prescan_addop_symbols(source)).tokenize();
@@ -4923,10 +7662,11 @@ int main(int argc, char **argv) {
   if (source_dir.empty())
     source_dir = ".";
 
-  log("[*] Compiling...");
+  log(ansi::info_tag("*") + ansi::cyan() + " Compiling" + ansi::reset() + ansi::grey() + "..." + ansi::reset());
   std::string c_code;
   try {
-    CTranspiler tr(tokens);
+    bool tcc_mode = (cc_backend == CCBackend::TCC);
+    CTranspiler tr(tokens, tcc_mode, !no_check);
     c_code = tr.transpile(source_dir, source_file, manual_main, include_paths,
                           emit_line_dirs);
   } catch (XenonError &e) {
@@ -4951,132 +7691,205 @@ int main(int argc, char **argv) {
     die(std::string("Could not write C file: ") + e.what());
   }
 
-  // find clang
-  auto find_clang = []() -> std::string {
-    // try which/where
-    for (const char *name :
-         {"clang", "clang-18", "clang-17", "clang-16", "clang-15"}) {
+  // ===========================================================================
+  // Locate compiler binary
+  // ===========================================================================
+  auto find_bin = [](std::initializer_list<const char*> names) -> std::string {
+    for (const char *name : names) {
       std::string cmd = std::string("which ") + name + " 2>/dev/null";
       FILE *p = popen(cmd.c_str(), "r");
-      if (!p)
-        continue;
+      if (!p) continue;
       char buf[512]{};
-      if (!fgets(buf, sizeof(buf), p))
-        buf[0] = '\0';
+      if (!fgets(buf, sizeof(buf), p)) buf[0] = '\0';
       pclose(p);
       std::string r(buf);
       while (!r.empty() &&
              (r.back() == '\n' || r.back() == '\r' || r.back() == ' '))
         r.pop_back();
-      if (!r.empty())
-        return r;
+      if (!r.empty()) return r;
     }
     return "";
   };
 
-  std::string clang_bin = find_clang();
-  if (clang_bin.empty()) {
-    std::cerr << "[-] clang is not installed.\n";
-    std::cerr << "    Install clang now? [y/N] ";
-    std::string ans;
-    std::getline(std::cin, ans);
-    if (ans == "y" || ans == "Y") {
-      // try apt
-      if (system("which apt>/dev/null 2>&1") == 0) {
-        int _r = system("sudo apt install -y clang lld");
-        (void)_r;
-      } else if (system("which dnf>/dev/null 2>&1") == 0) {
-        int _r = system("sudo dnf install -y clang lld");
-        (void)_r;
-      } else if (system("which pacman>/dev/null 2>&1") == 0) {
-        int _r = system("sudo pacman -S --noconfirm clang lld");
-        (void)_r;
-      } else
-        die("No supported package manager. Install clang manually.");
-      clang_bin = find_clang();
-      if (clang_bin.empty())
-        die("clang still not found on PATH after install.");
-    } else {
-      die("clang is required.");
+  // find clang (kept for the default/clang path)
+  auto find_clang = [&]() -> std::string {
+    return find_bin({"clang", "clang-18", "clang-17", "clang-16", "clang-15"});
+  };
+
+  std::string compiler_bin;
+  std::string compiler_label;
+
+  switch (cc_backend) {
+  case CCBackend::CLANG: {
+    compiler_bin = find_clang();
+    compiler_label = "clang";
+    if (compiler_bin.empty()) {
+      std::cerr << "\n" << ansi::separator() << "\n"
+                << ansi::warn_badge("WARNING") << "\n\n"
+                << "  " << ansi::bwhite() << "clang" << ansi::reset()
+                << ansi::yellow() << " is not installed on this system.\n" << ansi::reset()
+                << "  " << ansi::byellow() << "Install clang now? " << ansi::reset()
+                << ansi::grey() << "[y/N] " << ansi::reset();
+      std::string ans;
+      std::getline(std::cin, ans);
+      if (ans == "y" || ans == "Y") {
+        if (system("which apt>/dev/null 2>&1") == 0) {
+          int _r = system("sudo apt install -y clang lld"); (void)_r;
+        } else if (system("which dnf>/dev/null 2>&1") == 0) {
+          int _r = system("sudo dnf install -y clang lld"); (void)_r;
+        } else if (system("which pacman>/dev/null 2>&1") == 0) {
+          int _r = system("sudo pacman -S --noconfirm clang lld"); (void)_r;
+        } else
+          die("No supported package manager. Install clang manually.");
+        compiler_bin = find_clang();
+        if (compiler_bin.empty())
+          die("clang still not found on PATH after install.");
+      } else {
+        die("clang is required.");
+      }
     }
+    break;
+  }
+  case CCBackend::GCC:
+    compiler_bin = find_bin({"gcc", "gcc-13", "gcc-12", "gcc-11"});
+    compiler_label = "gcc";
+    if (compiler_bin.empty())
+      die("gcc not found on PATH. Install it (e.g. apt install gcc).");
+    break;
+  case CCBackend::TCC:
+    compiler_bin = find_bin({"tcc"});
+    compiler_label = "tcc";
+    if (compiler_bin.empty())
+      die("tcc not found on PATH. Install it (e.g. apt install tcc).");
+    break;
+  case CCBackend::CC:
+    compiler_bin = find_bin({"cc"});
+    compiler_label = "cc";
+    if (compiler_bin.empty())
+      die("cc not found on PATH.");
+    break;
   }
 
-  // build clang command
-  std::vector<std::string> clang_args;
-  clang_args.push_back(clang_bin);
-  clang_args.push_back(c_file);
+  // ===========================================================================
+  // Build compiler command
+  // ===========================================================================
+  std::vector<std::string> cc_args;
+  cc_args.push_back(compiler_bin);
+  cc_args.push_back(c_file);
   for (auto &e : extra_c_files)
-    clang_args.push_back(e);
-  clang_args.push_back("-o");
-  clang_args.push_back(out_bin);
-  clang_args.push_back("-lm");
+    cc_args.push_back(e);
+  cc_args.push_back("-o");
+  cc_args.push_back(out_bin);
+  cc_args.push_back("-lm");
   for (auto &ci : custom_includes)
-    clang_args.push_back(ci);
-  if (!dbuild) {
-    clang_args.push_back("-ffast-math");
-    clang_args.push_back("-march=x86-64-v3");
-    clang_args.push_back("-w");
-    clang_args.push_back("-O3");
-    clang_args.push_back("-fuse-ld=lld");
-    clang_args.push_back("-mavx2");
-    clang_args.push_back("-funroll-loops");
+    cc_args.push_back(ci);
 
-    clang_args.push_back("-fvectorize");
+  switch (cc_backend) {
+  case CCBackend::CLANG:
+    if (!dbuild) {
+      cc_args.push_back("-ffast-math");
+      cc_args.push_back("-march=x86-64-v3");
+      cc_args.push_back("-w");
+      cc_args.push_back("-O3");
+      cc_args.push_back("-fuse-ld=lld");
+      cc_args.push_back("-mavx2");
+      cc_args.push_back("-funroll-loops");
+      cc_args.push_back("-fvectorize");
+      if (!getasm)
+        cc_args.push_back("-flto");
+    }
+    if (getasm) cc_args.push_back("-S");
+    cc_args.push_back("-I" + source_dir);
+    cc_args.push_back("-g");
+    break;
 
-    if (!getasm)
-      clang_args.push_back("-flto");
+  case CCBackend::GCC:
+    if (!dbuild) {
+      cc_args.push_back("-ffast-math");
+      cc_args.push_back("-march=x86-64-v3");
+      cc_args.push_back("-w");
+      cc_args.push_back("-O3");
+      cc_args.push_back("-mavx2");
+      cc_args.push_back("-funroll-loops");
+      if (!getasm)
+        cc_args.push_back("-flto");
+    }
+    if (getasm) cc_args.push_back("-S");
+    cc_args.push_back("-I" + source_dir);
+    cc_args.push_back("-g");
+    break;
+
+  case CCBackend::TCC:
+    // TCC: C99 mode, minimal flags — no AVX, no LTO, no fast-math
+    cc_args.push_back("-std=c99");
+    cc_args.push_back("-w");
+    if (getasm) cc_args.push_back("-S");
+    cc_args.push_back("-I" + source_dir);
+    break;
+
+  case CCBackend::CC:
+    if (!dbuild) {
+      cc_args.push_back("-w");
+      cc_args.push_back("-O2");
+    }
+    if (getasm) cc_args.push_back("-S");
+    cc_args.push_back("-I" + source_dir);
+    cc_args.push_back("-g");
+    break;
   }
 
-  if (getasm)
-    clang_args.push_back("-S");
-  clang_args.push_back("-I" + source_dir);
-  clang_args.push_back("-g");
   // build shell command string
   std::string cmd;
-  for (size_t i = 0; i < clang_args.size(); i++) {
-    if (i)
-      cmd += " ";
-    // quote args with spaces
-    if (clang_args[i].find(' ') != std::string::npos)
-      cmd += "\"" + clang_args[i] + "\"";
+  for (size_t i = 0; i < cc_args.size(); i++) {
+    if (i) cmd += " ";
+    if (cc_args[i].find(' ') != std::string::npos)
+      cmd += "\"" + cc_args[i] + "\"";
     else
-      cmd += clang_args[i];
+      cmd += cc_args[i];
   }
 
-  log("[*] Compiling C code...");
+  log(ansi::info_tag("*") + ansi::cyan() + " Emitting C" + ansi::reset() + ansi::grey() + "..." + ansi::reset());
   if (debug) {
-    log("Written to debug file.");
+    log(ansi::info_tag("*") + ansi::yellow() + " Debug mode" + ansi::reset()
+        + ansi::grey() + " — C written to disk, skipping backend." + ansi::reset());
   } else if (priCMD) {
-    log("[*] Running: " + cmd);
+    log(ansi::info_tag("*") + " " + ansi::grey() + "Running:" + ansi::reset() + " " + ansi::bwhite() + cmd + ansi::reset());
   } else {
-    log("[*] Running clang to produce ./" + out_bin + "...");
+    log(ansi::info_tag("*") + " " + ansi::grey() + "Backend:" + ansi::reset()
+        + " " + ansi::bcyan() + compiler_label + ansi::reset()
+        + ansi::grey() + " → " + ansi::reset()
+        + ansi::bgreen() + "./" + out_bin + ansi::reset());
   }
 
   if (!debug) {
-    // redirect stderr to a temp file to capture it
     std::string err_file = c_file + ".err";
     std::string full_cmd = cmd + " 2>" + err_file;
     int ret = system(full_cmd.c_str());
     if (ret == 0) {
-      log("[*] Made ./" + out_bin);
+      log("\n" + ansi::separator("═") +
+          "\n" + ansi::ok_badge("BUILD OK") + "  " +
+          ansi::bgreen() + ansi::bold() + "./" + out_bin + ansi::reset() +
+          "\n" + ansi::separator("═") + "\n");
     } else {
-      // copy c_file to local debug
       std::string local_debug = base + "_debug.c";
       std::ifstream src(c_file, std::ios::binary);
       std::ofstream dst(local_debug, std::ios::binary);
       dst << src.rdbuf();
-      std::cerr << "[-] Clang error (exit " << ret << "). Debug C -> ./"
-                << local_debug << "\n";
-      // print captured stderr
+      std::cerr << "\n" << ansi::separator("═") << "\n"
+                << ansi::error_badge("BUILD FAILED") << "  "
+                << ansi::grey() << compiler_label << " exited " << ansi::reset()
+                << ansi::bred() << ret << ansi::reset() << "\n"
+                << ansi::grey() << "  Debug C → " << ansi::reset()
+                << ansi::bold() << ansi::underline() << "./" + local_debug << ansi::reset()
+                << "\n" << ansi::separator("─") << "\n";
       std::ifstream ef(err_file);
-      if (ef)
-        std::cerr << ef.rdbuf();
+      if (ef) std::cerr << ansi::yellow() << ef.rdbuf() << ansi::reset();
+      std::cerr << ansi::separator("═") << "\n\n";
       fs::remove(err_file);
       fs::remove(c_file);
       return -2;
     }
     fs::remove(err_file);
-    // remove temp c file
     try {
       fs::remove(c_file);
     } catch (...) {

@@ -13,3 +13,8 @@ examples/typeinfer
 stdlib/*.c
 *.c
 reloadS*
+examples/*nim
+examples/test
+@*
+*.rs
+exampleoutputs

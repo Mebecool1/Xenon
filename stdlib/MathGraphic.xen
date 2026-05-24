@@ -1043,3 +1043,42 @@ in namespace gmath are {
         decompose(m, &x, rotation, scale)
     }
 }
+// vec2f
+overload operator(+) args(a: vec2f, b: vec2f) type(vec2f) {
+    return gmath::vec2Add(a, b)
+}
+overload operator(-) args(a: vec2f, b: vec2f) type(vec2f) {
+    return gmath::vec2Sub(a, b)
+}
+overload operator(*) args(a: vec2f, b: vec2f) type(vec2f) {
+    return gmath::vec2Mul(a, b)
+}
+overload operator(/) args(a: vec2f, b: vec2f) type(vec2f) {
+    return gmath::vec2Div(a, b)
+}
+// vec3f
+overload operator(+) args(a: vec3f, b: vec3f) type(vec3f) {
+    return gmath::vec3Add(a, b)
+}
+overload operator(-) args(a: vec3f, b: vec3f) type(vec3f) {
+    return gmath::vec3Sub(a, b)
+}
+overload operator(*) args(a: vec3f, b: vec3f) type(vec3f) {
+    return gmath::vec3Mul(a, b)
+}
+overload operator(/) args(a: vec3f, b: vec3f) type(vec3f) {
+    return gmath::vec3Div(a, b)
+}
+// vec4f
+overload operator(+) args(a: vec4f, b: vec4f) type(vec4f) {
+    return gmath::vec4Add(a, b)
+}
+overload operator(-) args(a: vec4f, b: vec4f) type(vec4f) {
+    return gmath::vec4Sub(a, b)
+}
+overload operator(*) args(a: vec4f, b: vec4f) type(vec4f) {
+    return gmath::vec4Mul(a, b)
+}
+overload operator(/) args(a: vec4f, b: vec4f) type(vec4f) {
+    return gmath::vec4Div(a, b)
+}

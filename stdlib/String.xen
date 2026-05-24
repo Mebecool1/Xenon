@@ -1,74 +1,98 @@
-
 type String {
     ptr char data
-    bool isHeap
     int size
+    int capacity
+    bool isHeap
 }
-
-in namespace string are {
-    function String New(ptr char literal) {
-        String s 
-        s.data = cast(ptr char, literal) 
-        s.isHeap = false
-        s.size = strlen(literal)
-        return s
-    }
-    function void Free(ptr String s){
-        if s.isHeap == true then
-        free(s.data)
-        s.data = 0
-        s.isHeap = false
-        s.size = 0
-        end
-    }
-}
-function void StrAppend(ptr String s, String extra) {
-    // 1. Pull the length directly from the struct metadata! No strlen required.
-    let extra_len = extra.size 
+unsafe function void StrAppend(ptr String s, String extra) {
+    int extra_len = extra.size
     if extra_len == 0 then
-      return
+        return
     end
-    
-    let new_size = s.size + extra_len
+
+    int new_size = s.size + extra_len
+
     if not s.isHeap then
-      ptr char new_data = malloc(new_size + 1)
-
-      memcpy(new_data, s.data, s.size)
-      // 2. Read from extra.data instead of the raw pointer
-      memcpy(new_data + s.size, extra.data, extra_len) 
-      ptr char terminator_ptr = new_data + new_size
-      terminator_ptr[0] = 0
-
-      s.data = new_data
-      s.isHeap = true
-      s.size = new_size
+        // Transition from literal/stack data to heap.
+        // Pick next power-of-two capacity >= new_size + 1.
+        int new_cap = 8
+        while new_cap < new_size + 1 do
+            new_cap = new_cap * 2
+        end
+        ptr char new_data = cast(ptr char, malloc(new_cap))
+        memcpy(new_data, s.data, s.size)
+        memcpy(new_data + s.size, extra.data, extra_len)
+        ptr char term = new_data + new_size
+        term[0] = 0
+        s.data     = new_data
+        s.isHeap   = true
+        s.size     = new_size
+        s.capacity = new_cap
     else
-      s.data = realloc(s.data, new_size + 1)
-      // 3. Read from extra.data here as well
-      memcpy(s.data + s.size, extra.data, extra_len) 
-      ptr char terminator_ptr = s.data + new_size
-      terminator_ptr[0] = 0
-      s.size = new_size
+        // Already on heap — only realloc if outgrown capacity.
+        if new_size + 1 > s.capacity then
+            int new_cap = s.capacity * 2
+            while new_cap < new_size + 1 do
+                new_cap = new_cap * 2
+            end
+            s.data     = realloc(s.data, new_cap)
+            s.capacity = new_cap
+        end
+        memcpy(s.data + s.size, extra.data, extra_len)
+        ptr char term = s.data + new_size
+        term[0] = 0
+        s.size = new_size
     end
 }
 
-function bool StrEq(ptr String a, ptr String b) {
+unsafe function bool StrEq(ptr String a, ptr String b) {
     if a.size != b.size then
-      return false
+        return false
     end
     if a.data == b.data then
-      return true
+        return true
     end
     int result = memcmp(a.data, b.data, a.size)
     return result == 0
 }
+
 in namespace string are {
-    function void Print(ptr String a){
+    unsafe function String New(ptr char literal) {
+        String s
+        s.data     = cast(ptr char, literal)
+        s.isHeap   = false
+        s.size     = strlen(literal)
+        s.capacity = 0
+        return s
+    }
+
+    unsafe function void Free(ptr String s) {
+        if s.isHeap == true then
+            free(s.data)
+            s.data     = 0
+            s.isHeap   = false
+            s.size     = 0
+            s.capacity = 0
+        end
+    }
+
+    function void Print(ptr String a) {
         if (a && a.data) then
             println(a.data)
         end
     }
+
+    
 }
+
+
+
+
+
+
+
+
+
 overload operator(==) args(a:String, b:String) type(bool) {
     return StrEq(&a, &b)
 }
@@ -77,10 +101,23 @@ addop operator(<<) args(a:ptr String, b:String) type(int) {
     StrAppend(a, b)
     return 0
 }
-overload operator(+) args(a: String, b: String) type(String) {
-    String result
-    String copyOfA = a 
-    int thing = &copyOfA << b 
-    result = copyOfA 
-    return result
+
+// operator+ — deep-copies a onto the heap first so StrAppend takes the
+// realloc branch, fixing the dangling-pointer bug from the shallow copy.
+overload operator(+) args(a:String, b:String) type(String) {
+    int new_cap = 8
+    while new_cap < a.size + 1 do
+        new_cap = new_cap * 2
+    end
+    ptr char buf = cast(ptr char, malloc(new_cap))
+    memcpy(buf, a.data, a.size)
+    ptr char term = buf + a.size
+    term[0] = 0
+    String copyOfA
+    copyOfA.data     = buf
+    copyOfA.isHeap   = true
+    copyOfA.size     = a.size
+    copyOfA.capacity = new_cap
+    int thing = &copyOfA << b
+    return copyOfA
 }
