@@ -1,0 +1,397 @@
+// Vector.xen — Generic dynamic array container (like C++ std::vector)
+// Usage:
+//   link "Vector.xen"
+//   Vector<int> v = vector::new<int>()
+//   vector::push<int>(&v, 42)
+//   int val = vector::get<int>(&v, 0)
+//   vector::free<int>(&v)
+
+type Vector<T> {
+    ptr T data
+    int size
+    int capacity
+}
+
+// ============================================================================
+// Internal helper functions (global scope, prefixed with Vec__)
+// ============================================================================
+
+unsafe function void Vec__grow<T> (ptr Vector<T> v, int min_cap) {
+    int new_cap = v.capacity
+    if new_cap == 0 then
+        new_cap = 8
+    end
+    while new_cap < min_cap do
+        new_cap = new_cap * 2
+    end
+    
+    // Calculate byte size for allocation
+    int elem_size = sizeof(T)
+    int byte_size = new_cap * elem_size
+    
+    if v.data == 0 then
+        v.data = cast(ptr T, malloc(byte_size))
+    else
+        v.data = cast(ptr T, realloc(v.data, byte_size))
+    end
+    v.capacity = new_cap
+}
+
+unsafe function void Vec__ensure_capacity<T>(ptr Vector<T> v, int needed) {
+    if needed > v.capacity then
+        Vec__grow<T>(v, needed)
+    end
+}
+
+// ============================================================================
+// Public API (in vector:: namespace)
+// ============================================================================
+
+in namespace vector are {
+    // Create a new empty vector
+    unsafe function Vector<T> new<T>() {
+        Vector<T> v
+        v.data = 0
+        v.size = 0
+        v.capacity = 0
+        return v
+    }
+    
+    // Create a vector with initial capacity
+    unsafe function Vector<T> withCapacity<T>(int cap) {
+        Vector<T> v
+        v.data = 0
+        v.size = 0
+        v.capacity = 0
+        if cap > 0 then
+            Vec__grow<T>(&v, cap)
+        end
+        return v
+    }
+    
+    // Create a vector from an array
+    unsafe function Vector<T> from<T>(ptr T arr, int count) {
+        Vector<T> v
+        v.data = 0
+        v.size = 0
+        v.capacity = 0
+        
+        if count > 0 then
+            Vec__grow<T>(&v, count)
+            int elem_size = sizeof(T)
+            memcpy(v.data, arr, count * elem_size)
+            v.size = count
+        end
+        return v
+    }
+    
+    // Add an element to the end
+    unsafe function void push<T>(ptr Vector<T> v, T value) {
+        Vec__ensure_capacity<T>(v, v.size + 1)
+        v.data[v.size] = value
+        v.size = v.size + 1
+    }
+    
+    // Remove and return the last element (caller must check size > 0)
+    unsafe function T pop<T>(ptr Vector<T> v) {
+        v.size = v.size - 1
+        return v.data[v.size]
+    }
+    
+    // Get element at index (no bounds checking - use at() for safe access)
+    function T get<T>(ptr Vector<T> v, int index) {
+        return v.data[index]
+    }
+    
+    // Set element at index
+    function void set<T>(ptr Vector<T> v, int index, T value) {
+        v.data[index] = value
+    }
+    
+    // Get element at index with bounds checking
+    function T at<T>(ptr Vector<T> v, int index) {
+        if index < 0 then
+            println("Vector index out of bounds: negative index")
+            exit(1)
+        end
+        if index >= v.size then
+            println("Vector index out of bounds")
+            exit(1)
+        end
+        return v.data[index]
+    }
+    
+    // Get pointer to internal array
+    function ptr T data<T>(ptr Vector<T> v) {
+        return v.data
+    }
+    
+    // Get current size
+    function int size<T>(ptr Vector<T> v) {
+        return v.size
+    }
+    
+    // Get current capacity
+    function int capacity<T>(ptr Vector<T> v) {
+        return v.capacity
+    }
+    
+    // Check if empty
+    function bool empty<T>(ptr Vector<T> v) {
+        return v.size == 0
+    }
+    
+    // Clear all elements (keeps capacity)
+    function void clear<T>(ptr Vector<T> v) {
+        v.size = 0
+    }
+    
+    // Reserve capacity without changing size
+    unsafe function void reserve<T>(ptr Vector<T> v, int new_cap) {
+        if new_cap > v.capacity then
+            Vec__grow<T>(v, new_cap)
+        end
+    }
+    
+    // Resize vector to new size (fills with zero/default if growing)
+    unsafe function void resize<T>(ptr Vector<T> v, int new_size) {
+        if new_size > v.capacity then
+            Vec__grow<T>(v, new_size)
+        end
+        
+        // Zero-fill new elements if growing
+        if new_size > v.size then
+            int elem_size = sizeof(T)
+            int start_byte = v.size * elem_size
+            int fill_bytes = (new_size - v.size) * elem_size
+            ptr char fill_ptr = cast(ptr char, v.data) + start_byte
+            memset(fill_ptr, 0, fill_bytes)
+        end
+        
+        v.size = new_size
+    }
+    
+    // Insert element at index (shifts elements right)
+    unsafe function void insert<T>(ptr Vector<T> v, int index, T value) {
+        if index < 0 then
+            index = 0
+        end
+        if index > v.size then
+            index = v.size
+        end
+        
+        Vec__ensure_capacity<T>(v, v.size + 1)
+        
+        // Shift elements right
+        int i = v.size
+        while i > index do
+            v.data[i] = v.data[i - 1]
+            i = i - 1
+        end
+        
+        v.data[index] = value
+        v.size = v.size + 1
+    }
+    
+    // Remove element at index (shifts elements left)
+    unsafe function T remove<T>(ptr Vector<T> v, int index) {
+        if index < 0 then
+            println("Vector remove: negative index")
+            exit(1)
+        end
+        if index >= v.size then
+            println("Vector remove: index out of bounds")
+            exit(1)
+        end
+        
+        T removed = v.data[index]
+        
+        // Shift elements left
+        int i = index
+        while i < v.size - 1 do
+            v.data[i] = v.data[i + 1]
+            i = i + 1
+        end
+        
+        v.size = v.size - 1
+        return removed
+    }
+    
+    // Get first element (caller must check size > 0)
+    function T front<T>(ptr Vector<T> v) {
+        return v.data[0]
+    }
+    
+    // Get last element (caller must check size > 0)
+    function T back<T>(ptr Vector<T> v) {
+        return v.data[v.size - 1]
+    }
+    
+    // Shrink capacity to fit current size
+    unsafe function void shrinkToFit<T>(ptr Vector<T> v) {
+        if v.size < v.capacity then
+            if v.size == 0 then
+                if v.data != 0 then
+                    free(v.data)
+                    v.data = 0
+                end
+                v.capacity = 0
+            else
+                int elem_size = sizeof(T)
+                int byte_size = v.size * elem_size
+                v.data = cast(ptr T, realloc(v.data, byte_size))
+                v.capacity = v.size
+            end
+        end
+    }
+    
+    // Swap contents of two vectors
+    function void swap<T>(ptr Vector<T> a, ptr Vector<T> b) {
+        ptr T temp_data = a.data
+        int temp_size = a.size
+        int temp_cap = a.capacity
+        
+        a.data = b.data
+        a.size = b.size
+        a.capacity = b.capacity
+        
+        b.data = temp_data
+        b.size = temp_size
+        b.capacity = temp_cap
+    }
+    
+    // Find first occurrence of value (returns index, or -1 if not found)
+    function int find<T>(ptr Vector<T> v, T value) {
+        int i = 0
+        while i < v.size do
+            // Simple equality check - works for numeric types
+            // For complex types, would need custom comparator
+            if v.data[i] == value then
+                return i
+            end
+            i = i + 1
+        end
+        return -1
+    }
+    
+    // Check if vector contains value
+    function bool contains<T>(ptr Vector<T> v, T value) {
+        return find<T>(v, value) != -1
+    }
+    
+    // Reverse the vector in place
+    function void reverse<T>(ptr Vector<T> v) {
+        int left = 0
+        int right = v.size - 1
+        while left < right do
+            T temp = v.data[left]
+            v.data[left] = v.data[right]
+            v.data[right] = temp
+            left = left + 1
+            right = right - 1
+        end
+    }
+    
+    // Copy vector (deep copy)
+    unsafe function Vector<T> copy<T>(ptr Vector<T> src) {
+        Vector<T> dst
+        dst.data = 0
+        dst.size = 0
+        dst.capacity = 0
+        
+        if src.size > 0 then
+            Vec__grow<T>(&dst, src.size)
+            int elem_size = sizeof(T)
+            memcpy(dst.data, src.data, src.size * elem_size)
+            dst.size = src.size
+        end
+        
+        return dst
+    }
+    
+    // Free vector memory
+    unsafe function void free<T>(ptr Vector<T> v) {
+        if v.data != 0 then
+            free(v.data)
+            v.data = 0
+        end
+        v.size = 0
+        v.capacity = 0
+    }
+    
+    // Print vector contents (for numeric types)
+    function void print<T>(ptr Vector<T> v) {
+        print("[")
+        int i = 0
+        while i < v.size do
+            if i > 0 then
+                print(", ")
+            end
+            print(v.data[i])
+            i = i + 1
+        end
+        println("]")
+    }
+}
+
+// ============================================================================
+// Operator overloads
+// ============================================================================
+
+// Equality comparison (compares element-by-element)
+overload operator(==) args(a:Vector<int>, b:Vector<int>) type(bool) {
+    if a.size != b.size then
+        return false
+    end
+    int i = 0
+    while i < a.size do
+        if a.data[i] != b.data[i] then
+            return false
+        end
+        i = i + 1
+    end
+    return true
+}
+
+overload operator(==) args(a:Vector<float>, b:Vector<float>) type(bool) {
+    if a.size != b.size then
+        return false
+    end
+    int i = 0
+    while i < a.size do
+        if a.data[i] != b.data[i] then
+            return false
+        end
+        i = i + 1
+    end
+    return true
+}
+
+overload operator(==) args(a:Vector<long>, b:Vector<long>) type(bool) {
+    if a.size != b.size then
+        return false
+    end
+    int i = 0
+    while i < a.size do
+        if a.data[i] != b.data[i] then
+            return false
+        end
+        i = i + 1
+    end
+    return true
+}
+
+// Inequality
+overload operator(!=) args(a:Vector<int>, b:Vector<int>) type(bool) {
+    if a.size != b.size then
+        return true
+    end
+    int i = 0
+    while i < a.size do
+        if a.data[i] != b.data[i] then
+            return true
+        end
+        i = i + 1
+    end
+    return false
+}
