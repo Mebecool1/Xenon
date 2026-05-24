@@ -23,6 +23,61 @@
 #endif
 
 namespace fs = std::filesystem;
+
+static std::string g_current_source;
+static std::string g_current_source_file;
+static void set_current_source_for_errors(const std::string &src,
+                                          const std::string &file = "") {
+  g_current_source = src;
+  g_current_source_file = file;
+}
+static std::string extract_line_from_source(const std::string &src, int line) {
+  if (line <= 0) return "";
+  size_t p = 0;
+  int cur = 1;
+  // advance to requested line
+  while (cur < line && p < src.size()) {
+    size_t npos = src.find('\n', p);
+    if (npos == std::string::npos) return "";
+    p = npos + 1;
+    cur++;
+  }
+  size_t start = p;
+  size_t end = src.find('\n', start);
+  if (end == std::string::npos) end = src.size();
+  std::string s = src.substr(start, end - start);
+  if (!s.empty() && s.back() == '\r') s.pop_back();
+  return s;
+}
+// Find first occurrence of a whole-word `word` in `src`. Returns {line,col}
+// (1-based) or {0,0} when not found.
+static std::pair<int,int> find_word_in_source(const std::string &src, const std::string &word) {
+  if (word.empty()) return {0,0};
+  size_t p = 0;
+  while (p < src.size()) {
+    size_t pos = src.find(word, p);
+    if (pos == std::string::npos) break;
+    // ensure whole-word match
+    bool left_ok = (pos == 0) || (!std::isalnum((unsigned char)src[pos-1]) && src[pos-1] != '_');
+    size_t after = pos + word.size();
+    bool right_ok = (after >= src.size()) || (!std::isalnum((unsigned char)src[after]) && src[after] != '_');
+    if (left_ok && right_ok) {
+      // compute line and column by scanning up to pos (robust against CR/LF)
+      int cur_line = 1;
+      size_t last_nl = 0;
+      for (size_t i = 0; i < pos; ++i) {
+        if (src[i] == '\n') {
+          ++cur_line;
+          last_nl = i + 1;
+        }
+      }
+      int col = (int)(pos - last_nl) + 1;
+      return {cur_line, col};
+    }
+    p = pos + 1;
+  }
+  return {0,0};
+}
 // ===========================================================================
 // TokenType
 // ===========================================================================
@@ -452,6 +507,10 @@ struct XenonError : std::exception {
       if (col && *col > 0)
         ss << ansi::grey() << ":" << ansi::reset()
            << ansi::yellow() << *col << ansi::reset();
+      // If we have a current source file known, show it as well
+      if (!g_current_source_file.empty()) {
+        ss << "  " << ansi::path(g_current_source_file);
+      }
     }
     ss << "\n";
 
@@ -493,26 +552,95 @@ struct XenonError : std::exception {
     }
 
     // ── Source snippet + caret ─────────────────────────────────────────────
-    if (!snippet.empty()) {
+    // If the throw site didn't include a snippet but we have a global
+    // source buffer, extract the requested line so diagnostics always show
+    // the source line and caret when possible.
+    std::string final_snippet = snippet;
+    if (final_snippet.empty() && line && !g_current_source.empty())
+      final_snippet = extract_line_from_source(g_current_source, *line);
+    if (!final_snippet.empty()) {
       int caret_col = (col && *col > 0) ? *col : 0;
+      // if col is missing, try to place caret at first non-space
+      if (caret_col == 0) {
+        size_t p = final_snippet.find_first_not_of(' ');
+        caret_col = (p == std::string::npos) ? 1 : (int)p + 1;
+      }
       ss << "\n";
       // Line number gutter
       std::string lnum = line ? std::to_string(*line) : "?";
       ss << ansi::blue() << ansi::bold() << "  " << lnum << " │ "
          << ansi::reset()
-         << ansi::bwhite() << snippet << ansi::reset() << "\n";
+         << ansi::bwhite() << final_snippet << ansi::reset() << "\n";
       // Caret row
       int gutter_w = 2 + (int)lnum.size() + 3; // "  N │ "
       ss << ansi::blue() << ansi::bold()
          << std::string(gutter_w, ' ') << ansi::reset();
-      if (caret_col > 0 && caret_col <= (int)snippet.size() + 1) {
+      if (caret_col > 0 && caret_col <= (int)final_snippet.size() + 1) {
         ss << std::string(caret_col - 1, ' ')
            << ansi::bred() << ansi::bold() << "^"
            << ansi::bred() << std::string(
-                std::max(0, (int)snippet.size() - caret_col), '~')
+                std::max(0, (int)final_snippet.size() - caret_col), '~')
            << ansi::reset();
       }
       ss << "\n";
+    }
+
+    // Show related occurrences mentioned in the message (e.g. function names
+    // like 'malloc'). This helps when an error conceptually involves multiple
+    // lines — we display the first few related snippets found elsewhere.
+    if (!g_current_source.empty()) {
+      // collect candidate words from message: quoted tokens first
+      std::set<std::string> candidates;
+      for (size_t i = 0; i < msg.size(); ++i) {
+        if (msg[i] == '\'') {
+          size_t j = msg.find('\'', i+1);
+          if (j != std::string::npos && j > i+1) {
+            candidates.insert(msg.substr(i+1, j-i-1));
+            i = j;
+          }
+        }
+      }
+      // also gather bare words (identifiers)
+      std::string cur;
+      for (size_t i = 0; i <= msg.size(); ++i) {
+        char c = (i < msg.size()) ? msg[i] : ' ';
+        if (std::isalnum((unsigned char)c) || c == '_') cur += c;
+        else {
+          if (cur.size() > 1) {
+            std::string low = cur;
+            // simple stoplist
+            static const std::set<std::string> stop = {"line","column","error","unexpected","near","requires","must","function","syntax","type"};
+            std::string llow = low;
+            for (auto &ch : llow) ch = (char)std::tolower((unsigned char)ch);
+            if (!stop.count(llow)) candidates.insert(cur);
+          }
+          cur.clear();
+        }
+      }
+      int shown = 0;
+      for (const auto &cand : candidates) {
+        if (shown >= 3) break;
+        auto [rline, rcol] = find_word_in_source(g_current_source, cand);
+        if (rline == 0) continue;
+        if (line && rline == *line) continue; // skip primary line
+        std::string related_snip = extract_line_from_source(g_current_source, rline);
+        if (related_snip.empty()) continue;
+        ss << "\n" << ansi::separator("-", 40) << "\n";
+        ss << ansi::info_badge("Related") << " " << ansi::token(cand) << "\n\n";
+        // show snippet
+        ss << ansi::blue() << ansi::bold() << "  " << rline << " │ " << ansi::reset()
+           << ansi::bwhite() << related_snip << ansi::reset() << "\n";
+        int gutter_w = 2 + (int)std::to_string(rline).size() + 3;
+        ss << ansi::blue() << ansi::bold() << std::string(gutter_w, ' ') << ansi::reset();
+        int caret_at = rcol > 0 ? rcol : 1;
+        if (caret_at > 0 && caret_at <= (int)related_snip.size() + 1) {
+          ss << std::string(caret_at - 1, ' ')
+             << ansi::bred() << ansi::bold() << "^"
+             << ansi::bred() << std::string(std::max(0, (int)related_snip.size() - caret_at), '~')
+             << ansi::reset() << "\n";
+        } else ss << "\n";
+        shown++;
+      }
     }
 
     // ── Bottom separator ───────────────────────────────────────────────────
@@ -7650,6 +7778,9 @@ int main(int argc, char **argv) {
   log(ansi::info_tag("*") + ansi::cyan() + " Tokenizing" + ansi::reset() + ansi::grey() + "..." + ansi::reset());
   std::vector<Token> tokens;
   try {
+    // Provide the global source buffer so thrown XenonError's can show
+    // the snippet/file even when individual throw sites omit it.
+    set_current_source_for_errors(source, fs::weakly_canonical(inf).string());
     tokens = Lexer(source, prescan_addop_symbols(source)).tokenize();
   } catch (XenonError &e) {
     die(e.what());

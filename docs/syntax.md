@@ -104,7 +104,7 @@ $$
 \text{You can also use let/var in functions!}
 \\\\
 \text{function let fib(let n) \{
-\text{    insert code here    }
+\text{    insert code here    } \}
 
 }
 \end{array}
@@ -132,6 +132,9 @@ $$
 \text{type Player \{} \\
 \quad \text{int id} \\
 \quad \text{str name} \\
+\quad \text{function void printName() \{}\\
+\quad \quad \text{println(name)} \\
+\quad \text{\}} \\
 \text{\}} \\ \\
 \text{enum State \{} \\
 \quad \text{IDLE = 0, BUSY = 1} \\
@@ -193,11 +196,35 @@ $$
 \\ \hline
 \text{-debug} & \text{Skip Optimization Phase}
 \\ \hline
+\text{-no-check} & \text{Skip Safety Checks}
+\\ \hline
 \end{array}
 
 $$
 ---
-## 11. Uninstallation
+## 11. Safety Checking
+$$
+\text{function int main()\{
+    \\\\
+    ptr int x = malloc(10 * sizeof(int))
+    \}}
+\\
+This\ will\ throw\ a\ SafetyError\ since\ malloc\ is\\
+not\ safe.\ You\ must\ only\ use\ the\ stack.
+
+\\
+$$
+### Though, you can bypass this.:
+$$
+\\
+use:\\
+unsafe\ function\ int\ main()\{ptr\ int\ x\ =\ malloc(10*sizeof(int))\}\\\\
+or:\\
+unsafe\ \{\\ptr\ int\ x\ =\ malloc(10*sizeof(int))\\\}
+
+$$
+---
+## 12. Uninstallation
 $$
 \text{easiest way:}
 \\
@@ -206,7 +233,7 @@ bash \to remove.sh
 exact\ command \to \text{"./remove.sh"}
 $$
 ---
-## 12. Standard Library
+## 13. Standard Library
 ### Accessing the standard library
 ---
 $$
