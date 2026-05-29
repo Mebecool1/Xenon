@@ -1,0 +1,9 @@
+type Vec<T> {
+    ptr T data 
+    int size 
+}
+function Vec<T> VecNew<T>(ptr T data, int size) {
+    Vec<T> v 
+    v.data = data 
+    v.size = size
+}

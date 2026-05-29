@@ -18,3 +18,4 @@ examples/test
 @*
 *.rs
 exampleoutputs
+*.json

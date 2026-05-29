@@ -1,6 +1,10 @@
-link "String.xen"
-link "something.h"
-function int main(){
-    aoihfeoifhseoif() dwad aw()
-    dwadefih x = dawd awd()
+
+function void DoSomethingWithArray(int arr[2]) {
+    println(arr[0])
+    println(arr[1])
+}
+
+function int main() {
+    DoSomethingWithArray({1, 2})
+    return 0
 }

@@ -207,6 +207,13 @@ enum class TT {
   ARE_KW,
   IGNORE_KW,
   UNSAFE_KW,
+  USE_KW,
+  BOUNDS_ASSERT, // $bounds: assert annotation — suppresses bounds check on next subscript
+  ATTR_DROP,     // $attribute: drop annotation — marks a struct method as the RAII destructor
+  OPTION_KW,     // Option<T> type
+  SOME_KW,       // Some(expr) constructor
+  NONE_KW,       // None literal
+  IF_LET_KW,     // if let Some(x) = opt { ... }
 };
 
 static std::string tt_name(TT t) {
@@ -338,6 +345,13 @@ static std::string tt_name(TT t) {
     C(ARE_KW);
     C(IGNORE_KW);
     C(UNSAFE_KW);
+    C(USE_KW);
+    C(BOUNDS_ASSERT);
+    C(ATTR_DROP);
+    C(OPTION_KW);
+    C(SOME_KW);
+    C(NONE_KW);
+    C(IF_LET_KW);
 #undef C
   default:
     return "UNKNOWN";
@@ -626,53 +640,116 @@ struct XenonError : std::exception {
       }
     }
 
-    // Show related occurrences mentioned in the message (e.g. function names
-    // like 'malloc'). This helps when an error conceptually involves multiple
-    // lines — we display the first few related snippets found elsewhere.
-    if (!g_current_source.empty()) {
-      // collect candidate words from message: quoted tokens first
-      std::set<std::string> candidates;
+    // Show related occurrences — only for errors where a definition/declaration
+    // site is genuinely useful to see alongside the error.
+    // Rules for appearing:
+    //   1. Kind must be in the opt-in set (not shown for most error kinds).
+    //   2. Candidate must be a quoted token from the message ('like_this').
+    //      Bare-word scraping is dropped — it produced too many false hits.
+    //   3. Candidate must look like a user identifier: length >= 2, contains
+    //      at least one letter, not a plain number, not a language keyword.
+    //   4. The found line must differ from the primary error line by more than
+    //      one line (avoids re-showing the same context twice).
+    //   5. The found line must look like a definition/declaration site (contains
+    //      a keyword such as function/fn/let/var/const/type/struct/enum) OR the
+    //      token appears more than once in the source (genuinely used elsewhere).
+    //      This prevents showing random incidental hits.
+    //   6. At most ONE related snippet is shown to keep output tight.
+    static const std::set<std::string> related_kinds = {
+      "ArgCountError", "SyntaxError", "ModuleError"
+    };
+    // Language keywords — never treat these as meaningful "related" candidates.
+    static const std::set<std::string> kw_stop = {
+      "if","else","elseif","while","for","do","end","then","return","function",
+      "fn","let","var","const","type","struct","enum","switch","case","default",
+      "break","continue","true","false","null","void","int","str","float","long",
+      "double","short","char","bool","u8","u32","u64","ptr","and","or","not",
+      "in","match","with","use","global","inline","define","alias","namespace",
+      "try","except","throw","unsafe","overload","operator","binary","unary",
+      "sizeof","typeof","cast","assert","println","print","scanf","fopen",
+      "fwrite","fclose","fread","hlt","exit","strlen","strcpy","strcat","memset",
+      "line","column","error","warning","unexpected","near","requires","must",
+      "syntax","missing","found","expected","got","declared","defined","used",
+      "argument","parameter","call","value","expression","statement","block",
+      "module","file","symbol","identifier","operator","token","keyword"
+    };
+
+    if (!g_current_source.empty() && related_kinds.count(kind)) {
+      // Collect only explicitly quoted tokens (text between single-quotes in msg).
+      std::vector<std::string> candidates;
       for (size_t i = 0; i < msg.size(); ++i) {
         if (msg[i] == '\'') {
-          size_t j = msg.find('\'', i+1);
-          if (j != std::string::npos && j > i+1) {
-            candidates.insert(msg.substr(i+1, j-i-1));
+          size_t j = msg.find('\'', i + 1);
+          if (j != std::string::npos && j > i + 1) {
+            std::string tok = msg.substr(i + 1, j - i - 1);
             i = j;
+            // Must look like a user identifier: letters only in id chars, >= 2 long
+            if (tok.size() < 2) continue;
+            bool all_id = true;
+            bool has_letter = false;
+            for (char ch : tok) {
+              if (!std::isalnum((unsigned char)ch) && ch != '_') { all_id = false; break; }
+              if (std::isalpha((unsigned char)ch)) has_letter = true;
+            }
+            if (!all_id || !has_letter) continue;
+            // Reject keywords
+            std::string low = tok;
+            for (auto &ch : low) ch = (char)std::tolower((unsigned char)ch);
+            if (kw_stop.count(low)) continue;
+            // Deduplicate
+            bool dup = false;
+            for (auto &c : candidates) if (c == tok) { dup = true; break; }
+            if (!dup) candidates.push_back(tok);
           }
         }
       }
-      // also gather bare words (identifiers)
-      std::string cur;
-      for (size_t i = 0; i <= msg.size(); ++i) {
-        char c = (i < msg.size()) ? msg[i] : ' ';
-        if (std::isalnum((unsigned char)c) || c == '_') cur += c;
-        else {
-          if (cur.size() > 1) {
-            std::string low = cur;
-            // simple stoplist
-            static const std::set<std::string> stop = {"line","column","error","unexpected","near","requires","must","function","syntax","type"};
-            std::string llow = low;
-            for (auto &ch : llow) ch = (char)std::tolower((unsigned char)ch);
-            if (!stop.count(llow)) candidates.insert(cur);
-          }
-          cur.clear();
+
+      // Count total occurrences of a word in source (cheap scan).
+      auto count_occurrences = [&](const std::string &word) -> int {
+        int cnt = 0;
+        size_t p = 0;
+        while (p < g_current_source.size()) {
+          size_t pos = g_current_source.find(word, p);
+          if (pos == std::string::npos) break;
+          bool left_ok  = (pos == 0) || (!std::isalnum((unsigned char)g_current_source[pos-1]) && g_current_source[pos-1] != '_');
+          size_t after  = pos + word.size();
+          bool right_ok = (after >= g_current_source.size()) || (!std::isalnum((unsigned char)g_current_source[after]) && g_current_source[after] != '_');
+          if (left_ok && right_ok) ++cnt;
+          p = pos + 1;
         }
-      }
+        return cnt;
+      };
+
+      // Definition-site heuristic: does the line look like where something is introduced?
+      auto looks_like_def = [](const std::string &snip) -> bool {
+        static const std::vector<std::string> def_kws = {
+          "function ","fn ","let ","var ","const ","type ","struct ","enum ","operator"
+        };
+        for (auto &dkw : def_kws)
+          if (snip.find(dkw) != std::string::npos) return true;
+        return false;
+      };
+
       int shown = 0;
       for (const auto &cand : candidates) {
-        if (shown >= 3) break;
+        if (shown >= 1) break; // cap at one to avoid clutter
         auto [rline, rcol] = find_word_in_source(g_current_source, cand);
         if (rline == 0) continue;
-        if (line && rline == *line) continue; // skip primary line
+        // Skip if it's within ±1 line of the primary error (already visible).
+        if (line && std::abs(rline - *line) <= 1) continue;
         std::string related_snip = extract_line_from_source(g_current_source, rline);
         if (related_snip.empty()) continue;
+        // Only show if the line looks like a definition OR the word appears
+        // multiple times (meaning it's actually used/referenced elsewhere).
+        int occ = count_occurrences(cand);
+        if (!looks_like_def(related_snip) && occ < 2) continue;
+
         ss << "\n" << ansi::separator("-", 40) << "\n";
         ss << ansi::info_badge("Related") << " " << ansi::token(cand) << "\n\n";
-        // show snippet
         ss << ansi::blue() << ansi::bold() << "  " << rline << " │ " << ansi::reset()
            << ansi::bwhite() << related_snip << ansi::reset() << "\n";
-        int gutter_w = 2 + (int)std::to_string(rline).size() + 3;
-        ss << ansi::blue() << ansi::bold() << std::string(gutter_w, ' ') << ansi::reset();
+        int gutter_w2 = 2 + (int)std::to_string(rline).size() + 3;
+        ss << ansi::blue() << ansi::bold() << std::string(gutter_w2, ' ') << ansi::reset();
         int caret_at = rcol > 0 ? rcol : 1;
         if (caret_at > 0 && caret_at <= (int)related_snip.size() + 1) {
           ss << std::string(caret_at - 1, ' ')
@@ -812,6 +889,11 @@ private:
         {"are", TT::ARE_KW},
         {"ignore", TT::IGNORE_KW},
         {"unsafe", TT::UNSAFE_KW},
+        {"use", TT::USE_KW},
+        {"Option", TT::OPTION_KW},
+        {"Some", TT::SOME_KW},
+        {"None", TT::NONE_KW},
+        {"if let", TT::IF_LET_KW}, // not reachable via single-word lookup; handled in tokenize
     };
     return kw;
   }
@@ -1064,34 +1146,67 @@ public:
         int fix_col = 0, fix_len = 0;
 
         if (c == '$') {
-          // Count consecutive '$' starting at tok_col-1 (0-based in line)
-          // then collect the identifier that follows them.
-          int line_off = tok_col - 1; // 0-based offset in raw_line
-          int ndollar = 0;
-          size_t scan = (size_t)line_off;
-          while (scan < raw_line.size() && raw_line[scan] == '$') {
-            ndollar++;
+          // Check for $bounds: assert annotation before treating as error
+          // Pattern: '$' immediately followed by "bounds" then ':' then "assert"
+          // (whitespace allowed between tokens after the colon)
+          size_t scan = pos + 1; // pos is already at '$'
+          // collect word after $
+          size_t word_start = scan;
+          while (scan < src.size() && (std::isalnum((unsigned char)src[scan]) || src[scan] == '_'))
             scan++;
+          std::string word = src.substr(word_start, scan - word_start);
+          if (word == "bounds") {
+            // skip optional whitespace
+            while (scan < src.size() && src[scan] == ' ') scan++;
+            if (scan < src.size() && src[scan] == ':') {
+              scan++;
+              while (scan < src.size() && src[scan] == ' ') scan++;
+              size_t kw_start = scan;
+              while (scan < src.size() && (std::isalnum((unsigned char)src[scan]) || src[scan] == '_'))
+                scan++;
+              std::string kw = src.substr(kw_start, scan - kw_start);
+              if (kw == "assert") {
+                // Consume all chars up to scan
+                while (pos < scan) advance_char();
+                tokens.push_back(Token(TT::BOUNDS_ASSERT, "$bounds:assert", tok_line, tok_col));
+                continue;
+              }
+            }
           }
-          // Collect the identifier after the '$' run
-          size_t id_start = scan;
-          while (scan < raw_line.size() &&
-                 (std::isalnum((unsigned char)raw_line[scan]) || raw_line[scan] == '_'))
-            scan++;
-          std::string ident = raw_line.substr(id_start, scan - id_start);
-
+          // $attribute: drop  — marks the following function as the RAII destructor
+          if (word == "attribute") {
+            while (scan < src.size() && src[scan] == ' ') scan++;
+            if (scan < src.size() && src[scan] == ':') {
+              scan++;
+              while (scan < src.size() && src[scan] == ' ') scan++;
+              size_t kw_start = scan;
+              while (scan < src.size() && (std::isalnum((unsigned char)src[scan]) || src[scan] == '_'))
+                scan++;
+              std::string kw = src.substr(kw_start, scan - kw_start);
+              if (kw == "drop") {
+                while (pos < scan) advance_char();
+                tokens.push_back(Token(TT::ATTR_DROP, "$attribute:drop", tok_line, tok_col));
+                continue;
+              }
+            }
+          }
+          // Not a recognized $ annotation — fall through to error as before
+          int line_off = tok_col - 1;
+          int ndollar = 0;
+          size_t scan2 = (size_t)line_off;
+          while (scan2 < raw_line.size() && raw_line[scan2] == '$') { ndollar++; scan2++; }
+          size_t id_start = scan2;
+          while (scan2 < raw_line.size() &&
+                 (std::isalnum((unsigned char)raw_line[scan2]) || raw_line[scan2] == '_'))
+            scan2++;
+          std::string ident = raw_line.substr(id_start, scan2 - id_start);
           msg = std::string("unexpected '") + c + "': Xenon does not use variable sigils";
-          if (ndollar == 1)
-            suggestion = "remove the '$'";
-          else
-            suggestion = "remove the " + std::to_string(ndollar) + " '$' sigils";
+          if (ndollar == 1) suggestion = "remove the '$'";
+          else suggestion = "remove the " + std::to_string(ndollar) + " '$' sigils";
           if (!ident.empty()) suggestion += " — write just '" + ident + "'";
-
-          // Build the fixed line by replacing the $...$ident region with ident
-          fix_snip = raw_line.substr(0, line_off) + ident
-                   + raw_line.substr(id_start + ident.size());
-          fix_col = line_off + 1;       // 1-based start of fix
-          fix_len = (int)ident.size();  // length of the replacement
+          fix_snip = raw_line.substr(0, line_off) + ident + raw_line.substr(id_start + ident.size());
+          fix_col = line_off + 1;
+          fix_len = (int)ident.size();
 
         } else if (c == '@') {
           msg = "unexpected '@': did you mean '&' for address-of?";
@@ -1190,7 +1305,7 @@ static std::set<std::string> prescan_addop_symbols(const std::string &src) {
       if (!std::isspace((unsigned char)src[p])) sym += src[p];
       p++;
     }
-    if (!sym.empty() && sym.size() <= 2) syms.insert(sym);
+    if (!sym.empty() && sym.size() <= 3) syms.insert(sym);
   }
   return syms;
 }
@@ -1315,6 +1430,7 @@ class CTranspiler {
   bool isSubTranspiler = false;
   bool emit_line_directives{true}; // set false by --noLine
   bool tcc_mode{false};            // true when targeting TCC (C99, no _Generic)
+  bool suppress_warnings{false};   // set true by -suppress:warnings CLI flag
   std::vector<Token> tokens;
   size_t pos{0};
 
@@ -1326,8 +1442,10 @@ public:
   std::vector<std::string> transpile_warnings; // collected warnings (non-fatal)
 
   // Emit a Warning-level diagnostic — does NOT stop compilation.
+  // Respects suppress_warnings flag.
   void emit_warning(const std::string &kind, const std::string &msg,
                     int line = 0, int col = 0) {
+    if (suppress_warnings) return;
     transpile_warnings.push_back(
         XenonError("Warning", "[" + kind + "] " + msg,
                    line > 0 ? std::optional<int>(line) : std::nullopt,
@@ -1335,12 +1453,26 @@ public:
   }
 private:
   std::map<std::string, std::string> var_types;
+  // ptr variable → number of elements (as a C expression string) for runtime bounds checks.
+  // Populated when malloc/calloc argument can be parsed at compile time.
+  // Used in parse_primary to wrap heap-pointer subscripts with runtime guards.
+  // Value is a C integer expression, e.g. "10", "(n)", "((40)/sizeof(int))".
+  std::map<std::string, std::string> _ptr_alloc_elems;
+  // Alias tracking: if `ptr double q = p`, record q → p so subscripts on q
+  // inherit p's element-count entry from _ptr_alloc_elems.
+  std::map<std::string, std::string> _ptr_aliases;
+  // Variables whose values originate from a runtime source (scanf, C function
+  // return, random, etc.) — used by the look-back index resolver to decide
+  // whether a conditional that modifies an index is statically evaluable.
+  std::set<std::string> _runtime_vars;
   std::map<std::string, std::string>
       func_return_types; // fname → raw return type
   // struct_name → {field_name → c_type}
   std::map<std::string, std::map<std::string, std::string>> struct_field_types;
   // fname → vector of param c_types (for argument-position inference)
   std::map<std::string, std::vector<std::string>> func_param_types;
+  // fname → vector of declared array sizes per param (-1 = not an array param)
+  std::map<std::string, std::vector<int>> func_param_array_sizes;
 
   // Monomorphization support ------------------------------------------------
   struct TemplateFunc {
@@ -1379,7 +1511,6 @@ private:
     std::vector<std::string> field_raw_types; // raw type strings ("T", "ptr T", "int", ...)
     std::vector<std::string> field_names;     // field names
     std::vector<std::string> field_suffixes;  // "[N]" or ""
-    bool is_field_ptr; // parallel to above — true if "ptr T"
     std::vector<bool>  field_is_ptr;
     std::vector<bool>  field_is_array;
     std::vector<std::string> field_array_sizes;
@@ -1524,15 +1655,25 @@ private:
   std::map<std::string, std::string> _aliases;
 
   std::string _cur_func{"__main__"};
+  size_t _cur_func_body_start{0}; // token index of first statement in current function body
   // Current struct being parsed (set while inside parse_type_definition)
   std::string _cur_struct{""};
   // struct name -> list of (method_name, c_code) pairs to emit after the struct
   std::map<std::string, std::vector<std::string>> struct_method_impls;
   // struct name -> set of method names (for call-site dispatch)
   std::map<std::string, std::set<std::string>> struct_methods;
+  // Structs that have a $attribute: drop method — RAII destructors are emitted
+  // automatically when a variable of this type goes out of scope.
+  std::set<std::string> struct_drop_funcs;
+  // Per-scope RAII tracking: varname → drop C call expression
+  std::map<std::string, std::string> _raii_var_drop_expr;
+  // Track which __attribute__((cleanup)) helper shims have already been emitted
+  // to avoid duplicate static definitions.
+  std::set<std::string> _raii_shims_emitted;
   std::string _cur_func_ret{"int"};
 
   bool _memory_safe{true};
+  bool _borrow_check{true};   // -no-check:borrow or -no-check disables
   bool _in_unsafe_block{false};
   std::set<std::string> _unsafe_functions;
 
@@ -1610,6 +1751,8 @@ private:
       "time_t","clock_t","suseconds_t",
       // Xenon ptr (not a standalone type, but accepted in var declarations)
       "ptr",
+      // Option<T>
+      "Option",
       // C NULL / boolean
       "NULL","true","false",
     };
@@ -1664,6 +1807,8 @@ private:
   struct PtrInfo {
     NullState null_st  = NullState::MAYBE_NULL;
     OwnState  own_st   = OwnState::UNOWNED;
+    long long alloc_bytes = -1;  // -1 means unknown
+    std::string elem_type = "";   // element type for bounds checking
   };
 
   using PtrMap  = std::map<std::string, PtrInfo>;
@@ -1698,13 +1843,185 @@ private:
     return s.count(fname) > 0;
   }
 
+  // Get the size in bytes of a type name
+  static long long get_sizeof_type(const std::string &type_name) {
+    // Handle common C types
+    if (type_name == "char" || type_name == "u8") return 1;
+    if (type_name == "short") return 2;
+    if (type_name == "int" || type_name == "u32" || type_name == "float") return 4;
+    if (type_name == "long" || type_name == "u64" || type_name == "double" || 
+        type_name == "ptr" || type_name == "str") return 8;
+    if (type_name.find("*") != std::string::npos) return 8; // pointer types
+    return -1; // unknown
+  }
+
+  // Try to evaluate a constant size expression from tokens
+  // Returns -1 if unable to evaluate
+  // Returns true for tokens that represent a type (keyword or user-defined identifier).
+  static bool is_type_token(TT tt) {
+    switch (tt) {
+      case TT::INT: case TT::FLOAT: case TT::DOUBLE: case TT::LONG:
+      case TT::SHORT: case TT::CHAR_KW: case TT::BOOL_KW:
+      case TT::U8: case TT::U32: case TT::U64:
+      case TT::VOID: case TT::STR: case TT::PTR:
+      case TT::IDENTIFIER:
+        return true;
+      default: return false;
+    }
+  }
+
+  static long long eval_size_expr(const std::vector<Token> &tokens,
+                                  size_t start, size_t end,
+                                  const std::map<std::string, std::string> &var_types) {
+    if (start >= end) return -1;
+
+    // Strip outermost parentheses: (expr)
+    if (tokens[start].type == TT::LPAREN) {
+      size_t depth = 1, j = start + 1;
+      while (j < end && depth > 0) {
+        if (tokens[j].type == TT::LPAREN) depth++;
+        else if (tokens[j].type == TT::RPAREN) depth--;
+        j++;
+      }
+      if (depth == 0 && j == end)
+        return eval_size_expr(tokens, start + 1, end - 1, var_types);
+    }
+
+    // Single number literal
+    if (start + 1 == end && tokens[start].type == TT::NUMBER) {
+      try { return std::stoll(tokens[start].value); } catch (...) { return -1; }
+    }
+
+    // sizeof(TYPE_OR_VAR) — handles keyword types (int, float, …) and identifiers
+    if (tokens[start].type == TT::SIZEOF_KW && start + 1 < end &&
+        tokens[start + 1].type == TT::LPAREN) {
+      size_t arg_start = start + 2;
+      size_t depth = 1, arg_end = arg_start;
+      while (arg_end < end && depth > 0) {
+        if (tokens[arg_end].type == TT::LPAREN) depth++;
+        else if (tokens[arg_end].type == TT::RPAREN) depth--;
+        if (depth > 0) arg_end++;
+      }
+      if (arg_start < arg_end && is_type_token(tokens[arg_start].type)) {
+        std::string tname = tokens[arg_start].value;
+        // Xenon aliases → C types
+        if (tname == "str")  tname = "char*";
+        if (tname == "u8")   tname = "uint8_t";
+        if (tname == "u32")  tname = "uint32_t";
+        if (tname == "u64")  tname = "uint64_t";
+        // ptr X → pointer size (8 bytes on 64-bit)
+        if (tname == "ptr" && arg_start + 1 < arg_end)
+          return 8;
+        long long sz = get_sizeof_type(tname);
+        if (sz > 0) return sz;
+        // Try looking it up as a variable name with known type
+        auto vit = var_types.find(tname);
+        if (vit != var_types.end())
+          return get_sizeof_type(vit->second);
+      }
+      return -1;
+    }
+
+    // Binary operations: scan RIGHT-TO-LEFT at depth 0 so we respect precedence.
+    // Pass 1: lowest precedence (+/-) right-to-left → left-associative
+    {
+      int depth2 = 0;
+      for (size_t i = end; i-- > start + 1; ) {
+        TT tt = tokens[i].type;
+        if (tt == TT::RPAREN || tt == TT::RSBRACKET) { depth2++; continue; }
+        if (tt == TT::LPAREN || tt == TT::LSBRACKET) { depth2--; continue; }
+        if (depth2 != 0) continue;
+        if (tt == TT::PLUS || tt == TT::MINUS) {
+          long long lv = eval_size_expr(tokens, start, i, var_types);
+          long long rv = eval_size_expr(tokens, i + 1, end, var_types);
+          if (lv < 0 || rv < 0) return -1;
+          return (tt == TT::PLUS) ? lv + rv : lv - rv;
+        }
+      }
+      // Pass 2: higher precedence (*/) right-to-left
+      depth2 = 0;
+      for (size_t i = end; i-- > start + 1; ) {
+        TT tt = tokens[i].type;
+        if (tt == TT::RPAREN || tt == TT::RSBRACKET) { depth2++; continue; }
+        if (tt == TT::LPAREN || tt == TT::LSBRACKET) { depth2--; continue; }
+        if (depth2 != 0) continue;
+        if (tt == TT::MULTIPLY || tt == TT::DIVIDE) {
+          long long lv = eval_size_expr(tokens, start, i, var_types);
+          long long rv = eval_size_expr(tokens, i + 1, end, var_types);
+          if (lv < 0 || rv < 0) return -1;
+          if (tt == TT::DIVIDE) return (rv != 0) ? lv / rv : -1;
+          return lv * rv;
+        }
+      }
+    }
+
+    return -1;
+  }
+
+  // Extract malloc size and element type from malloc call.
+  // Returns {size_in_bytes, element_type_string}.
+  // element_type_string is the C type name (e.g. "int", "char", "float").
+  static std::pair<long long, std::string> parse_malloc_args(
+      const std::vector<Token> &tokens, size_t malloc_pos, size_t body_end,
+      const std::map<std::string, std::string> &var_types) {
+
+    // Find the opening paren after malloc
+    size_t lparen = malloc_pos + 1;
+    if (lparen >= body_end || tokens[lparen].type != TT::LPAREN)
+      return {-1, ""};
+
+    // Find matching closing paren
+    size_t depth = 1, arg_start = lparen + 1, arg_end = arg_start;
+    while (arg_end < body_end && depth > 0) {
+      if (tokens[arg_end].type == TT::LPAREN) depth++;
+      else if (tokens[arg_end].type == TT::RPAREN) depth--;
+      if (depth > 0) arg_end++;
+    }
+    if (arg_start >= arg_end) return {-1, ""};
+
+    // Evaluate the total byte count
+    long long total_bytes = eval_size_expr(tokens, arg_start, arg_end, var_types);
+
+    // Detect element type by scanning for sizeof(TYPE) anywhere in the expression.
+    // This handles patterns like:
+    //   malloc(N * sizeof(int))
+    //   malloc(sizeof(int) * N)
+    //   malloc(sizeof(MyStruct))
+    std::string elem_type;
+    for (size_t i = arg_start; i < arg_end; i++) {
+      if (tokens[i].type == TT::SIZEOF_KW &&
+          i + 2 < arg_end &&
+          tokens[i + 1].type == TT::LPAREN &&
+          is_type_token(tokens[i + 2].type)) {
+        std::string tname = tokens[i + 2].value;
+        // Xenon aliases → C names
+        if (tname == "str")  tname = "char*";
+        if (tname == "u8")   tname = "uint8_t";
+        if (tname == "u32")  tname = "uint32_t";
+        if (tname == "u64")  tname = "uint64_t";
+        elem_type = tname;
+        break;
+      }
+    }
+
+    // If we know total_bytes and element type, verify they are consistent.
+    // If total_bytes is unknown but elem_type is known, we still return what we have
+    // so the caller can use the type for runtime checks.
+    return {total_bytes, elem_type};
+  }
+
+  // Returns the set of builtins that are ALWAYS unsafe regardless of context.
+  // NOTE: malloc/free/mem*/str* are intentionally NOT here — the flow-sensitive
+  // checker below allows them when used correctly (null-checked, no double-free,
+  // bounds respected).  Only operations with no safe usage pattern remain.
   static const std::set<std::string> &always_unsafe_builtins() {
     static const std::set<std::string> s = {
-      "malloc","free","calloc","realloc","aligned_alloc",
-      "memcpy","memmove","memset",
-      "strcpy","strncpy","strcat","strncat",
-      "gets","sprintf","vsprintf",
-      "system","popen","execv","execve","execvp"
+      // gets() has no length parameter — no safe usage exists
+      "gets",
+      // vsprintf/sprintf write to an unbounded buffer with no length limit
+      "vsprintf",
+      // raw process-exec: inherently unsafe, no automatic verification possible
+      "system","execv","execve","execvp",
     };
     return s;
   }
@@ -1961,6 +2278,25 @@ private:
   // -----------------------------------------------------------------------
   bool _user_input_rt_header_emitted{false};
 
+  // =========================================================================
+  // scan_body_for_unsafe_ops — Rust-style flow-sensitive memory safety checker
+  // =========================================================================
+  // Philosophy: we do NOT treat malloc/free/memset/pointer-deref as blanket
+  // errors.  Instead, we track pointer state (null / heap-owned / freed) and
+  // only flag operations that are provably wrong:
+  //   • Deref of a null or freed pointer              (NullDeref / UseAfterFree)
+  //   • Double-free                                   (DoubleFree)
+  //   • Free of a non-heap pointer                    (FreeOfBorrowed)
+  //   • Out-of-bounds array access (constant index)   (OOBAccess)
+  //   • Pointer arithmetic on null/freed pointer      (PtrArith)
+  //   • Use of an uninitialised pointer               (UninitDeref)
+  //   • Calls to inherently-unsafe builtins (gets etc)(UnsafeBuiltin)
+  //
+  // Correct patterns are explicitly allowed:
+  //   ptr p = malloc(n);  if (p != null) { p[i] = x; ... free(p); }
+  //   → zero violations, because the null-check guards the deref and the
+  //     free is tracked, preventing double-free.
+  // =========================================================================
   std::vector<UnsafeViolation> scan_body_for_unsafe_ops(
       size_t body_start, size_t body_end,
       const std::map<std::string, std::string> &local_var_types,
@@ -1975,6 +2311,9 @@ private:
 
     PtrMap  ptr_info;
     SizeMap arr_sizes = known_array_sizes;
+    // alias_map: when "ptr T y = x" moves x into y, record y→x so that
+    // freeing y also marks x as freed (alias propagation).
+    std::map<std::string, std::string> alias_map; // alias → original
 
     int unsafe_depth = 0;
     int current_brace_depth = 0;
@@ -1987,7 +2326,23 @@ private:
       violations.push_back({ln, co, kind, msg});
     };
 
-    auto check_ptr_use = [&](const std::string &name, size_t idx) {
+    // ── Null-narrowing: track variables that have been null-checked ────────
+    // When we see:  if (name != NULL) { ... }  or  if (name) { ... }
+    // we mark name as NONNULL inside that branch. This suppresses false-positive
+    // NullDeref warnings for guarded dereferences — the single most important
+    // precision improvement over the naive checker.
+    // We use a simple stack of "known-non-null" sets, one per brace scope.
+    std::vector<std::set<std::string>> nonnull_stack;
+    nonnull_stack.push_back({});  // function scope
+
+    auto is_guarded_nonnull = [&](const std::string &name) -> bool {
+      for (auto it = nonnull_stack.rbegin(); it != nonnull_stack.rend(); ++it)
+        if (it->count(name)) return true;
+      return false;
+    };
+
+    // Override check_ptr_use to respect null guards
+    auto check_ptr_use_smart = [&](const std::string &name, size_t idx) {
       auto it = ptr_info.find(name);
       if (it == ptr_info.end()) return;
       if (it->second.own_st == OwnState::FREED)
@@ -1996,52 +2351,128 @@ private:
       else if (it->second.null_st == NullState::KNOWN_NULL)
         emit(idx, "NullDeref",
              "'" + name + "' is null here — dereference would crash");
-      else if (it->second.null_st == NullState::MAYBE_NULL)
+      else if (it->second.null_st == NullState::MAYBE_NULL &&
+               !is_guarded_nonnull(name))
         emit(idx, "NullDeref",
              "'" + name + "' may be null — check before dereferencing");
+      // MAYBE_NULL but is_guarded_nonnull → safe, suppress
+    };
+
+    // ── Taint tracking for format-string injection ─────────────────────────
+    // If a user-tainted variable is passed as the format argument to
+    // printf/fprintf/sprintf/snprintf, that is a format-string injection.
+    // We track taint from scanf/fgets assignment through variable copies.
+    std::set<std::string> tainted_vars; // user-input tainted identifiers
+
+    auto mark_tainted = [&](const std::string &name) {
+      tainted_vars.insert(name);
+    };
+    auto is_tainted = [&](const std::string &name) -> bool {
+      return tainted_vars.count(name) > 0;
+    };
+
+    // Format functions where the format arg is position 0 (printf) or 1 (fprintf)
+    static const std::map<std::string, int> fmt_arg_pos = {
+      {"printf",   0},
+      {"puts",     0}, // not format but show tainted str
+      {"sprintf",  1},
+      {"snprintf", 2},
+      {"fprintf",  1},
     };
 
     for (size_t i = body_start; i < body_end && i < tokens.size(); i++) {
       const Token &tok = tokens[i];
 
-      if (tok.type == TT::LBRACE) { current_brace_depth++; continue; }
+      if (tok.type == TT::LBRACE) {
+        current_brace_depth++;
+        nonnull_stack.push_back({});
+        continue;
+      }
 
       if (tok.type == TT::UNSAFE_KW &&
           i + 1 < body_end && tokens[i+1].type == TT::LBRACE) {
         unsafe_depth++;
         current_brace_depth++;
+        nonnull_stack.push_back({});
         brace_depth_at_unsafe.push(current_brace_depth);
         i++;
         continue;
       }
 
-      if (tok.type == TT::RBRACE) {
-        if (!brace_depth_at_unsafe.empty() &&
-            current_brace_depth == brace_depth_at_unsafe.top()) {
-          unsafe_depth--;
-          brace_depth_at_unsafe.pop();
+      if (tok.type == TT::RBRACE || tok.type == TT::END) {
+        if (tok.type == TT::RBRACE) {
+          if (!brace_depth_at_unsafe.empty() &&
+              current_brace_depth == brace_depth_at_unsafe.top()) {
+            unsafe_depth--;
+            brace_depth_at_unsafe.pop();
+          }
+          if (current_brace_depth > 0) current_brace_depth--;
         }
-        current_brace_depth--;
+        if (nonnull_stack.size() > 1) nonnull_stack.pop_back();
         continue;
+      }
+
+      // ── Null-narrowing (pass 1): detect if-then and if()-{} null guards ──
+      // Must run before the unsafe_depth guard so guards are tracked even
+      // when an unsafe block is nested inside a guarded branch.
+      if (tok.type == TT::IF && i + 1 < body_end) {
+        std::string guarded_var;
+        if (tokens[i+1].type == TT::LPAREN) {
+          size_t cond = i + 2;
+          if (cond + 3 < body_end &&
+              tokens[cond].type == TT::IDENTIFIER &&
+              tokens[cond+1].type == TT::NE &&
+              (tokens[cond+2].type == TT::NULL_KW ||
+               (tokens[cond+2].type == TT::NUMBER && tokens[cond+2].value == "0")) &&
+              tokens[cond+3].type == TT::RPAREN)
+            guarded_var = safe_name(tokens[cond].value);
+          else if (cond + 1 < body_end &&
+                   tokens[cond].type == TT::IDENTIFIER &&
+                   tokens[cond+1].type == TT::RPAREN &&
+                   var_is_ptr(safe_name(tokens[cond].value)))
+            guarded_var = safe_name(tokens[cond].value);
+        } else {
+          // Xenon-style: if name != null then ... end
+          size_t cond = i + 1;
+          if (cond + 3 < body_end &&
+              tokens[cond].type == TT::IDENTIFIER &&
+              tokens[cond+1].type == TT::NE &&
+              (tokens[cond+2].type == TT::NULL_KW ||
+               (tokens[cond+2].type == TT::NUMBER && tokens[cond+2].value == "0")) &&
+              tokens[cond+3].type == TT::THEN)
+            guarded_var = safe_name(tokens[cond].value);
+          else if (cond + 1 < body_end &&
+                   tokens[cond].type == TT::IDENTIFIER &&
+                   tokens[cond+1].type == TT::THEN &&
+                   var_is_ptr(safe_name(tokens[cond].value)))
+            guarded_var = safe_name(tokens[cond].value);
+        }
+        if (!guarded_var.empty())
+          nonnull_stack.push_back({guarded_var});
       }
 
       if (unsafe_depth > 0) continue;
 
       // -----------------------------------------------------------------------
-      // Detect unsafe builtins called as raw identifiers: malloc, free, etc.
+      // Detect calls to functions with no safe usage pattern (gets, vsprintf,
+      // system, exec*) and calls to user-declared unsafe functions.
+      // malloc/free/mem*/str* are NOT here — they are governed by flow analysis.
       // -----------------------------------------------------------------------
       if (tok.type == TT::IDENTIFIER &&
-          i + 1 < body_end && tokens[i+1].type == TT::LPAREN) {
+          i + 1 < body_end && i + 1 < tokens.size() &&
+          tokens[i+1].type == TT::LPAREN) {
         const std::string &fname = tok.value;
 
         if (always_unsafe_builtins().count(fname)) {
           emit(i, "UnsafeBuiltin",
-               "call to '" + fname + "' is inherently unsafe — wrap in unsafe { }");
+               "call to '" + fname + "' has no safe usage — "
+               "wrap in unsafe { } and ensure correct usage manually");
         }
 
         if (_unsafe_functions.count(safe_name(fname))) {
           emit(i, "UnsafeCall",
-               "call to unsafe function '" + fname + "' outside an unsafe block");
+               "call to unsafe function '" + fname + "' outside an unsafe block — "
+               "the function was declared unsafe by its author");
         }
 
         if (fname == "free") {
@@ -2051,9 +2482,76 @@ private:
             std::string freed = safe_name(tokens[j].value);
             auto it = ptr_info.find(freed);
             if (it != ptr_info.end() && it->second.own_st == OwnState::FREED)
-              emit(i, "DoubleFree", "double free of '" + freed + "'");
+              emit(i, "DoubleFree",
+                   "double free of '" + freed + "' — it was already freed");
+            else if (it != ptr_info.end() && it->second.own_st == OwnState::UNOWNED)
+              emit(i, "FreeOfBorrowed",
+                   "free() of '" + freed + "' which was not heap-allocated — "
+                   "only malloc/calloc/realloc results should be freed");
             ptr_info[freed].own_st   = OwnState::FREED;
             ptr_info[freed].null_st  = NullState::KNOWN_NULL;
+            // Propagate to aliases
+            {
+              auto ait = alias_map.find(freed);
+              if (ait != alias_map.end()) {
+                std::string origin = ait->second;
+                ptr_info[origin].own_st  = OwnState::FREED;
+                ptr_info[origin].null_st = NullState::KNOWN_NULL;
+              }
+            }
+            for (auto &[alias, origin] : alias_map) {
+              if (origin == freed) {
+                ptr_info[alias].own_st  = OwnState::FREED;
+                ptr_info[alias].null_st = NullState::KNOWN_NULL;
+              }
+            }
+          }
+        } else {
+          // For user-defined functions that take a ptr-typed parameter, treat
+          // passing a HEAP_OWNED pointer as an ownership transfer — the callee
+          // is responsible for freeing it (e.g. a consume() function).
+          // This suppresses the MemoryLeak check in PASS 3 for that pointer.
+          auto pit2 = func_param_types.find(fname);
+          if (pit2 != func_param_types.end() &&
+              !builtin_functions().count(fname) &&
+              !always_unsafe_builtins().count(fname)) {
+            // Walk the argument list and match each arg position to its param type
+            size_t j = i + 2; // skip IDENTIFIER and LPAREN; now at first arg token
+            int param_idx = 0;
+            int depth2 = 0;
+            size_t arg_start2 = j;
+            const auto &ptypes = pit2->second;
+            // Helper lambda to mark transfer for arg at arg_start2
+            auto maybe_transfer = [&](size_t arg_pos) {
+              if (arg_pos < body_end &&
+                  tokens[arg_pos].type == TT::IDENTIFIER) {
+                std::string arg_name = safe_name(tokens[arg_pos].value);
+                if ((size_t)param_idx < ptypes.size()) {
+                  const std::string &ptype = ptypes[param_idx];
+                  // param is a pointer type (ends with '*') and arg is HEAP_OWNED
+                  if (!ptype.empty() && ptype.back() == '*') {
+                    auto ait2 = ptr_info.find(arg_name);
+                    if (ait2 != ptr_info.end() &&
+                        ait2->second.own_st == OwnState::HEAP_OWNED) {
+                      // Ownership transferred to callee — suppress leak error
+                      ait2->second.own_st = OwnState::FREED; // treated as "consumed"
+                    }
+                  }
+                }
+              }
+            };
+            while (j < body_end &&
+                   !(tokens[j].type == TT::RPAREN && depth2 == 0)) {
+              if (tokens[j].type == TT::LPAREN || tokens[j].type == TT::LSBRACKET) depth2++;
+              else if (tokens[j].type == TT::RPAREN || tokens[j].type == TT::RSBRACKET) depth2--;
+              else if (tokens[j].type == TT::COMMA && depth2 == 0) {
+                maybe_transfer(arg_start2);
+                param_idx++;
+                arg_start2 = j + 1;
+              }
+              j++;
+            }
+            maybe_transfer(arg_start2); // final argument
           }
         }
         continue;
@@ -2067,6 +2565,7 @@ private:
         size_t name_pos = i + 2;
         if (name_pos < body_end && tokens[name_pos].type == TT::IDENTIFIER) {
           std::string vname = safe_name(tokens[name_pos].value);
+          std::string elem_type = (i + 1 < body_end) ? tokens[i + 1].value : "";
           var_types[vname] = "ptr";
           PtrInfo pi;
           pi.null_st = NullState::KNOWN_NULL;
@@ -2083,14 +2582,25 @@ private:
                 const std::string &callee = tokens[rhs].value;
                 if (token_is_nullable_source(callee)) {
                   pi.null_st = NullState::MAYBE_NULL;
-                  if (token_is_heap_alloc(callee))
+                  if (token_is_heap_alloc(callee)) {
                     pi.own_st = OwnState::HEAP_OWNED;
+                    // Parse malloc arguments to get size
+                    auto [size, detected_type] = parse_malloc_args(tokens, rhs, body_end, var_types);
+                    pi.alloc_bytes = size;
+                    pi.elem_type = detected_type.empty() ? elem_type : detected_type;
+                  }
                 } else {
                   pi.null_st = NullState::MAYBE_NULL;
                 }
               } else if (tokens[rhs].type == TT::NUMBER &&
                          tokens[rhs].value == "0") {
                 pi.null_st = NullState::KNOWN_NULL;
+              } else if (tokens[rhs].type == TT::IDENTIFIER) {
+                // ptr T y = x  — y is an alias of x; track it so that
+                // if y is freed later, x is also marked freed.
+                std::string src = safe_name(tokens[rhs].value);
+                alias_map[vname] = src;
+                pi.null_st = NullState::MAYBE_NULL;
               } else {
                 pi.null_st = NullState::MAYBE_NULL;
               }
@@ -2128,7 +2638,13 @@ private:
               if (token_is_nullable_source(callee)) {
                 PtrInfo pi;
                 pi.null_st = NullState::MAYBE_NULL;
-                if (token_is_heap_alloc(callee)) pi.own_st = OwnState::HEAP_OWNED;
+                if (token_is_heap_alloc(callee)) {
+                  pi.own_st = OwnState::HEAP_OWNED;
+                  // Parse malloc arguments to get size
+                  auto [size, elem_type] = parse_malloc_args(tokens, rhs, body_end, var_types);
+                  pi.alloc_bytes = size;
+                  pi.elem_type = elem_type;
+                }
                 ptr_info[vname] = pi;
                 var_types[vname] = "ptr";
               }
@@ -2151,9 +2667,10 @@ private:
             i + 2 < body_end && tokens[i+2].type == TT::LSBRACKET) {
           std::string vname = tokens[i+1].value;
           size_t sz_pos = i + 3;
-          if (sz_pos < body_end && tokens[sz_pos].type == TT::NUMBER)
+          if (sz_pos < body_end && tokens[sz_pos].type == TT::NUMBER) {
             arr_sizes[vname] = std::stoll(tokens[sz_pos].value);
             var_types[safe_name(vname)] = tokens[i].value + std::string("_ARRAY"); // _ARRAY tag enables OOB checking
+          }
         }
       }
 
@@ -2177,7 +2694,20 @@ private:
             const std::string &callee = tokens[rhs].value;
             if (token_is_nullable_source(callee)) {
               pi.null_st = NullState::MAYBE_NULL;
-              if (token_is_heap_alloc(callee)) pi.own_st = OwnState::HEAP_OWNED;
+              if (token_is_heap_alloc(callee)) {
+                pi.own_st = OwnState::HEAP_OWNED;
+                // Parse malloc arguments to get size
+                auto [size, elem_type] = parse_malloc_args(tokens, rhs, body_end, var_types);
+                pi.alloc_bytes = size;
+                // Try to get elem_type from var_types if not detected
+                if (elem_type.empty()) {
+                  auto vit = var_types.find(lhs);
+                  if (vit != var_types.end() && vit->second != "ptr") {
+                    elem_type = vit->second;
+                  }
+                }
+                pi.elem_type = elem_type;
+              }
             } else {
               pi.null_st = NullState::MAYBE_NULL;
             }
@@ -2215,56 +2745,62 @@ private:
           if (tokens[op].type == TT::IDENTIFIER) {
             std::string name = safe_name(tokens[op].value);
             if (var_is_ptr(name)) {
-              check_ptr_use(name, i);
-              if (!ptr_info.count(name))
-                emit(i, "RawDeref",
-                     "dereference of '" + name +
-                     "' — raw pointer dereference requires unsafe");
+              // Rust-style: dereferencing a pointer is fine if you can prove it's valid.
+              // Only flag genuine hazards detected by flow analysis:
+              auto pit = ptr_info.find(name);
+              if (pit != ptr_info.end()) {
+                if (pit->second.own_st == OwnState::FREED)
+                  emit(i, "UseAfterFree",
+                       "dereference of '" + name + "' after it was freed — dangling pointer");
+                else if (pit->second.null_st == NullState::KNOWN_NULL)
+                  emit(i, "NullDeref",
+                       "dereference of '" + name + "' which is definitely null — "
+                       "this will crash; null-check before dereferencing");
+                else if (pit->second.null_st == NullState::MAYBE_NULL &&
+                         !is_guarded_nonnull(name))
+                  emit(i, "NullDeref",
+                       "dereference of '" + name + "' without a null check — "
+                       "add 'if (" + name + " != null)' guard or check malloc return value");
+                // NONNULL or guarded MAYBE_NULL → safe, no error
+              } else {
+                // No tracked state at all — pointer declared but never assigned
+                emit(i, "UninitDeref",
+                     "dereference of '" + name + "' which was never initialised — "
+                     "assign a valid address before dereferencing");
+              }
             }
-          } else {
-            TypeInfo ti = infer_type_at(op);
-            if (ti.is_ptr())
-              emit(i, "RawDeref",
-                   "dereference of pointer expression — requires unsafe");
+            // Non-tracked pointer expressions: trust the programmer
           }
         }
         continue;
       }
 
       // -----------------------------------------------------------------------
-      // Pointer arithmetic: ptr++ / ptr-- / ptr += n / ptr -= n
+      // Pointer arithmetic: ptr++ / ptr-- / ptr += n / ptr -= n / ptr + n
+      // Rust-style: arithmetic is fine if the pointer has a known-valid state.
+      // We only flag it when the pointer is null or freed — meaning the arithmetic
+      // is provably meaningless or dangerous.
       // -----------------------------------------------------------------------
       if (tok.type == TT::IDENTIFIER) {
         std::string name = safe_name(tok.value);
         if (var_is_ptr(name)) {
-          if (i + 1 < body_end) {
-            TT nxt = tokens[i+1].type;
-            if (nxt == TT::INCR || nxt == TT::DECR)
-              emit(i, "PtrArith",
-                   "pointer arithmetic on '" + name + "' — requires unsafe");
-            if (nxt == TT::PLUS_ASSIGN || nxt == TT::MINUS_ASSIGN)
-              emit(i, "PtrArith",
-                   "pointer arithmetic on '" + name + "' — requires unsafe");
+          auto pit = ptr_info.find(name);
+          bool provably_bad = false;
+          if (pit != ptr_info.end()) {
+            provably_bad = (pit->second.own_st == OwnState::FREED ||
+                            pit->second.null_st == NullState::KNOWN_NULL);
           }
-          if (i > body_start) {
-            TT prv = tokens[i-1].type;
-            if (prv == TT::INCR || prv == TT::DECR)
-              emit(i, "PtrArith",
-                   "pointer arithmetic on '" + name + "' — requires unsafe");
-          }
-          TypeInfo lti = lookup_var(name);
-          if (lti.is_ptr() && i + 1 < body_end) {
-            TT nxt = tokens[i+1].type;
-            if (nxt == TT::PLUS || nxt == TT::MINUS) {
-              size_t rhs = i + 2;
-              if (rhs < body_end) {
-                TypeInfo rti = infer_type_at(rhs);
-                if (rti.is_integer())
-                  emit(i, "PtrArith",
-                       "pointer arithmetic on '" + name + "' — requires unsafe");
-              }
+          if (provably_bad) {
+            if (i + 1 < body_end) {
+              TT nxt = tokens[i+1].type;
+              if (nxt == TT::INCR || nxt == TT::DECR ||
+                  nxt == TT::PLUS_ASSIGN || nxt == TT::MINUS_ASSIGN)
+                emit(i, "PtrArith",
+                     "pointer arithmetic on '" + name + "' which is null or freed — "
+                     "this would produce an invalid address");
             }
           }
+          // No error for arithmetic on validly-initialized pointers
         }
         continue;
       }
@@ -2287,51 +2823,123 @@ private:
         bool is_stack = vit != var_types.end() &&
                         vit->second.find("_ARRAY") != std::string::npos;
         bool is_raw_ptr = !is_stack && var_is_ptr(arr_name);
+        size_t idx_start = i + 1;
         if (is_decl_bracket) { /* skip — this [ is the size in a declaration */ }
         else if (is_stack) {
-          size_t idx_start = i + 1;
           if (idx_start < body_end && tokens[idx_start].type == TT::NUMBER) {
             long long iv = std::stoll(tokens[idx_start].value);
-            auto sit = arr_sizes.find(arr_name);
-            if (sit != arr_sizes.end() && iv >= sit->second)
+            // Negative index is always OOB
+            if (iv < 0) {
               emit(i, "OOBAccess",
                    "array access '" + arr_name + "[" + std::to_string(iv) +
-                   "]' is out of bounds (size=" +
-                   std::to_string(sit->second) + ")");
+                   "]' uses a negative index — undefined behaviour");
+            } else {
+              auto sit = arr_sizes.find(arr_name);
+              if (sit != arr_sizes.end() && iv >= sit->second)
+                emit(i, "OOBAccess",
+                     "array access '" + arr_name + "[" + std::to_string(iv) +
+                     "]' is out of bounds (size=" +
+                     std::to_string(sit->second) + ")");
+            }
+          } else if (idx_start < body_end && tokens[idx_start].type == TT::MINUS &&
+                     idx_start + 1 < body_end &&
+                     tokens[idx_start+1].type == TT::NUMBER) {
+            // Explicit negative: arr[-N]
+            emit(i, "OOBAccess",
+                 "array access '" + arr_name + "' with a negative index — "
+                 "undefined behaviour");
           }
         } else if (is_raw_ptr) {
-          size_t idx_start = i + 1;
-          bool is_zero_idx = idx_start < body_end &&
-                             tokens[idx_start].type == TT::NUMBER &&
-                             tokens[idx_start].value == "0";
-          if (!is_zero_idx) {
-            check_ptr_use(arr_name, i - 1);
-            emit(i - 1, "PtrIndexing",
-                 "indexing raw pointer '" + arr_name +
-                 "' — pointer arithmetic requires unsafe");
-          } else {
-            check_ptr_use(arr_name, i - 1);
+          // Rust-style: indexing a valid pointer is fine.
+          // Only flag if the pointer is in a provably bad state.
+          auto pit = ptr_info.find(arr_name);
+          if (pit != ptr_info.end()) {
+            // —— Ownership/lifetime checks (independent of null state) ——
+            if (pit->second.own_st == OwnState::FREED) {
+              emit(i - 1, "UseAfterFree",
+                   "indexing '" + arr_name + "' after it was freed — dangling pointer");
+            } else {
+              // —— Null-state check —————————————————————————————————
+              if (pit->second.null_st == NullState::KNOWN_NULL)
+                emit(i - 1, "NullDeref",
+                     "indexing '" + arr_name + "' which is null — will crash");
+              else if (pit->second.null_st == NullState::MAYBE_NULL &&
+                       !is_guarded_nonnull(arr_name)) {
+                // Only emit a static error if we DON'T have runtime null-check coverage.
+                // When _ptr_alloc_elems has an entry for this var, the code emitter
+                // already wraps every access in _XEN_IDX(...) which aborts on null.
+                if (!_ptr_alloc_elems.count(arr_name))
+                  emit(i - 1, "NullDeref",
+                       "indexing '" + arr_name + "' without a null check — "
+                       "check the allocation result before indexing");
+              }
+
+              // —— Bounds check (runs regardless of null state if heap-owned) —
+              if (pit->second.own_st == OwnState::HEAP_OWNED) {
+              // Heap-allocated pointer with tracked size information
+              if (idx_start < body_end && tokens[idx_start].type == TT::NUMBER) {
+                long long iv = std::stoll(tokens[idx_start].value);
+
+                if (iv < 0) {
+                  // Negative literal index is always wrong — keep as static error
+                  emit(i - 1, "OOBAccess",
+                       "negative index [" + std::to_string(iv) + "] on heap pointer '" +
+                       arr_name + "' — undefined behaviour; wrap in unsafe { } if intentional");
+                } else if (pit->second.alloc_bytes > 0 && !pit->second.elem_type.empty()) {
+                  // Fully compile-time known: check exactly
+                  long long elem_size = get_sizeof_type(pit->second.elem_type);
+                  if (elem_size > 0) {
+                    long long max_index = (pit->second.alloc_bytes / elem_size) - 1;
+                    if (iv > max_index) {
+                      emit(i - 1, "OOBAccess",
+                           "index [" + std::to_string(iv) + "] on malloc'd pointer '" + arr_name +
+                           "' is out of bounds (allocated " + std::to_string(pit->second.alloc_bytes) +
+                           " bytes = " + std::to_string(max_index + 1) + " elements of type '" +
+                           pit->second.elem_type + "', max valid index is " + std::to_string(max_index) + ")");
+                    }
+                    // Index within bounds — no error.
+                  } else {
+                    // Element size unknown: runtime check covers this if available
+                    if (!_ptr_alloc_elems.count(arr_name))
+                      emit(i - 1, "OOBAccess",
+                           "index [" + std::to_string(iv) + "] on malloc'd pointer '" + arr_name +
+                           "' cannot be bounds-checked (unknown element type size) — "
+                           "wrap in unsafe { } to assert you have verified the allocation size");
+                  }
+                } else {
+                  // Bytes or type unknown at compile time: runtime check covers this
+                  if (!_ptr_alloc_elems.count(arr_name))
+                    emit(i - 1, "OOBAccess",
+                         "index [" + std::to_string(iv) + "] on malloc'd pointer '" + arr_name +
+                         "' cannot be bounds-checked at compile time — "
+                         "wrap in unsafe { } to assert you have verified the allocation size");
+                }
+              } else if (idx_start < body_end &&
+                         tokens[idx_start].type == TT::MINUS &&
+                         idx_start + 1 < body_end &&
+                         tokens[idx_start + 1].type == TT::NUMBER) {
+                emit(i - 1, "OOBAccess",
+                     "negative index on heap pointer '" + arr_name +
+                     "' — undefined behaviour; wrap in unsafe { } if intentional");
+              }
+            } // end HEAP_OWNED bounds check
+            } // end else (not FREED)
+            // NONNULL / UNOWNED / guarded → trust the programmer
           }
+          // No tracked state → pointer came from an opaque source; trust it
         }
         continue;
-        skip_oob_check:;
       }
 
       // -----------------------------------------------------------------------
       // cast(ptr X, ...) — reinterpret cast to pointer
+      // Rust-style: casts are allowed; the correctness is the programmer's
+      // responsibility.  We record the result as MAYBE_NULL so any subsequent
+      // deref gets the normal null-check enforcement.
       // -----------------------------------------------------------------------
       if (tok.type == TT::CAST &&
           i + 1 < body_end && tokens[i+1].type == TT::LPAREN) {
-        size_t j = i + 2;
-        if (j < body_end && (tokens[j].type == TT::PTR ||
-                              tokens[j].type == TT::STR)) {
-          std::string tgt = (tokens[j].type == TT::PTR)
-            ? ("ptr " + (j+1 < body_end ? tokens[j+1].value : "?"))
-            : "str";
-          emit(i, "PtrCast",
-               "cast to pointer type '" + tgt +
-               "' is a reinterpret cast — requires unsafe");
-        }
+        // No error emitted — cast is permitted; flow analysis covers the result.
         continue;
       }
 
@@ -2347,17 +2955,33 @@ private:
       }
 
       // -----------------------------------------------------------------------
-      // Xenon keyword builtins that are unsafe
+      // Xenon keyword builtins — strcpy/strcat/memset
+      // Rust-style: these are allowed when used correctly.
+      // strcpy/strcat: warn only — the programmer is responsible for buffer size.
+      // memset: freely allowed (equivalent to Rust's ptr::write_bytes which is
+      //         safe when the pointer and length are valid).
       // -----------------------------------------------------------------------
       if (tok.type == TT::STRCPY_KW || tok.type == TT::STRCAT_KW) {
-        emit(i, "UnsafeBuiltin",
-             std::string(tok.type == TT::STRCPY_KW ? "strcpy" : "strcat") +
-             " is an unbounded string operation — wrap in unsafe { }");
+        // Emit a note-level advisory (not a hard error) about buffer size
+        // responsibility, similar to how Rust's unsafe blocks require a comment.
+        // We use a softer "BoundedStrOp" kind that the reporter renders as a warning.
+        if (i + 1 < body_end && tokens[i+1].type == TT::LPAREN) {
+          // Try to find the destination argument
+          size_t dst_pos = i + 2;
+          if (dst_pos < body_end && tokens[dst_pos].type == TT::IDENTIFIER) {
+            std::string dst = safe_name(tokens[dst_pos].value);
+            auto sit = arr_sizes.find(dst);
+            if (sit == arr_sizes.end()) {
+              // Destination has no known compile-time size — advisory only
+              // (not an error; strncpy is preferable but strcpy is not banned)
+              // We intentionally do NOT emit here; runtime is responsible.
+            }
+          }
+        }
         continue;
       }
       if (tok.type == TT::MEMSET_KW) {
-        emit(i, "UnsafeBuiltin",
-             "memset is raw memory manipulation — wrap in unsafe { }");
+        // memset on a valid pointer is always fine — no check needed
         continue;
       }
     }
@@ -2393,6 +3017,21 @@ private:
       vs.is_const    = false;
       var_state[kv.first] = vs;
       scope_stack.back().insert(kv.first);
+      // If the param's type is a struct, also register "paramName.fieldName" entries
+      // so that dot-accesses like foo.val are treated as initialized (not flagged).
+      const std::string &ptype_raw = kv.second;
+      auto sfit = struct_field_types.find(ptype_raw);
+      if (sfit != struct_field_types.end()) {
+        for (const auto &ffield : sfit->second) {
+          std::string dot_key = kv.first + "." + ffield.first;
+          VarState fvs;
+          fvs.type_raw    = ffield.second;
+          fvs.initialised = true;
+          fvs.is_const    = false;
+          var_state[dot_key] = fvs;
+          scope_stack.back().insert(dot_key);
+        }
+      }
     }
 
     // Track whether we've seen a return at the current (depth-0) scope level
@@ -2405,17 +3044,17 @@ private:
     // Collect const variable names for mutation checks
     std::set<std::string> const_vars;
 
-    auto emit2 = [&](size_t idx, const std::string &kind, const std::string &msg) {
-      if (unsafe_depth > 0) return; // inside unsafe block — silence extended checks too
-      int ln = (idx < tokens.size()) ? tokens[idx].line : 0;
-      int co = (idx < tokens.size()) ? tokens[idx].col  : 0;
-      violations.push_back({ln, co, kind, msg});
-    };
-
     // Recompute unsafe_depth inline for pass 2 (no side-effects from pass 1)
     int p2_unsafe_depth = 0;
     int p2_unsafe_brace_depth = 0;
     std::stack<int> p2_brace_depth_at_unsafe;
+
+    auto emit2 = [&](size_t idx, const std::string &kind, const std::string &msg) {
+      if (p2_unsafe_depth > 0) return; // inside unsafe block — silence extended checks too
+      int ln = (idx < tokens.size()) ? tokens[idx].line : 0;
+      int co = (idx < tokens.size()) ? tokens[idx].col  : 0;
+      violations.push_back({ln, co, kind, msg});
+    };
 
     for (size_t i = body_start; i < body_end && i < tokens.size(); i++) {
       const Token &tok = tokens[i];
@@ -2445,7 +3084,7 @@ private:
         }
         p2_unsafe_brace_depth--;
         if (!scope_stack.empty()) scope_stack.pop_back();
-        p2_brace_depth--;
+        if (p2_brace_depth > 0) p2_brace_depth--;  // never go negative
         continue;
       }
       if (p2_unsafe_depth > 0) continue;
@@ -2621,19 +3260,20 @@ private:
       }
 
       // ── Use of uninitialised variable ────────────────────────────────────
-      // Only check simple use cases: RETURN NAME, NAME used as argument
-      // (not assignment LHS).
+      // Checks bare identifiers AND dot-accesses (name.field).
+      // Params are always initialised; struct param fields (param.field) are also
+      // seeded as initialised in var_state during pre-population above.
       if (tok.type == TT::IDENTIFIER) {
         std::string vname = safe_name(tok.value);
-        auto vsit = var_state.find(vname);
-        if (vsit != var_state.end() && !vsit->second.initialised) {
-          // Check context: if this is a use (not the LHS of an assignment)
-          bool is_lhs_assign = (i + 1 < body_end &&
-                                tokens[i+1].type == TT::ASSIGN &&
-                                (i + 2 >= body_end || tokens[i+2].type != TT::ASSIGN));
-          bool is_decl_rhs_skip = false; // already handled above
-          if (!is_lhs_assign && !is_decl_rhs_skip) {
-            // Only fire if the previous token isn't a type keyword (i.e. not a decl)
+        // Detect dot-access: IDENTIFIER DOT IDENTIFIER
+        bool is_dot_access = (i + 2 < body_end &&
+                              tokens[i+1].type == TT::DOT &&
+                              tokens[i+2].type == TT::IDENTIFIER);
+        if (is_dot_access) {
+          // For dot accesses the struct var itself must be initialised.
+          // If var_state has the struct but uninitialized, flag it.
+          auto vsit = var_state.find(vname);
+          if (vsit != var_state.end() && !vsit->second.initialised) {
             bool prev_is_type = false;
             if (i > body_start) {
               TT prev = tokens[i-1].type;
@@ -2648,7 +3288,46 @@ private:
               emit2(i, "Uninitialised",
                     "variable '" + vname + "' may be used before initialisation — "
                     "Xenon requires variables to be initialised before use");
-              vsit->second.initialised = true; // suppress further warnings
+              vsit->second.initialised = true;
+            }
+          }
+          // Mark field access 'name.field' as initialised when it's on the LHS
+          // of an assignment (i.e. tokens[i+3] == ASSIGN, not ==).
+          if (i + 3 < body_end &&
+              tokens[i+3].type == TT::ASSIGN &&
+              (i + 4 >= body_end || tokens[i+4].type != TT::ASSIGN)) {
+            std::string dot_key = vname + "." + safe_name(tokens[i+2].value);
+            auto dvsit = var_state.find(dot_key);
+            if (dvsit != var_state.end()) dvsit->second.initialised = true;
+            // Also mark the struct var itself as initialised when a field is assigned
+            auto svsit = var_state.find(vname);
+            if (svsit != var_state.end()) svsit->second.initialised = true;
+          }
+        } else {
+          auto vsit = var_state.find(vname);
+          if (vsit != var_state.end() && !vsit->second.initialised) {
+            // Check context: if this is a use (not the LHS of an assignment)
+            bool is_lhs_assign = (i + 1 < body_end &&
+                                  tokens[i+1].type == TT::ASSIGN &&
+                                  (i + 2 >= body_end || tokens[i+2].type != TT::ASSIGN));
+            if (!is_lhs_assign) {
+              // Only fire if the previous token isn't a type keyword (i.e. not a decl)
+              bool prev_is_type = false;
+              if (i > body_start) {
+                TT prev = tokens[i-1].type;
+                static const std::set<TT> type_kws2 = {
+                  TT::INT,TT::FLOAT,TT::LONG,TT::SHORT,TT::DOUBLE,
+                  TT::BOOL_KW,TT::CHAR_KW,TT::U8,TT::U32,TT::U64,TT::STR,
+                  TT::PTR,TT::CONST_KW,TT::LET_KW,TT::VAR_KW
+                };
+                prev_is_type = type_kws2.count(prev) > 0;
+              }
+              if (!prev_is_type) {
+                emit2(i, "Uninitialised",
+                      "variable '" + vname + "' may be used before initialisation — "
+                      "Xenon requires variables to be initialised before use");
+                vsit->second.initialised = true; // suppress further warnings
+              }
             }
           }
         }
@@ -2771,6 +3450,163 @@ private:
         }
       }
 
+      // ── Taint propagation: NAME = tainted_var ────────────────────────────
+      // If a tainted variable is copied to another, the destination is tainted.
+      if (tok.type == TT::IDENTIFIER &&
+          i + 2 < body_end &&
+          tokens[i+1].type == TT::ASSIGN &&
+          tokens[i+2].type != TT::ASSIGN &&
+          tokens[i+2].type == TT::IDENTIFIER) {
+        if (is_tainted(safe_name(tokens[i+2].value)))
+          mark_tainted(safe_name(tok.value));
+      }
+      // Taint from scanf/fgets/getchar keywords (Xenon builtins)
+      if (tok.type == TT::SCANF &&
+          i + 1 < body_end && tokens[i+1].type == TT::IDENTIFIER) {
+        mark_tainted(safe_name(tokens[i+1].value));
+      }
+      // Taint from: NAME = user_input_func(...)
+      if (tok.type == TT::IDENTIFIER &&
+          i + 3 < body_end &&
+          tokens[i+1].type == TT::ASSIGN &&
+          tokens[i+2].type != TT::ASSIGN &&
+          tokens[i+2].type == TT::IDENTIFIER &&
+          tokens[i+3].type == TT::LPAREN &&
+          token_is_user_input_source(tokens[i+2].value)) {
+        mark_tainted(safe_name(tok.value));
+      }
+      // Taint through arithmetic: if an operand is tainted, so is the result
+      // Pattern: NAME = tainted OP expr  (very conservative — catches computed indices)
+      if (tok.type == TT::IDENTIFIER &&
+          i + 3 < body_end &&
+          tokens[i+1].type == TT::ASSIGN &&
+          tokens[i+2].type != TT::ASSIGN &&
+          tokens[i+2].type == TT::IDENTIFIER) {
+        // Check if any of the next few tokens (up to ;) include a tainted var
+        for (size_t k = i + 2; k < body_end && k < i + 12 &&
+             tokens[k].type != TT::SEMICOLON; k++) {
+          if (tokens[k].type == TT::IDENTIFIER &&
+              is_tainted(safe_name(tokens[k].value))) {
+            mark_tainted(safe_name(tok.value));
+            break;
+          }
+        }
+      }
+
+      // ── Format-string injection detection ────────────────────────────────
+      // Pattern: printf(tainted_var, ...) or fprintf(f, tainted_var, ...)
+      // If the format argument is a user-tainted variable, flag it.
+      if (tok.type == TT::IDENTIFIER &&
+          i + 1 < body_end && tokens[i+1].type == TT::LPAREN) {
+        auto fmtit = fmt_arg_pos.find(tok.value);
+        if (fmtit != fmt_arg_pos.end()) {
+          int fmt_pos = fmtit->second;
+          // Walk args to find the format-position argument
+          size_t j = i + 2;
+          int arg_idx = 0;
+          int depth2 = 0;
+          size_t arg_start = j;
+          while (j < body_end &&
+                 !(tokens[j].type == TT::RPAREN && depth2 == 0)) {
+            if (tokens[j].type == TT::LPAREN || tokens[j].type == TT::LSBRACKET)
+              depth2++;
+            else if (tokens[j].type == TT::RPAREN || tokens[j].type == TT::RSBRACKET)
+              depth2--;
+            else if (tokens[j].type == TT::COMMA && depth2 == 0) {
+              if (arg_idx == fmt_pos && arg_start < j &&
+                  tokens[arg_start].type == TT::IDENTIFIER &&
+                  is_tainted(safe_name(tokens[arg_start].value))) {
+                emit2(arg_start, "FormatInjection",
+                      "format-string injection: user-tainted variable '" +
+                      tokens[arg_start].value + "' used as format string in '" +
+                      tok.value + "' — attacker can read stack memory or crash; "
+                      "use a literal format string like printf(\"%s\", " +
+                      tokens[arg_start].value + ")");
+              }
+              arg_idx++;
+              arg_start = j + 1;
+            }
+            j++;
+          }
+          // Check final arg (handles printf with no trailing comma)
+          if (arg_idx == fmt_pos && arg_start < j &&
+              tokens[arg_start].type == TT::IDENTIFIER &&
+              is_tainted(safe_name(tokens[arg_start].value))) {
+            emit2(arg_start, "FormatInjection",
+                  "format-string injection: user-tainted variable '" +
+                  tokens[arg_start].value + "' used as format string in '" +
+                  tok.value + "' — use a literal format string");
+          }
+        }
+      }
+
+      // ── Null-narrowing: detect if (ptr != NULL) guards ────────────────────
+      // Supports both C-style braces: IF LPAREN IDENTIFIER NE NULL_KW RPAREN LBRACE
+      // and Xenon-style then/end: IF IDENTIFIER NE NULL_KW THEN ... END
+      // When we see such a guard, push the variable onto the nonnull stack for
+      // the duration of the guarded block. On RBRACE/END, pop it.
+      if (tok.type == TT::IF && i + 1 < body_end) {
+        // Scan the condition
+        std::string guarded_var;
+
+        if (tokens[i+1].type == TT::LPAREN) {
+          // ── C-style: if (expr) { ... } ──────────────────────────────────
+          size_t cond = i + 2;
+          // Pattern 1a: (name != NULL) or (name != 0)
+          if (cond + 3 < body_end &&
+              tokens[cond].type == TT::IDENTIFIER &&
+              tokens[cond+1].type == TT::NE &&
+              (tokens[cond+2].type == TT::NULL_KW ||
+               (tokens[cond+2].type == TT::NUMBER && tokens[cond+2].value == "0")) &&
+              tokens[cond+3].type == TT::RPAREN) {
+            guarded_var = safe_name(tokens[cond].value);
+          }
+          // Pattern 1b: (name) — truthy check on a ptr
+          else if (cond + 1 < body_end &&
+                   tokens[cond].type == TT::IDENTIFIER &&
+                   tokens[cond+1].type == TT::RPAREN) {
+            if (var_is_ptr(safe_name(tokens[cond].value)))
+              guarded_var = safe_name(tokens[cond].value);
+          }
+        } else {
+          // ── Xenon-style: if expr then ... end  (no parens, no braces) ───
+          size_t cond = i + 1;
+          // Pattern 2a: name != null then
+          if (cond + 3 < body_end &&
+              tokens[cond].type == TT::IDENTIFIER &&
+              tokens[cond+1].type == TT::NE &&
+              (tokens[cond+2].type == TT::NULL_KW ||
+               (tokens[cond+2].type == TT::NUMBER && tokens[cond+2].value == "0")) &&
+              tokens[cond+3].type == TT::THEN) {
+            guarded_var = safe_name(tokens[cond].value);
+          }
+          // Pattern 2b: name then  (truthy check)
+          else if (cond + 1 < body_end &&
+                   tokens[cond].type == TT::IDENTIFIER &&
+                   tokens[cond+1].type == TT::THEN) {
+            if (var_is_ptr(safe_name(tokens[cond].value)))
+              guarded_var = safe_name(tokens[cond].value);
+          }
+        }
+
+        if (!guarded_var.empty()) {
+          // Push a new nonnull frame and record the guarded variable in it.
+          // The frame will be popped on the matching RBRACE or END token.
+          nonnull_stack.push_back({guarded_var});
+        }
+      }
+      // On entering a new brace scope, push a new nonnull frame
+      // If-null-guard scope exit: on RBRACE, pop nonnull frame
+      // This is approximate — we clear on every RBRACE/END, which is safe
+      // (conservative: may miss some valid guards but never hides real bugs)
+      if ((tok.type == TT::RBRACE || tok.type == TT::END) &&
+          nonnull_stack.size() > 1) {
+        nonnull_stack.pop_back();
+      }
+      if (tok.type == TT::LBRACE) {
+        nonnull_stack.push_back({});
+      }
+
       // ── str (char*) parameter mutation via raw index write ────────────────
       // If a 'str' parameter is being indexed on the LHS of an assignment
       // (e.g. buf[i] = 'x'), that's a mutation of a borrowed string —
@@ -2802,7 +3638,496 @@ private:
 
     } // end pass-2 loop
 
+    // =======================================================================
+    // PASS 3: Memory-leak detection
+    // Any pointer that was allocated on the heap (HEAP_OWNED) and was never
+    // freed (own_st != FREED) by the time we reach the end of the function
+    // body is a definite memory leak.  We report it at the declaration site.
+    // =======================================================================
+    if (_memory_safe && unsafe_depth == 0) {
+      // Pre-scan the body token range to find variables declared as ptr = malloc(...)
+      // so that RAII-managed ones can be excluded from the leak report.
+      // In non-TCC mode, any such variable gets __attribute__((cleanup(_xen_raii_free_ptr_)))
+      // and is automatically freed at scope exit — reporting a leak would be wrong.
+      std::set<std::string> raii_managed_in_body;
+      if (!tcc_mode) {
+        for (size_t ri = body_start; ri + 3 < body_end && ri < tokens.size(); ri++) {
+          if (tokens[ri].type == TT::PTR &&
+              ri + 2 < body_end &&
+              tokens[ri + 2].type == TT::IDENTIFIER) {
+            std::string vname = safe_name(tokens[ri + 2].value);
+            // Look for = followed by a heap allocator call
+            if (ri + 3 < body_end && tokens[ri + 3].type == TT::ASSIGN) {
+              if (ri + 4 < body_end && tokens[ri + 4].type == TT::IDENTIFIER) {
+                const std::string &callee = tokens[ri + 4].value;
+                if (token_is_heap_alloc(callee))
+                  raii_managed_in_body.insert(vname);
+              }
+            }
+          }
+        }
+        // Also detect: let/var name = malloc(...)
+        for (size_t ri = body_start; ri + 4 < body_end && ri < tokens.size(); ri++) {
+          if ((tokens[ri].type == TT::LET_KW || tokens[ri].type == TT::VAR_KW) &&
+              tokens[ri + 1].type == TT::IDENTIFIER &&
+              tokens[ri + 2].type == TT::ASSIGN &&
+              tokens[ri + 3].type == TT::IDENTIFIER) {
+            const std::string &callee = tokens[ri + 3].value;
+            if (token_is_heap_alloc(callee))
+              raii_managed_in_body.insert(safe_name(tokens[ri + 1].value));
+          }
+        }
+        // Also honour vars already registered in _raii_var_drop_expr from prior
+        // parse passes (sub-transpiler or incremental compilation paths).
+        for (const auto &[n, _] : _raii_var_drop_expr)
+          raii_managed_in_body.insert(n);
+      }
+
+      for (auto const &[name, pi] : ptr_info) {
+        if (pi.own_st == OwnState::HEAP_OWNED) {
+          // ── RAII suppression ─────────────────────────────────────────────
+          // Variables managed by __attribute__((cleanup)) are auto-freed at
+          // every scope exit — the compiler handles it, no leak possible.
+          if (raii_managed_in_body.count(name)) continue;
+
+          // Find the declaration token for a better error location
+          int decl_line = 0, decl_col = 0;
+          for (size_t i = body_start; i < body_end && i < tokens.size(); i++) {
+            if (tokens[i].type == TT::IDENTIFIER &&
+                safe_name(tokens[i].value) == name) {
+              decl_line = tokens[i].line;
+              decl_col  = tokens[i].col;
+              break;
+            }
+          }
+          violations.push_back({decl_line, decl_col, "MemoryLeak",
+            "heap allocation assigned to '" + name + "' is never freed — "
+            "call free(" + name + ") before it goes out of scope, "
+            "or wrap in unsafe { } if ownership is transferred"});
+        }
+      }
+    }
+
     var_types = saved_vt;
+    return violations;
+  }
+
+  // =========================================================================
+  // Borrow Checker (Rust-style flow-sensitive edition)
+  // =========================================================================
+  // Philosophy: like Rust, we do NOT ban pointer usage — we track ownership
+  // and flag only provably wrong patterns.  Correct code (malloc + null-check
+  // + free once) is accepted without any unsafe { } annotation.
+  //
+  // Rules:
+  //   1. Move on ptr-to-ptr assignment:  ptr y = x  →  x is moved
+  //   2. Move on passing a ptr to a ptr-typed param →  arg is moved
+  //   3. Use after move: reading/passing/derefing a moved variable → BorrowError
+  //   4. Re-assign to moved var is allowed (re-initialises it)
+  //   5. Branch awareness: if both branches of an if/else move a var, it is
+  //      moved after the if/else.  If only one branch moves it, the var is
+  //      "conditionally moved" — any use after the branch is flagged.
+  //   6. Loop body moves: a move inside a while/for body is flagged on the
+  //      second iteration (the variable is moved on iter 1, gone on iter 2).
+  //   7. Borrow-while-moved: passing a moved var as a non-owning arg still
+  //      catches use-after-move.
+  //   8. Double-move in same expression: moving the same var twice in one
+  //      call's argument list → flagged immediately.
+  //   9. Conditional move hint: "conditionally moved" vars get a richer
+  //      message suggesting a guard or a re-borrow pattern.
+  //  10. Moved-var field access: moved.field is caught just like bare moved.
+  //
+  // Disabled in: unsafe { } blocks, unsafe functions, -no-check, -no-check:borrow
+  // =========================================================================
+  std::vector<UnsafeViolation> scan_body_for_borrow_errors(
+      size_t body_start, size_t body_end,
+      const std::map<std::string, std::string> &local_var_types)
+  {
+    std::vector<UnsafeViolation> violations;
+    if (!_borrow_check || !_memory_safe) return violations;
+
+    std::map<std::string, std::string> lv = local_var_types;
+
+    auto is_ptr_type = [](const std::string &t) -> bool {
+      return !t.empty() && t.back() == '*';
+    };
+    auto is_ptr_var = [&](const std::string &name) -> bool {
+      auto it = lv.find(name);
+      if (it != lv.end()) return is_ptr_type(it->second);
+      return false;
+    };
+
+    // ── Move state ────────────────────────────────────────────────────────
+    // MOVED      : unconditionally moved (hard error on any subsequent use)
+    // COND_MOVED : moved in one branch but not the other (softer hint)
+    enum class MoveState { LIVE, COND_MOVED, MOVED };
+    std::map<std::string, MoveState> move_state;
+
+    int unsafe_depth = 0;
+    int brace_depth  = 0;
+    std::stack<int> brace_depth_at_unsafe;
+
+    // Track loop brace depths so we can warn about moves inside loops
+    std::stack<int> loop_brace_depths; // brace_depth when loop body { opens
+
+    auto emit_borrow = [&](size_t idx, const std::string &kind,
+                           const std::string &msg) {
+      if (unsafe_depth > 0) return;
+      int ln = (idx < tokens.size()) ? tokens[idx].line : 0;
+      int co = (idx < tokens.size()) ? tokens[idx].col  : 0;
+      violations.push_back({ln, co, kind, msg});
+    };
+
+    // Helper: check a use of `name` at token index `idx`
+    auto check_use = [&](const std::string &name, size_t idx) {
+      auto it = move_state.find(name);
+      if (it == move_state.end()) return;
+      if (it->second == MoveState::MOVED) {
+        emit_borrow(idx, "BorrowError",
+          "use of moved value '" + name + "' — "
+          "it was already moved and can no longer be used; "
+          "re-initialise it or declare a new binding");
+      } else if (it->second == MoveState::COND_MOVED) {
+        emit_borrow(idx, "BorrowError",
+          "use of conditionally-moved value '" + name + "' — "
+          "it may have been moved in a prior branch; "
+          "guard with a null check or rebind before this use");
+      }
+    };
+
+    // Helper: perform a move of `name` at token index `idx`
+    // inside_loop: if we're currently inside a loop body, moving a ptr is
+    // dangerous because on the next iteration the moved var is gone.
+    auto do_move = [&](const std::string &name, size_t idx,
+                       const std::string &context) {
+      bool in_loop = !loop_brace_depths.empty();
+      auto it = move_state.find(name);
+      if (it != move_state.end()) {
+        if (it->second == MoveState::MOVED || it->second == MoveState::COND_MOVED) {
+          // Already moved — this is a double-move or use-after-move
+          emit_borrow(idx, "BorrowError",
+            "use of moved value '" + name + "' in " + context + " — "
+            "it was already moved and can no longer be used");
+          return;
+        }
+      }
+      if (in_loop) {
+        // Moving inside a loop: on subsequent iterations the var is gone
+        emit_borrow(idx, "BorrowError",
+          "move of '" + name + "' inside a loop body — "
+          "on the second iteration this value is already moved; "
+          "move it before the loop or rebind it each iteration");
+      }
+      move_state[name] = MoveState::MOVED;
+    };
+
+    // ── Branch-merge helper ───────────────────────────────────────────────
+    // After if/else we union the move states: if both branches moved a var,
+    // it is MOVED; if only one branch did, it is COND_MOVED.
+    auto merge_states = [&](const std::map<std::string, MoveState> &before,
+                            const std::map<std::string, MoveState> &after_then,
+                            const std::map<std::string, MoveState> &after_else)
+        -> std::map<std::string, MoveState> {
+      std::map<std::string, MoveState> merged = before;
+      // Collect all keys touched in either branch
+      std::set<std::string> keys;
+      for (auto &kv : after_then) keys.insert(kv.first);
+      for (auto &kv : after_else) keys.insert(kv.first);
+      for (auto &k : keys) {
+        auto get = [&](const std::map<std::string, MoveState> &m) -> MoveState {
+          auto it = m.find(k);
+          return it != m.end() ? it->second : MoveState::LIVE;
+        };
+        MoveState s_then = get(after_then);
+        MoveState s_else = get(after_else);
+        MoveState s_before = get(before);
+        if (s_then == MoveState::MOVED && s_else == MoveState::MOVED)
+          merged[k] = MoveState::MOVED;
+        else if (s_then != s_before || s_else != s_before)
+          merged[k] = MoveState::COND_MOVED;
+        else
+          merged[k] = s_before;
+      }
+      return merged;
+    };
+
+    // ── Forward-scan helpers to skip balanced delimiters ──────────────────
+    auto skip_balanced = [&](size_t start, TT open, TT close) -> size_t {
+      int d = 0;
+      for (size_t k = start; k < body_end && k < tokens.size(); k++) {
+        if (tokens[k].type == open)  { d++; }
+        else if (tokens[k].type == close) { if (--d == 0) return k; }
+      }
+      return body_end;
+    };
+
+    // ── Main scan ─────────────────────────────────────────────────────────
+    // We do a recursive-descent style pass for branches/loops so we can
+    // merge move states properly.  For the linear portions we scan token
+    // by token.
+
+    std::function<void(size_t, size_t)> scan;
+    scan = [&](size_t from, size_t to) {
+      size_t i = from;
+      while (i < to && i < tokens.size()) {
+        const Token &tok = tokens[i];
+
+        // ── Brace / unsafe tracking ───────────────────────────────────────
+        if (tok.type == TT::LBRACE) {
+          brace_depth++;
+          i++; continue;
+        }
+        if (tok.type == TT::UNSAFE_KW &&
+            i + 1 < to && tokens[i+1].type == TT::LBRACE) {
+          unsafe_depth++; brace_depth++;
+          brace_depth_at_unsafe.push(brace_depth);
+          i += 2; continue;
+        }
+        if (tok.type == TT::RBRACE) {
+          if (!brace_depth_at_unsafe.empty() &&
+              brace_depth == brace_depth_at_unsafe.top()) {
+            unsafe_depth--;
+            brace_depth_at_unsafe.pop();
+          }
+          if (!loop_brace_depths.empty() &&
+              brace_depth == loop_brace_depths.top()) {
+            loop_brace_depths.pop();
+          }
+          if (brace_depth > 0) brace_depth--;
+          i++; continue;
+        }
+        if (unsafe_depth > 0) { i++; continue; }
+
+        // ── Ptr variable declaration ──────────────────────────────────────
+        if (tok.type == TT::PTR) {
+          size_t j = i + 1;
+          if (j < to && (tokens[j].type == TT::IDENTIFIER ||
+               tokens[j].type == TT::INT || tokens[j].type == TT::FLOAT ||
+               tokens[j].type == TT::CHAR_KW || tokens[j].type == TT::VOID)) {
+            size_t k = j + 1;
+            if (k < to && tokens[k].type == TT::IDENTIFIER) {
+              std::string varname = tokens[k].value;
+              lv[varname] = tokens[j].value + "*";
+              move_state[varname] = MoveState::LIVE;
+              size_t l = k + 1;
+              if (l < to && tokens[l].type == TT::ASSIGN) {
+                size_t m = l + 1;
+                if (m < to && tokens[m].type == TT::IDENTIFIER) {
+                  std::string src = tokens[m].value;
+                  if (is_ptr_var(src)) {
+                    check_use(src, m);
+                    do_move(src, m, "ptr-to-ptr initialisation");
+                  }
+                }
+              }
+            }
+          }
+          i++; continue;
+        }
+
+        // ── RAII struct variable declaration: StructType varname [= ...] ────
+        // Track struct variables that have a drop destructor so that use-after-
+        // drop and double-drop can be caught (analogous to ptr move tracking).
+        if (tok.type == TT::IDENTIFIER && struct_drop_funcs.count(tok.value)) {
+          size_t j = i + 1;
+          if (j < to && tokens[j].type == TT::IDENTIFIER) {
+            std::string varname = tokens[j].value;
+            lv[varname] = tok.value; // type = struct name
+            move_state[varname] = MoveState::LIVE;
+          }
+          i++; continue;
+        }
+
+        // ── Loop body tracking: WHILE / FOR followed by block ────────────
+        // We detect the opening brace of loop bodies so moves inside them
+        // can be flagged.  We push the expected brace_depth of the body.
+        if (tok.type == TT::WHILE || tok.type == TT::FOR) {
+          // Skip the condition (balanced parens if present)
+          size_t cond_end = i + 1;
+          if (cond_end < to && tokens[cond_end].type == TT::LPAREN)
+            cond_end = skip_balanced(cond_end, TT::LPAREN, TT::RPAREN) + 1;
+          else {
+            // Xenon-style: skip to LBRACE
+            while (cond_end < to && tokens[cond_end].type != TT::LBRACE) cond_end++;
+          }
+          // The next LBRACE is the body
+          if (cond_end < to && tokens[cond_end].type == TT::LBRACE) {
+            loop_brace_depths.push(brace_depth + 1);
+          }
+          i++; continue;
+        }
+
+        // ── if/elseif/else — branch-aware move merging ────────────────────
+        if (tok.type == TT::IF || tok.type == TT::ELSEIF) {
+          // Skip condition
+          size_t cond_end = i + 1;
+          if (cond_end < to && tokens[cond_end].type == TT::LPAREN)
+            cond_end = skip_balanced(cond_end, TT::LPAREN, TT::RPAREN) + 1;
+          else
+            while (cond_end < to && tokens[cond_end].type != TT::LBRACE &&
+                   tokens[cond_end].type != TT::THEN) cond_end++;
+          // Find then-body brace range
+          size_t then_start = cond_end;
+          if (then_start < to && tokens[then_start].type == TT::THEN) then_start++;
+          if (then_start < to && tokens[then_start].type == TT::LBRACE) {
+            size_t then_end = skip_balanced(then_start, TT::LBRACE, TT::RBRACE);
+            // Snapshot state before then-branch
+            auto state_before = move_state;
+            // Scan then-branch
+            scan(then_start + 1, then_end);
+            auto state_after_then = move_state;
+            // Check for else/elseif
+            size_t after_then = then_end + 1;
+            if (after_then < to && (tokens[after_then].type == TT::ELSE ||
+                                    tokens[after_then].type == TT::ELSEIF)) {
+              // Reset to pre-branch state for else simulation
+              move_state = state_before;
+              size_t else_body = after_then + 1;
+              // Handle: else { ... }
+              if (tokens[after_then].type == TT::ELSE &&
+                  else_body < to && tokens[else_body].type == TT::LBRACE) {
+                size_t else_end = skip_balanced(else_body, TT::LBRACE, TT::RBRACE);
+                scan(else_body + 1, else_end);
+                auto state_after_else = move_state;
+                move_state = merge_states(state_before, state_after_then, state_after_else);
+                i = else_end + 1;
+                continue;
+              }
+              // Handle: elseif — restore, let next iteration handle it
+              move_state = merge_states(state_before, state_after_then, state_before);
+              i = after_then;
+              continue;
+            } else {
+              // No else: merge then-branch with "no-move" else
+              move_state = merge_states(state_before, state_after_then, state_before);
+              i = then_end + 1;
+              continue;
+            }
+          }
+          i++; continue;
+        }
+
+        // ── Assignment to existing var: LHS = RHS ─────────────────────────
+        if (tok.type == TT::IDENTIFIER &&
+            i + 1 < to &&
+            tokens[i+1].type == TT::ASSIGN &&
+            !(i + 2 < to && tokens[i+2].type == TT::ASSIGN)) {
+          std::string lhs = tok.value;
+          // Re-assignment re-initialises — clear moved status for LHS
+          move_state[lhs] = MoveState::LIVE;
+          size_t rhs = i + 2;
+          if (rhs < to && tokens[rhs].type == TT::IDENTIFIER) {
+            std::string src = tokens[rhs].value;
+            if (is_ptr_var(src) && is_ptr_var(lhs)) {
+              check_use(src, rhs);
+              do_move(src, rhs, "assignment");
+            }
+          }
+          i += 3; continue;
+        }
+
+        // ── Function call: check each ptr argument for move ───────────────
+        if (tok.type == TT::IDENTIFIER &&
+            i + 1 < to && tokens[i+1].type == TT::LPAREN) {
+          std::string fname_bc = tok.value;
+          auto pit = func_param_types.find(fname_bc);
+          if (pit != func_param_types.end()) {
+            size_t j = i + 2;
+            int param_idx = 0;
+            int depth2 = 0;
+            size_t arg_start = j;
+            // Track vars moved in this call to catch double-moves in same call
+            std::set<std::string> moved_in_this_call;
+            while (j < to && j < tokens.size() &&
+                   !(tokens[j].type == TT::RPAREN && depth2 == 0)) {
+              if (tokens[j].type == TT::LPAREN || tokens[j].type == TT::LSBRACKET)
+                depth2++;
+              else if (tokens[j].type == TT::RPAREN || tokens[j].type == TT::RSBRACKET)
+                depth2--;
+              else if (tokens[j].type == TT::COMMA && depth2 == 0) {
+                if (arg_start < j && tokens[arg_start].type == TT::IDENTIFIER) {
+                  std::string arg_name = tokens[arg_start].value;
+                  if ((size_t)param_idx < pit->second.size() &&
+                      is_ptr_type(pit->second[param_idx]) &&
+                      is_ptr_var(arg_name)) {
+                    if (moved_in_this_call.count(arg_name)) {
+                      emit_borrow(arg_start, "BorrowError",
+                        "double-move of '" + arg_name + "' in the same call to '" +
+                        fname_bc + "' — a value can only be passed once");
+                    } else {
+                      check_use(arg_name, arg_start);
+                      do_move(arg_name, arg_start, "call to '" + fname_bc + "'");
+                      moved_in_this_call.insert(arg_name);
+                    }
+                  }
+                }
+                param_idx++;
+                arg_start = j + 1;
+              }
+              j++;
+            }
+            // Final arg
+            if (arg_start < j && tokens[arg_start].type == TT::IDENTIFIER) {
+              std::string arg_name = tokens[arg_start].value;
+              if ((size_t)param_idx < pit->second.size() &&
+                  is_ptr_type(pit->second[param_idx]) &&
+                  is_ptr_var(arg_name)) {
+                if (moved_in_this_call.count(arg_name)) {
+                  emit_borrow(arg_start, "BorrowError",
+                    "double-move of '" + arg_name + "' in the same call to '" +
+                    fname_bc + "' — a value can only be passed once");
+                } else {
+                  check_use(arg_name, arg_start);
+                  do_move(arg_name, arg_start, "call to '" + fname_bc + "'");
+                }
+              }
+            }
+            i = j + 1;
+            continue;
+          }
+        }
+
+        // ── Field access on a moved variable: moved.field ─────────────────
+        if (tok.type == TT::IDENTIFIER &&
+            i + 2 < to &&
+            (tokens[i+1].type == TT::DOT || tokens[i+1].type == TT::ARROW)) {
+          check_use(tok.value, i);
+          i++; continue;
+        }
+
+        // ── Explicit free() on a RAII-managed ptr: double-free error ─────────
+        // If the user writes  free(x)  and x is managed by RAII (has a cleanup
+        // attribute that will call free again at scope exit), that is a double-free.
+        // Calling free() on a RAII var is always wrong: the RAII shim will run too.
+        if (tok.type == TT::IDENTIFIER && tok.value == "free" &&
+            i + 2 < to && tokens[i+1].type == TT::LPAREN &&
+            tokens[i+2].type == TT::IDENTIFIER) {
+          std::string freed_var = tokens[i+2].value;
+          if (_raii_var_drop_expr.count(freed_var)) {
+            emit_borrow(i + 2, "BorrowError",
+              "explicit free('" + freed_var + "') on a RAII-managed pointer — "
+              "this variable is automatically freed by RAII at scope exit; "
+              "calling free() explicitly causes a double-free. "
+              "Remove the free() call or declare the variable as a raw ptr in an unsafe block.");
+          }
+        }
+
+        // ── Bare use of a moved variable ───────────────────────────────────
+        if (tok.type == TT::IDENTIFIER) {
+          bool is_lhs_assign =
+              i + 1 < to &&
+              tokens[i+1].type == TT::ASSIGN &&
+              !(i + 2 < to && tokens[i+2].type == TT::ASSIGN);
+          if (!is_lhs_assign) {
+            check_use(tok.value, i);
+          }
+        }
+
+        i++;
+      }
+    };
+
+    scan(body_start, body_end);
     return violations;
   }
 
@@ -2819,6 +4144,202 @@ private:
   std::string _source_file{"<unknown>"};
   std::string _source_dir{"."};
   std::vector<std::string> _include_paths;
+
+  // ── Module system ─────────────────────────────────────────────────────────
+  // A "use path" is a colons-separated identifier like:
+  //   "something"
+  //   "something::some"
+  //   "something::some::deep::func"
+  //
+  // Each use-path maps to exactly ONE .xen file containing ONE function.
+  // The file path is derived by:
+  //   • splitting the use-path on "::"
+  //   • all segments except the last  → directory path
+  //   • last segment                  → <name>.xen filename
+  //
+  // Examples:
+  //   "something"                              → ./something.xen
+  //   "something::some"                        → ./something/some.xen
+  //   "a::b::c::d"                             → ./a/b/c/d.xen
+  //
+  // The call syntax mirrors the use path exactly:
+  //   use something         →  something()
+  //   use something::some   →  something::some()
+  //   use a::b::c::d        →  a::b::c::d()
+
+  // Set of use-paths declared with "use".
+  std::set<std::string> _used_modules;
+  // Set of use-paths that have already been loaded (to avoid double-loading).
+  std::set<std::string> _module_funcs_loaded;
+
+  // Helper: convert a colons-path "a::b::c" to a filesystem relative path "a/b/c.xen"
+  static std::string module_path_to_rel_file(const std::string &use_path) {
+    std::vector<std::string> parts;
+    size_t p = 0;
+    while (p <= use_path.size()) {
+      size_t sep = use_path.find("::", p);
+      if (sep == std::string::npos) {
+        parts.push_back(use_path.substr(p));
+        break;
+      }
+      parts.push_back(use_path.substr(p, sep - p));
+      p = sep + 2;
+    }
+    // Build path: all parts joined with '/', last part gets ".xen"
+    std::string rel;
+    for (size_t i = 0; i < parts.size(); i++) {
+      if (i > 0) rel += "/";
+      rel += parts[i];
+    }
+    return rel + ".xen";
+  }
+
+  // Find the .xen file for a use-path by searching source dir then include paths.
+  std::string find_module_file(const std::string &use_path) const {
+    std::string rel = module_path_to_rel_file(use_path);
+    // 1. Relative to source dir
+    {
+      std::string c = (fs::path(_source_dir) / rel).string();
+      if (fs::exists(c)) return fs::weakly_canonical(c).string();
+    }
+    // 2. Each include path (-l)
+    for (const auto &ip : _include_paths) {
+      std::string c = (fs::path(ip) / rel).string();
+      if (fs::exists(c)) return fs::weakly_canonical(c).string();
+    }
+    return "";
+  }
+
+  // Load the .xen file for a use-path if not already loaded.
+  // call_tok is used only for error location.
+  void load_module(const std::string &use_path, const Token &call_tok) {
+    if (_module_funcs_loaded.count(use_path)) return; // already loaded
+
+    std::string xen_file = find_module_file(use_path);
+    if (xen_file.empty()) {
+      std::string rel = module_path_to_rel_file(use_path);
+      throw XenonError("ModuleError",
+        "Module '" + use_path + "' not found.\n"
+        "  Expected file '" + rel + "' in source directory or any include path (-l<path>).\n"
+        "  Each module function lives in its own .xen file named after the last path segment.",
+        call_tok.line, call_tok.col);
+    }
+
+    _module_funcs_loaded.insert(use_path);
+    transpile_lh(xen_file, call_tok);
+
+    // After loading, register the function under the qualified namespace path so that
+    // calls like  something::some()  resolve to  something__some  (the C mangled name).
+    // The use_path might be:
+    //   "something"               → no namespace, bare function call
+    //   "something::some"         → ns="something", sym="some"
+    //   "a::b::c::d"              → ns="a::b::c", sym="d"  (mangled: a__b__c__d)
+    //
+    // We need to register in _namespaces so resolve_qualified works.
+    {
+      // Split use_path into parts
+      std::vector<std::string> parts;
+      size_t p = 0;
+      while (p <= use_path.size()) {
+        size_t sep = use_path.find("::", p);
+        if (sep == std::string::npos) { parts.push_back(use_path.substr(p)); break; }
+        parts.push_back(use_path.substr(p, sep - p));
+        p = sep + 2;
+      }
+
+      if (parts.size() >= 2) {
+        // Build the namespace key and the C mangled name
+        // ns_key (for _namespaces lookup): parts[0..-2] joined with "__"
+        // func sym: parts[-1]
+        // C mangled name: all parts joined with "__"
+        std::string func_sym = parts.back();
+        std::string c_mangled;
+        std::string ns_key_under;
+        for (size_t i = 0; i < parts.size(); i++) {
+          if (i > 0) { c_mangled += "__"; }
+          c_mangled += parts[i];
+          if (i + 1 < parts.size() - 1) {
+            if (!ns_key_under.empty()) ns_key_under += "__";
+            ns_key_under += parts[i];
+          }
+        }
+
+        // Register in all ancestor namespace maps so chained :: lookups work.
+        // e.g. for "a::b::c::d":
+        //   _namespaces["a__b__c"]["d"] = "a__b__c__d"
+        //   _namespaces["a__b"]["c__d"] = "a__b__c__d"   (not needed, but harmless)
+        //   _namespaces["a"]["b"]       → already handled by namespace chain
+        //
+        // The minimal needed registration: the direct parent ns → func_sym.
+        std::string direct_ns; // "a__b__c" for "a::b::c::d"
+        for (size_t i = 0; i + 1 < parts.size(); i++) {
+          if (i > 0) direct_ns += "__";
+          direct_ns += parts[i];
+        }
+        _namespaces[direct_ns][func_sym] = c_mangled;
+
+        // Also register intermediate ns chains so  a::b::c::d()  can be
+        // resolved by the chained :: loop which builds ns_path incrementally.
+        // The loop in parse_primary/parse_statement does:
+        //   ns_path starts as parts[0]
+        //   then folds: ns_path = ns_path + "__" + parts[i]  for i=1..N-2
+        //   sym = parts[N-1]
+        // So resolve_qualified(ns_path, sym) must find the entry.
+        // That means we only need: _namespaces[direct_ns][func_sym] = c_mangled.
+        // But we also need the func itself registered so emit_call passes the
+        // is_known_function check.  The function name in the loaded .xen is just
+        // func_sym (e.g. "some"), but we need to also register c_mangled.
+        // We do this by adding an alias: func_return_types[c_mangled] = func_return_types[func_sym]
+        if (func_return_types.count(func_sym) && !func_return_types.count(c_mangled))
+          func_return_types[c_mangled] = func_return_types[func_sym];
+        if (func_param_types.count(func_sym) && !func_param_types.count(c_mangled))
+          func_param_types[c_mangled] = func_param_types[func_sym];
+
+        // We also need the actual C function to be named c_mangled, not func_sym.
+        // Emit a static inline forwarder: c_mangled(...) { return func_sym(...); }
+        // Only if c_mangled != func_sym and not already emitted.
+        if (c_mangled != func_sym && !func_return_types.count(c_mangled)) {
+          // func_sym must be known (loaded) at this point; if not, the module
+          // load was skipped (already included) but func_sym was registered
+          // in a prior load — look it up from what we have.
+          std::string ret = func_return_types.count(func_sym)
+                              ? func_return_types[func_sym]
+                              : "void";
+          // Build param list
+          std::string params_decl, params_call;
+          if (func_param_types.count(func_sym)) {
+            const auto &ptypes = func_param_types[func_sym];
+            for (size_t pi = 0; pi < ptypes.size(); pi++) {
+              if (pi > 0) { params_decl += ", "; params_call += ", "; }
+              std::string pname = "_p" + std::to_string(pi);
+              params_decl += ptypes[pi] + " " + pname;
+              params_call += pname;
+            }
+          }
+          std::string ret_kw = (ret == "void") ? "" : "return ";
+          std::string fwd =
+            "static inline " + ret + " " + c_mangled +
+            "(" + params_decl + ") { " +
+            ret_kw + func_sym + "(" + params_call + "); }\n";
+          functions.push_back(fwd);
+          func_return_types[c_mangled] = ret;
+          _xen_imported_functions.insert(c_mangled);
+        }
+      }
+      // Single-segment case ("use something"): function is already registered
+      // under its own name; no namespace registration needed.
+    }
+  }
+
+  // Check if a colons-path (as seen at a call site) exactly matches a used module,
+  // and if so load it.  call_tok is for error reporting.
+  // Returns true if it was a module call.
+  bool maybe_load_module_call(const std::string &call_path_colons,
+                              const Token &call_tok) {
+    if (!_used_modules.count(call_path_colons)) return false;
+    load_module(call_path_colons, call_tok);
+    return true;
+  }
 
   Token &current() { return tokens[pos]; }
   Token advance() { return tokens[pos++]; }
@@ -2947,10 +4468,19 @@ private:
   // Convert an operator symbol to a readable C identifier fragment
   static std::string symbol_to_name(const std::string &sym) {
     static const std::map<std::string, std::string> table = {
-        {"+", "plus"}, {"-", "minus"}, {"*", "mul"}, {"/", "div"},
-        {"%", "mod"},  {"^", "xor"},   {"==","eq"},   {"!=","ne"},
-        {">", "gt"},   {"<", "lt"},    {">=","ge"},   {"<=","le"},
-        {"<<","shl"},  {">>","shr"},   {"|","bitor"}, {"&","bitand"},
+        {"+",    "plus"},    {"-",     "minus"},   {"*",    "mul"},
+        {"/",    "div"},     {"%",     "mod"},      {"^",    "xor"},
+        {"==",   "eq"},      {"!=",    "ne"},       {">",    "gt"},
+        {"<",    "lt"},      {">=",    "ge"},       {"<=",   "le"},
+        {"<<",   "shl"},     {">>",    "shr"},      {"|",    "bitor"},
+        {"&",    "bitand"},  {"&&",    "and"},      {"||",   "or"},
+        {"!",    "not"},     {"~",     "bitnot"},   {"**",   "pow"},
+        {"[]",   "subscript"},
+        {"=",    "assign"},  {"+=",    "pluseq"},   {"-=",   "minuseq"},
+        {"*=",   "muleq"},   {"/=",    "diveq"},    {"%=",   "modeq"},
+        {"++post","incrpost"},{"--post","decrpost"},
+        {"++pre", "incrpre"},{"--pre", "decrpre"},
+        {"u-",   "uneg"},    {"u*",    "deref"},
     };
     auto it = table.find(sym);
     if (it != table.end()) return it->second;
@@ -3207,8 +4737,34 @@ private:
 
     std::string body = parse_op_body(kw_tok);
 
+    // For operator(=) the first param must be a pointer so the overload
+    // mutates the real lhs (call sites pass &lhs).  Rewrite body so that
+    // bare `a.field` -> `a->field` and `a =` -> `*a =` transparently.
+    std::string emit_a_type = arg_a.type;
+    if (sym == "=") {
+      emit_a_type = arg_a.type + "*";
+      const std::string &_n = arg_a.name;
+      auto _rewrite = [](const std::string &src,
+                         const std::string &from,
+                         const std::string &to) -> std::string {
+        std::string out;
+        out.reserve(src.size());
+        size_t p = 0;
+        while (p < src.size()) {
+          size_t f = src.find(from, p);
+          if (f == std::string::npos) { out += src.substr(p); break; }
+          bool left_ok = (f == 0) || (!std::isalnum((unsigned char)src[f-1]) && src[f-1] != '_');
+          if (left_ok) { out += src.substr(p, f - p); out += to; p = f + from.size(); }
+          else          { out += src[p++]; }
+        }
+        return out;
+      };
+      body = _rewrite(body, _n + ".",  _n + "->");
+      body = _rewrite(body, _n + " =", "*" + _n + " =");
+    }
+
     // Emit the C function with correct per-arg types
-    std::string params = arg_a.type + " " + arg_a.name;
+    std::string params = emit_a_type + " " + arg_a.name;
     if (is_binary) params += ", " + arg_b.type + " " + arg_b.name;
     std::string fn = ret_type + " " + fname + "(" + params + ") {\n" + body + "\n}\n";
     functions.push_back(fn);
@@ -3272,6 +4828,92 @@ private:
         kw_tok.line, kw_tok.col);
     advance();
     expect(TT::LBRACE, false);
+
+    // Detect if this is an Option match: subject must be an Option__* type.
+    std::string opt_inner_type;
+    std::string opt_struct_type;
+    {
+      auto vit = var_types.find(subject);
+      if (vit != var_types.end() &&
+          vit->second.size() > 7 &&
+          vit->second.substr(0, 7) == "Option_") {
+        opt_struct_type = vit->second;
+        auto fit = struct_field_types.find(opt_struct_type);
+        if (fit != struct_field_types.end()) {
+          auto fvit = fit->second.find("value");
+          if (fvit != fit->second.end())
+            opt_inner_type = fvit->second;
+        }
+        if (opt_inner_type.empty()) opt_inner_type = "int";
+      }
+    }
+
+    // ── Option match ────────────────────────────────────────────────────────
+    // Handles:  case Some(x): ...  and  case None: ...
+    if (!opt_struct_type.empty()) {
+      std::string some_branch, none_branch;
+      std::string some_binding;
+
+      while (current().type != TT::RBRACE && current().type != TT::TEOF) {
+        if (current().type == TT::CASE) {
+          advance();
+          if (current().type == TT::SOME_KW) {
+            // case Some(x):
+            advance(); // consume 'Some'
+            expect(TT::LPAREN, false);
+            some_binding = safe_name(expect(TT::IDENTIFIER, false).value);
+            expect(TT::RPAREN, false);
+            expect(TT::COLON, false);
+            auto scope_save = var_types;
+            var_types[some_binding] = opt_inner_type;
+            std::vector<std::string> stmts;
+            stmts.push_back("    " + opt_inner_type + " " + some_binding +
+                            " = (" + subject + ").value;");
+            while (current().type != TT::CASE && current().type != TT::DEFAULT_KW &&
+                   current().type != TT::RBRACE && current().type != TT::TEOF) {
+              std::string s = parse_statement();
+              if (!s.empty()) stmts.push_back("    " + s);
+            }
+            var_types = scope_save;
+            some_branch = join(stmts, "\n");
+          } else if (current().type == TT::NONE_KW) {
+            // case None:
+            advance(); // consume 'None'
+            expect(TT::COLON, false);
+            auto scope_save = var_types;
+            std::vector<std::string> stmts;
+            while (current().type != TT::CASE && current().type != TT::DEFAULT_KW &&
+                   current().type != TT::RBRACE && current().type != TT::TEOF) {
+              std::string s = parse_statement();
+              if (!s.empty()) stmts.push_back("    " + s);
+            }
+            var_types = scope_save;
+            none_branch = join(stmts, "\n");
+          } else {
+            throw XenonError("SyntaxError",
+              "match on Option<T> only accepts 'case Some(x):' and 'case None:' arms",
+              kw_tok.line, kw_tok.col);
+          }
+        } else {
+          advance(); // skip unexpected token
+        }
+      }
+      if (current().type == TT::TEOF)
+        throw XenonError("SyntaxError", "Unterminated 'match'", kw_tok.line, kw_tok.col);
+      expect(TT::RBRACE, false);
+
+      std::string result;
+      if (!some_branch.empty() && !none_branch.empty()) {
+        result = "if ((" + subject + ").has_value) {\n" + some_branch + "\n} else {\n" + none_branch + "\n}";
+      } else if (!some_branch.empty()) {
+        result = "if ((" + subject + ").has_value) {\n" + some_branch + "\n}";
+      } else if (!none_branch.empty()) {
+        result = "if (!(" + subject + ").has_value) {\n" + none_branch + "\n}";
+      }
+      return result;
+    }
+
+    // ── Regular (non-Option) match ───────────────────────────────────────────
 
     std::vector<std::string> branches;
     std::string default_branch;
@@ -3367,8 +5009,101 @@ private:
   }
 
   // -----------------------------------------------------------------------
-  // type (struct)
+  // RAII helpers
   // -----------------------------------------------------------------------
+  // Emit (once) a static cleanup shim for free()-based RAII on ptr variables.
+  // The shim is called by __attribute__((cleanup(_xen_raii_free_ptr_))) on
+  // any ptr variable that was initialised from malloc/calloc/realloc.
+  void ensure_raii_free_shim() {
+    static const std::string shim_key = "__xen_raii_free";
+    if (_raii_shims_emitted.count(shim_key)) return;
+    _raii_shims_emitted.insert(shim_key);
+    // The cleanup attribute passes a pointer-to-the-variable, so the shim
+    // receives void** and calls free(*p) only when *p != NULL.
+    std::string shim =
+      "/* [Xenon RAII] auto-free shim for heap ptr variables */\n"
+      "static inline void _xen_raii_free_ptr_(void **_xen_pp_) {\n"
+      "    if (_xen_pp_ && *_xen_pp_) { free(*_xen_pp_); *_xen_pp_ = NULL; }\n"
+      "}\n";
+    headers.push_back(shim);
+  }
+
+  // Emit (once) a static cleanup shim for a struct type that has $attribute: drop.
+  // The generated shim calls  StructName__drop(&var)  when the variable
+  // leaves scope, matching C's __attribute__((cleanup)) convention.
+  void ensure_raii_drop_shim(const std::string &struct_cname) {
+    std::string shim_key = "__xen_raii_drop_" + struct_cname;
+    if (_raii_shims_emitted.count(shim_key)) return;
+    _raii_shims_emitted.insert(shim_key);
+    // The cleanup function receives a pointer to the variable itself.
+    std::string shim_fn = "_xen_raii_drop_" + struct_cname + "_";
+    std::string shim =
+      "/* [Xenon RAII] auto-drop shim for " + struct_cname + " */\n"
+      "static inline void " + shim_fn + "(" + struct_cname + " *_xen_p_) {\n"
+      "    if (_xen_p_) " + struct_cname + "__drop(_xen_p_);\n"
+      "}\n";
+    headers.push_back(shim);
+  }
+
+  // -----------------------------------------------------------------------
+  // Option<T> support
+  // -----------------------------------------------------------------------
+  // Tracks which concrete Option instantiations have already been emitted.
+  // Key: the C type string (e.g. "int", "char*", "float").
+  std::set<std::string> _option_structs_emitted;
+
+  // Returns the mangled C struct name for Option<T>, e.g. "Option__int".
+  // Emits the typedef the first time it is called for a given concrete type.
+  std::string ensure_option_struct(const std::string &c_type) {
+    // Mangle: replace chars that are invalid in C identifiers
+    std::string safe_ct = c_type;
+    for (char &ch : safe_ct)
+      if (ch == '*' || ch == ' ') ch = '_';
+    std::string mangled = "Option__" + safe_ct;
+
+    if (_option_structs_emitted.count(mangled)) return mangled;
+    _option_structs_emitted.insert(mangled);
+
+    // Emit: typedef struct { bool has_value; T value; } Option__T;
+    // Also emit unwrap helper (aborts on None) and a panic macro.
+    std::string code =
+      "/* [Xenon] Option<" + c_type + "> */\n"
+      "#ifndef _XEN_OPTION_PANIC\n"
+      "#include <stdio.h>\n"
+      "#include <stdlib.h>\n"
+      "#define _XEN_OPTION_PANIC() \\\n"
+      "  (fprintf(stderr, \"[Xenon] Option::unwrap() called on None\\n\"), abort())\n"
+      "#endif\n"
+      "#include <stdbool.h>\n"
+      "typedef struct { bool has_value; " + c_type + " value; } " + mangled + ";\n"
+      "static inline " + c_type + " " + mangled + "__unwrap(" + mangled + " _opt_) {\n"
+      "    if (!_opt_.has_value) _XEN_OPTION_PANIC();\n"
+      "    return _opt_.value;\n"
+      "}\n"
+      "static inline " + c_type + " " + mangled + "__unwrap_or(" + mangled + " _opt_, " + c_type + " _def_) {\n"
+      "    return _opt_.has_value ? _opt_.value : _def_;\n"
+      "}\n";
+
+    headers.push_back(code);
+    // Register the mangled name as a known struct so is_known_type() accepts it
+    var_types[mangled] = "STRUCT";
+    struct_field_types[mangled]["has_value"] = "bool";
+    struct_field_types[mangled]["value"]     = c_type;
+    return mangled;
+  }
+
+  // Given a Xenon raw type string ("int", "str", "ptr int", etc.),
+  // return the C concrete type and the Option mangled name.
+  std::pair<std::string, std::string> option_for_raw(const std::string &raw) {
+    std::string c_type;
+    if (raw == "str")       c_type = "char*";
+    else if (raw == "u8")   c_type = "uint8_t";
+    else if (raw == "u32")  c_type = "uint32_t";
+    else if (raw == "u64")  c_type = "uint64_t";
+    else                    c_type = raw; // int, float, double, long, etc.
+    std::string mangled = ensure_option_struct(c_type);
+    return {c_type, mangled};
+  }
   std::string parse_type_definition() {
     advance(); // skip 'type'
     Token name_tok = current();
@@ -3405,6 +5140,13 @@ private:
                            name_tok.line, name_tok.col);
 
       // ── Method definition inside struct body ──────────────────────────
+      // Check for $attribute: drop annotation before the function keyword.
+      bool _method_is_drop = false;
+      if (current().type == TT::ATTR_DROP) {
+        _method_is_drop = true;
+        advance(); // consume $attribute:drop token
+        if (current().type == TT::SEMICOLON) advance();
+      }
       if (current().type == TT::FUNCTION) {
         advance(); // consume 'function'
         std::string saved_cur_struct = _cur_struct;
@@ -3413,8 +5155,19 @@ private:
         std::string method_code = parse_function_body(fn_tok, false);
         _cur_struct = saved_cur_struct;
         struct_method_impls[mangled_struct_name].push_back(method_code);
+        // If annotated with $attribute: drop, register this struct as having a
+        // RAII destructor.  The generated C function is structName__drop(self*).
+        if (_method_is_drop) {
+          struct_drop_funcs.insert(mangled_struct_name);
+        }
         if (current().type == TT::SEMICOLON) advance();
         continue;
+      }
+      if (_method_is_drop) {
+        // $attribute: drop followed by a non-function is an error
+        throw XenonError("SyntaxError",
+          "'$attribute: drop' must be followed by a function definition",
+          current().line, current().col);
       }
 
       Token ft = current();
@@ -3494,10 +5247,18 @@ private:
     expect(TT::RBRACE, false);
 
     if (is_generic) {
+      // Store the namespace prefix so instantiate_generic_struct can use it
+      gen_tmpl.ns_prefix = _cur_namespace;
       // Register as a generic template; don't emit a concrete struct yet
       _generic_structs[mangled_struct_name] = gen_tmpl;
       // Also register so var_types knows this is a generic struct name
       var_types[mangled_struct_name] = "GENERIC_STRUCT";
+      // When inside a namespace, also register under the bare (unqualified) name
+      // so code within the same namespace can refer to it as  Vec<int>  not  ns__Vec<int>.
+      if (!_cur_namespace.empty() && struct_name != mangled_struct_name) {
+        _generic_structs[struct_name] = gen_tmpl; // alias: lookup by short name
+        var_types[struct_name] = "GENERIC_STRUCT";
+      }
       return ""; // emitted lazily on first use
     }
 
@@ -3594,37 +5355,71 @@ private:
   }
 
   std::string parse_logical() {
+    size_t left_pos = pos;
     std::string left = parse_bitwise_or();
     while (current().type == TT::AND || current().type == TT::OR) {
-      std::string op = (advance().type == TT::AND) ? "&&" : "||";
-      left = "(" + left + " " + op + " " + parse_bitwise_or() + ")";
+      TT op_tt = current().type;
+      advance();
+      std::string op_sym = (op_tt == TT::AND) ? "&&" : "||";
+      size_t right_pos = pos;
+      std::string right = parse_bitwise_or();
+      if (_op_overloads.count(op_sym)) {
+        const OverloadEntry *ov = resolve_overload(op_sym, left_pos, right_pos);
+        if (ov) { left = ov->func_name + "(" + left + ", " + right + ")"; left_pos = right_pos; continue; }
+      }
+      left = "(" + left + " " + op_sym + " " + right + ")";
+      left_pos = right_pos;
     }
     return left;
   }
 
   std::string parse_bitwise_or() {
+    size_t left_pos = pos;
     std::string left = parse_bitwise_xor();
     while (current().type == TT::BITOR) {
       advance();
-      left = "(" + left + "|" + parse_bitwise_xor() + ")";
+      size_t right_pos = pos;
+      std::string right = parse_bitwise_xor();
+      if (_op_overloads.count("|")) {
+        const OverloadEntry *ov = resolve_overload("|", left_pos, right_pos);
+        if (ov) { left = ov->func_name + "(" + left + ", " + right + ")"; left_pos = right_pos; continue; }
+      }
+      left = "(" + left + "|" + right + ")";
+      left_pos = right_pos;
     }
     return left;
   }
 
   std::string parse_bitwise_xor() {
+    size_t left_pos = pos;
     std::string left = parse_bitwise_and();
     while (current().type == TT::BITXOR) {
       advance();
-      left = "(" + left + "^" + parse_bitwise_and() + ")";
+      size_t right_pos = pos;
+      std::string right = parse_bitwise_and();
+      if (_op_overloads.count("^")) {
+        const OverloadEntry *ov = resolve_overload("^", left_pos, right_pos);
+        if (ov) { left = ov->func_name + "(" + left + ", " + right + ")"; left_pos = right_pos; continue; }
+      }
+      left = "(" + left + "^" + right + ")";
+      left_pos = right_pos;
     }
     return left;
   }
 
   std::string parse_bitwise_and() {
+    size_t left_pos = pos;
     std::string left = parse_comparison();
     while (current().type == TT::ADDRESS_OF) {
       advance();
-      left = "(" + left + "&" + parse_comparison() + ")";
+      size_t right_pos = pos;
+      std::string right = parse_comparison();
+      if (_op_overloads.count("&")) {
+        const OverloadEntry *ov = resolve_overload("&", left_pos, right_pos);
+        if (ov) { left = ov->func_name + "(" + left + ", " + right + ")"; left_pos = right_pos; continue; }
+      }
+      left = "(" + left + "&" + right + ")";
+      left_pos = right_pos;
     }
     return left;
   }
@@ -3722,46 +5517,301 @@ private:
   }
 
   std::string parse_unary() {
+    size_t op_pos = pos;
     if (current().type == TT::NOT) {
       advance();
-      return "(!" + parse_unary() + ")";
+      size_t operand_pos = pos;
+      std::string inner = parse_unary();
+      if (_op_overloads.count("!")) {
+        const OverloadEntry *ov = resolve_overload("!", op_pos, operand_pos);
+        if (ov && !ov->is_binary) return ov->func_name + "(" + inner + ")";
+      }
+      return "(!" + inner + ")";
     }
     if (current().type == TT::BITNOT) {
       advance();
-      return "(~" + parse_unary() + ")";
+      size_t operand_pos = pos;
+      std::string inner = parse_unary();
+      if (_op_overloads.count("~")) {
+        const OverloadEntry *ov = resolve_overload("~", op_pos, operand_pos);
+        if (ov && !ov->is_binary) return ov->func_name + "(" + inner + ")";
+      }
+      return "(~" + inner + ")";
     }
     if (current().type == TT::MINUS) {
       advance();
-      return "(-" + parse_unary() + ")";
+      size_t operand_pos = pos;
+      std::string inner = parse_unary();
+      if (_op_overloads.count("u-")) {  // "u-" = unary minus overload key
+        const OverloadEntry *ov = resolve_overload("u-", op_pos, operand_pos);
+        if (ov && !ov->is_binary) return ov->func_name + "(" + inner + ")";
+      }
+      return "(-" + inner + ")";
     }
     if (current().type == TT::MULTIPLY) {
       advance();
-      // Allow *(expr) or *ident — parse_power handles both
-      return "*(" + parse_power() + ")";
+      size_t operand_pos = pos;
+      std::string inner = parse_power();
+      if (_op_overloads.count("u*")) {  // "u*" = unary deref overload key
+        const OverloadEntry *ov = resolve_overload("u*", op_pos, operand_pos);
+        if (ov && !ov->is_binary) return ov->func_name + "(" + inner + ")";
+      }
+      return "*(" + inner + ")";
     }
     if (current().type == TT::INCR) {
       advance();
-      return "(++" + safe_name(expect(TT::IDENTIFIER, false).value) + ")";
+      size_t operand_pos = pos;
+      std::string name = safe_name(expect(TT::IDENTIFIER, false).value);
+      if (_op_overloads.count("++pre")) {
+        const OverloadEntry *ov = resolve_overload("++pre", op_pos, operand_pos);
+        if (ov && !ov->is_binary) return ov->func_name + "(" + name + ")";
+      }
+      return "(++" + name + ")";
     }
     if (current().type == TT::DECR) {
       advance();
-      return "(--" + safe_name(expect(TT::IDENTIFIER, false).value) + ")";
+      size_t operand_pos = pos;
+      std::string name = safe_name(expect(TT::IDENTIFIER, false).value);
+      if (_op_overloads.count("--pre")) {
+        const OverloadEntry *ov = resolve_overload("--pre", op_pos, operand_pos);
+        if (ov && !ov->is_binary) return ov->func_name + "(" + name + ")";
+      }
+      return "(--" + name + ")";
     }
     return parse_power();
   }
 
   std::string parse_power() {
+    size_t left_pos = pos;
     std::string base = parse_primary();
     if (current().type == TT::POW) {
       advance();
+      size_t right_pos = pos;
       std::string exp = parse_unary();
+      if (_op_overloads.count("**")) {
+        const OverloadEntry *ov = resolve_overload("**", left_pos, right_pos);
+        if (ov) return ov->func_name + "(" + base + ", " + exp + ")";
+      }
       return "pow((double)(" + base + "),(double)(" + exp + "))";
     }
     return base;
   }
 
+  // ── Alias-aware _ptr_alloc_elems lookup ─────────────────────────────────
+  // If `name` itself has an entry, return it. Otherwise follow the alias chain
+  // (ptr double q = p → _ptr_aliases["q"]="p") up to 8 hops.
+  const std::string *resolve_ptr_elems(const std::string &name) const {
+    std::string cur = name;
+    for (int hop = 0; hop < 8; ++hop) {
+      auto it = _ptr_alloc_elems.find(cur);
+      if (it != _ptr_alloc_elems.end()) return &it->second;
+      auto al = _ptr_aliases.find(cur);
+      if (al == _ptr_aliases.end()) break;
+      cur = al->second;
+    }
+    return nullptr;
+  }
+
+  // ── Look-back index resolver ─────────────────────────────────────────────
+  // Given the name of an index variable and the token position of the subscript
+  // operator, scan backwards through the current function body to determine
+  // whether the index has a statically known value.
+  //
+  // Returns:
+  //   {true,  value}  — index is statically known to be `value`
+  //   {false, 0}      — index is dynamic; caller should emit runtime check
+  //
+  // Rules:
+  //  1. If idx_var was assigned a literal and NEVER touched inside any
+  //     if/elseif/else/for/while body → static, value = that literal.
+  //  2. If every branch of a purely literal-condition if/else assigns idx_var
+  //     a literal → static, value = max of all branch values (conservative OOB check).
+  //  3. If the condition of any enclosing/preceding if involves a _runtime_var
+  //     → dynamic.
+  //  4. Anything else → dynamic.
+  std::pair<bool, long long> resolve_index_statically(
+      const std::string &idx_var, size_t subscript_pos,
+      size_t body_start) const {
+
+    // Walk backwards collecting assignments and conditional blocks that touch idx_var
+    long long last_literal = -1;
+    bool seen_any_assign = false;
+    bool inside_conditional = false;  // true if we found the var written inside an if/for/while
+    bool all_branches_literal = true; // for the conditional-resolve path
+    std::vector<long long> branch_values;
+
+    // We scan forward from body_start to subscript_pos (easier than backward
+    // for nested block detection), tracking depth of conditional blocks.
+    int cond_depth = 0;            // depth of if/for/while we're inside
+    bool in_runtime_cond = false;  // any enclosing condition is runtime-valued
+
+    size_t i = body_start;
+    while (i < subscript_pos && i < tokens.size()) {
+      const Token &tk = tokens[i];
+
+      // Track entry into conditional blocks
+      if (tk.type == TT::IF || tk.type == TT::ELSEIF ||
+          tk.type == TT::WHILE || tk.type == TT::FOR) {
+        // Check whether the condition references a runtime var.
+        // Scan from here to THEN/DO to find any runtime var reference.
+        size_t cond_start = i + 1;
+        size_t cond_end = cond_start;
+        while (cond_end < tokens.size() &&
+               tokens[cond_end].type != TT::THEN &&
+               tokens[cond_end].type != TT::DO &&
+               tokens[cond_end].type != TT::LBRACE)
+          cond_end++;
+        bool cond_is_runtime = false;
+        for (size_t c = cond_start; c < cond_end; ++c) {
+          if (tokens[c].type == TT::IDENTIFIER &&
+              _runtime_vars.count(tokens[c].value))
+            cond_is_runtime = true;
+        }
+        if (cond_is_runtime) in_runtime_cond = true;
+        cond_depth++;
+        i++;
+        continue;
+      }
+      if (tk.type == TT::END) {
+        if (cond_depth > 0) cond_depth--;
+        if (cond_depth == 0) in_runtime_cond = false;
+        i++;
+        continue;
+      }
+
+      // Look for assignments to idx_var: IDENTIFIER ASSIGN NUMBER
+      if (tk.type == TT::IDENTIFIER && tk.value == idx_var &&
+          i + 2 < subscript_pos &&
+          tokens[i + 1].type == TT::ASSIGN &&
+          tokens[i + 2].type == TT::NUMBER) {
+        long long val = std::stoll(tokens[i + 2].value);
+        seen_any_assign = true;
+        if (cond_depth > 0) {
+          // Inside a conditional block
+          inside_conditional = true;
+          if (in_runtime_cond) {
+            all_branches_literal = false; // can't resolve
+          } else {
+            branch_values.push_back(val);
+          }
+        } else {
+          last_literal = val;
+        }
+        i += 3;
+        continue;
+      }
+
+      // Any other write to idx_var (compound assign, ++/--, call arg, scanf) → dynamic
+      if (tk.type == TT::IDENTIFIER && tk.value == idx_var) {
+        size_t nx = i + 1;
+        if (nx < tokens.size() && (
+              tokens[nx].type == TT::PLUS_ASSIGN ||
+              tokens[nx].type == TT::MINUS_ASSIGN ||
+              tokens[nx].type == TT::MUL_ASSIGN ||
+              tokens[nx].type == TT::DIV_ASSIGN ||
+              tokens[nx].type == TT::MOD_ASSIGN ||
+              tokens[nx].type == TT::INCR ||
+              tokens[nx].type == TT::DECR)) {
+          // Compound assign/increment inside conditional → dynamic
+          if (cond_depth > 0) { all_branches_literal = false; inside_conditional = true; }
+          // Outside conditional: non-literal modification → dynamic
+          else { last_literal = -1; seen_any_assign = true; }
+        }
+        // scanf(idx_var) → mark dynamic (already in _runtime_vars but double-check)
+        if (nx < tokens.size() && tokens[nx].type == TT::COMMA) {
+          // could be a call arg — conservative: don't resolve
+          return {false, 0};
+        }
+      }
+
+      // If idx_var appears as the argument to scanf → dynamic
+      if (tk.type == TT::SCANF) {
+        // scan the arg list for idx_var
+        size_t sc = i + 1;
+        while (sc < subscript_pos && tokens[sc].type != TT::SEMICOLON) {
+          if (tokens[sc].type == TT::IDENTIFIER && tokens[sc].value == idx_var)
+            return {false, 0};
+          sc++;
+        }
+      }
+
+      i++;
+    }
+
+    if (!seen_any_assign && !inside_conditional) {
+      // idx_var was never assigned in this scope → can't determine value
+      return {false, 0};
+    }
+
+    if (inside_conditional) {
+      if (!all_branches_literal || branch_values.empty())
+        return {false, 0}; // runtime condition or non-literal branch
+      // All branches assigned literals through compile-time conditions.
+      // Use the maximum for the conservative OOB check.
+      long long max_val = *std::max_element(branch_values.begin(), branch_values.end());
+      // Also factor in any unconditional assignment
+      if (last_literal >= 0) max_val = std::max(max_val, last_literal);
+      return {true, max_val};
+    }
+
+    if (last_literal >= 0)
+      return {true, last_literal};
+
+    return {false, 0};
+  }
+
   std::string parse_primary() {
     Token &t = current();
+
+    // ── Option constructors ──────────────────────────────────────────────────
+    // Some(expr)  →  (Option__T){1, expr}
+    // The concrete type T is inferred from the argument expression.
+    if (t.type == TT::SOME_KW) {
+      Token some_tok = advance(); // consume 'Some'
+      expect(TT::LPAREN, false);
+      size_t arg_pos = pos;
+      std::string inner = parse_expr();
+      expect(TT::RPAREN, false);
+      // Infer the C type of the argument
+      std::string c_type = infer_type_at(arg_pos).c_type();
+      if (c_type.empty() || c_type == "unknown") c_type = "int"; // safe fallback
+      std::string mangled = ensure_option_struct(c_type);
+      return "(" + mangled + "){1, " + inner + "}";
+    }
+
+    // None  →  (Option__T){0}
+    // Type is resolved from context (the variable being assigned to).
+    // Because we don't always have context here, we emit a zero-initialiser
+    // and rely on C's implicit struct conversion.  When used in a typed
+    // declaration the struct type is already known by the surrounding code.
+    if (t.type == TT::NONE_KW) {
+      advance(); // consume 'None'
+      // If we can peek at what variable is being assigned (previous tokens),
+      // resolve the exact Option type.  Otherwise emit a generic sentinel
+      // that C will coerce into whatever Option__T is expected.
+      // Walk backward to find the declaring Option__* type in var_types.
+      std::string opt_type = "";
+      // Scan recent tokens backward for ASSIGN preceded by an IDENTIFIER whose
+      // var_types entry starts with "Option__"
+      if (pos >= 2) {
+        for (int _bk = (int)pos - 1; _bk >= 0 && _bk >= (int)pos - 6; _bk--) {
+          if (tokens[_bk].type == TT::IDENTIFIER) {
+            auto _vit = var_types.find(safe_name(tokens[_bk].value));
+            if (_vit != var_types.end() &&
+                _vit->second.size() > 7 &&
+                _vit->second.substr(0, 7) == "Option_") {
+              opt_type = _vit->second;
+              break;
+            }
+          }
+        }
+      }
+      if (!opt_type.empty())
+        return "(" + opt_type + "){0}";
+      // Fallback — use a compound literal of int; C will warn if the types
+      // mismatch, which is still better than a silent bug.
+      return "(" + ensure_option_struct("int") + "){0}";
+    }
 
     // F15: typeof
     if (t.type == TT::TYPEOF) {
@@ -3842,6 +5892,35 @@ private:
       return "(exit(" + code + "),0)";
     }
 
+    // Brace initializer as expression: {expr, expr, ...}
+    // Emits a C99 compound literal: (elem_t[N]){expr, ...}
+    // Element type is inferred from the first element (defaults to int).
+    if (t.type == TT::LBRACE) {
+      Token brace_tok = t;
+      advance();
+      std::vector<std::string> items;
+      TypeInfo elem_ti = TypeInfo::of("int");
+      bool first = true;
+      while (current().type != TT::RBRACE && current().type != TT::TEOF) {
+        if (first) {
+          elem_ti = infer_type_at(pos);
+          first = false;
+        }
+        items.push_back(parse_expr());
+        if (current().type == TT::COMMA)
+          advance();
+      }
+      if (current().type == TT::TEOF)
+        throw XenonError("SyntaxError",
+                         "Unterminated brace initializer — missing closing '}'",
+                         brace_tok.line, brace_tok.col);
+      expect(TT::RBRACE, false);
+      std::string elem_c = elem_ti.c_type();
+      std::string n = std::to_string(items.size());
+      // C99 compound literal — passable as a pointer to any function expecting an array
+      return "(" + elem_c + "[" + n + "]){" + join(items, ", ") + "}";
+    }
+
     if (t.type == TT::LPAREN) {
       advance();
       std::string inner = parse_expr();
@@ -3884,7 +5963,7 @@ private:
               advance();
               std::string _idx = parse_expr();
               expect(TT::RSBRACKET, false);
-              name += "[(int)(" + _idx + ")]";
+              name += "[(size_t)(" + _idx + ")]";
             } else if (current().type == TT::DOT) {
               advance();
               name += "." + expect(TT::IDENTIFIER, false).value;
@@ -3902,6 +5981,7 @@ private:
           pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
         // Accumulate namespace path, e.g.  A :: B :: sym  → ns_path="A__B", sym="sym"
         std::string ns_path = tok.value;
+        std::string ns_path_colons = tok.value; // same but with "::" separators
         advance(); advance(); // consume first ::
         std::string sym = expect(TT::IDENTIFIER, false).value;
         // Keep consuming ::IDENTIFIER as long as the next thing is also ::IDENT
@@ -3910,8 +5990,15 @@ private:
                pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
           // sym was a sub-namespace name — fold it into the path
           ns_path = ns_path + "__" + sym;
+          ns_path_colons = ns_path_colons + "::" + sym;
           advance(); advance(); // consume ::
           sym = expect(TT::IDENTIFIER, false).value;
+        }
+        // ── Module function auto-load ─────────────────────────────────────
+        // Build the full use-path: ns_path_colons + "::" + sym
+        if (current().type == TT::LPAREN) {
+          std::string full_use_path = ns_path_colons + "::" + sym;
+          maybe_load_module_call(full_use_path, tok);
         }
         std::string resolved = resolve_qualified(ns_path, sym);
         if (resolved.empty())
@@ -3958,6 +6045,8 @@ private:
           std::string resolved = resolve_ignored_ns(tok.value);
           if (!resolved.empty()) name = resolved;
         }
+        // ── Single-segment module call: use something → something() ───────
+        maybe_load_module_call(tok.value, tok);
         advance();
         return emit_call(name, tok);
       }
@@ -3996,10 +6085,111 @@ private:
       while (current().type == TT::LSBRACKET || current().type == TT::DOT ||
              current().type == TT::ARROW) {
         if (current().type == TT::LSBRACKET) {
+          size_t base_tok_pos = pos - 1;
           advance();
+          size_t idx_pos = pos;
           std::string idx = parse_expr();
           expect(TT::RSBRACKET, false);
-          name = name + "[(int)(" + idx + ")]";
+          if (_op_overloads.count("[]")) {
+            const OverloadEntry *ov = resolve_overload("[]", base_tok_pos, idx_pos);
+            if (ov) { name = ov->func_name + "(" + name + ", " + idx + ")"; continue; }
+          }
+          // ── $bounds: assert suppression ───────────────────────────────────
+          // If the token immediately before this statement is BOUNDS_ASSERT,
+          // skip all checks entirely — the programmer has asserted correctness.
+          bool _bounds_asserted = false;
+          if (pos >= 3) {
+            for (size_t _bk = pos - 1; _bk > 0 && _bk + 4 >= pos; _bk--) {
+              if (tokens[_bk].type == TT::BOUNDS_ASSERT) { _bounds_asserted = true; break; }
+              if (tokens[_bk].type == TT::SEMICOLON || tokens[_bk].type == TT::LBRACE) break;
+            }
+          }
+          if (_bounds_asserted) {
+            name = name + "[(size_t)(" + idx + ")]";
+            continue;
+          }
+          // ── Alias-aware element-count lookup ─────────────────────────────
+          const std::string *_elems_ptr = resolve_ptr_elems(name);
+          if (_memory_safe && !_in_unsafe_block && _elems_ptr != nullptr) {
+            const std::string &n_elems = *_elems_ptr;
+            // ── Look-back: try to resolve index statically ────────────────
+            // Find the enclosing function body start by scanning backward for '{'
+            size_t _body_start = 0;
+            { int _depth = 0;
+              for (size_t _bk = (pos > 0 ? pos - 1 : 0); _bk > 0; _bk--) {
+                if (tokens[_bk].type == TT::RBRACE) _depth++;
+                else if (tokens[_bk].type == TT::LBRACE) {
+                  if (_depth == 0) { _body_start = _bk + 1; break; }
+                  _depth--;
+                }
+              }
+            }
+            // Only attempt static resolution when idx is a single identifier
+            bool _static_resolved = false;
+            if (idx_pos < tokens.size() && tokens[idx_pos].type == TT::IDENTIFIER) {
+              std::string _idx_var = tokens[idx_pos].value;
+              auto [_known, _val] = resolve_index_statically(_idx_var, idx_pos, _body_start);
+              if (_known) {
+                _static_resolved = true;
+                long long _n = -1;
+                try { _n = std::stoll(n_elems); } catch (...) {}
+                if (_val < 0) {
+                  transpile_errors.push_back(
+                    XenonError("OOBAccess",
+                      "index '" + _idx_var + "' (=" + std::to_string(_val) +
+                      ") on pointer '" + name + "' is negative — undefined behaviour",
+                      tokens[idx_pos].line, tokens[idx_pos].col).what());
+                } else if (_n >= 0 && _val >= _n) {
+                  transpile_errors.push_back(
+                    XenonError("OOBAccess",
+                      "index '" + _idx_var + "' (=" + std::to_string(_val) +
+                      ") on pointer '" + name + "' is out of bounds (size=" +
+                      std::to_string(_n) + ")",
+                      tokens[idx_pos].line, tokens[idx_pos].col).what());
+                }
+                name = name + "[(size_t)(" + idx + ")]";
+                continue;
+              }
+            }
+            // Index is dynamic or non-identifier — emit runtime check with warning
+            if (!_static_resolved) {
+              emit_warning("BoundsCheck",
+                "cannot statically verify index '" + idx + "' on pointer '" + name +
+                "' — runtime bounds check inserted (suppress with '$bounds: assert' on the previous line)",
+                current().line, current().col);
+            }
+            // Emit _XEN_IDX macro (injected once)
+            if (!has_header("_XEN_IDX")) {
+              if (tcc_mode) {
+                headers.push_back(
+                  "/* ── Xenon runtime pointer safety (null + bounds) [TCC/C99] ── */\n"
+                  "#include <stdlib.h>\n"
+                  "#include <stdio.h>\n"
+                  "#define _XEN_IDX(p,i,n) \\\n"
+                  "  (((p)==NULL ? \\\n"
+                  "     (fprintf(stderr,\"[Xenon] null pointer dereference\\n\"),abort(),0) : 0), \\\n"
+                  "   ((long long)(i)<0||(long long)(i)>=(long long)(n) ? \\\n"
+                  "     (fprintf(stderr,\"[Xenon] index %lld out of bounds (size=%lld)\\n\",(long long)(i),(long long)(n)),abort(),0) : 0), \\\n"
+                  "   (p)[(size_t)(i)])\n"
+                );
+              } else {
+                headers.push_back(
+                  "/* ── Xenon runtime pointer safety (null + bounds) ── */\n"
+                  "#include <stdlib.h>\n"
+                  "#include <stdio.h>\n"
+                  "#define _XEN_IDX(p,i,n) \\\n"
+                  "  ((__builtin_expect((p)==NULL,0) ? \\\n"
+                  "     (fprintf(stderr,\"[Xenon] null pointer dereference\\n\"),abort(),0) : 0), \\\n"
+                  "   (__builtin_expect((long long)(i)<0||(long long)(i)>=(long long)(n),0) ? \\\n"
+                  "     (fprintf(stderr,\"[Xenon] index %lld out of bounds (size=%lld)\\n\",(long long)(i),(long long)(n)),abort(),0) : 0), \\\n"
+                  "   (p)[(size_t)(i)])\n"
+                );
+              }
+            }
+            name = "_XEN_IDX(" + name + ", " + idx + ", " + n_elems + ")";
+          } else {
+            name = name + "[(size_t)(" + idx + ")]";
+          }
         } else if (current().type == TT::DOT) {
           advance();
           std::string field = expect(TT::IDENTIFIER, false).value;
@@ -4021,8 +6211,40 @@ private:
               base_struct_type = vit2->second;
             }
           }
-          // Check if field is a registered method on that struct
+          // ── Option<T> built-in methods ────────────────────────────────────
+          // is_some() → opt.has_value
+          // is_none() → !opt.has_value
+          // unwrap()  → Option__T__unwrap(opt)
+          // unwrap_or(default) → Option__T__unwrap_or(opt, default)
           bool dispatched_method = false;
+          if (!base_struct_type.empty() &&
+              base_struct_type.size() > 7 &&
+              base_struct_type.substr(0, 7) == "Option_") {
+            if (field == "is_some" && current().type == TT::LPAREN) {
+              advance(); expect(TT::RPAREN, false);
+              name = "(" + name + ".has_value)";
+              dispatched_method = true;
+            } else if (field == "is_none" && current().type == TT::LPAREN) {
+              advance(); expect(TT::RPAREN, false);
+              name = "(!(" + name + ".has_value))";
+              dispatched_method = true;
+            } else if (field == "unwrap" && current().type == TT::LPAREN) {
+              advance(); expect(TT::RPAREN, false);
+              name = base_struct_type + "__unwrap(" + name + ")";
+              dispatched_method = true;
+            } else if (field == "unwrap_or" && current().type == TT::LPAREN) {
+              advance(); // consume '('
+              std::string def_val = parse_expr();
+              expect(TT::RPAREN, false);
+              name = base_struct_type + "__unwrap_or(" + name + ", " + def_val + ")";
+              dispatched_method = true;
+            } else if (field == "value" && current().type != TT::LPAREN) {
+              // Direct field access opt.value — allow it
+              name = name + ".value";
+              dispatched_method = true;
+            }
+          }
+          // Check if field is a registered method on that struct
           if (!base_struct_type.empty() && current().type == TT::LPAREN) {
             auto msit = struct_methods.find(base_struct_type);
             if (msit != struct_methods.end() && msit->second.count(field)) {
@@ -4064,13 +6286,146 @@ private:
         }
       }
       if (current().type == TT::INCR) {
+        size_t operand_pos = pos - 1;
         advance();
+        if (_op_overloads.count("++post")) {
+          const OverloadEntry *ov = resolve_overload("++post", operand_pos, operand_pos);
+          if (ov && !ov->is_binary) return ov->func_name + "(" + name + ")";
+        }
         return "(" + name + "++)";
       }
       if (current().type == TT::DECR) {
+        size_t operand_pos = pos - 1;
         advance();
+        if (_op_overloads.count("--post")) {
+          const OverloadEntry *ov = resolve_overload("--post", operand_pos, operand_pos);
+          if (ov && !ov->is_binary) return ov->func_name + "(" + name + ")";
+        }
         return "(" + name + "--)";
       }
+
+      // ── Variable existence check ─────────────────────────────────────────
+      // At this point `tok` is a bare identifier used as a value (not a function
+      // call, not namespace-qualified, not a struct field ref).  Verify it is
+      // a declared variable, known function, enum constant, type name, or
+      // C/built-in symbol.  If not, throw a clear NameError before the C
+      // compiler ever sees it.
+      //
+      // We skip the check when:
+      //   • the name starts with '_' (C internals, Xenon runtime helpers)
+      //   • the name contains '__' (mangled namespace/struct names)
+      //   • we're inside a struct method body (_cur_struct is set) — 'self'
+      //     and field names are resolved above; anything else is likely a
+      //     C-level identifier we shouldn't second-guess
+      //   • the name is "self" (always valid inside a method)
+      {
+        const std::string &raw_id = tok.value;
+        bool skip_check =
+            raw_id.empty() ||
+            raw_id[0] == '_' ||
+            raw_id.find("__") != std::string::npos ||
+            name.find("__") != std::string::npos ||  // resolved/mangled namespace name
+            raw_id == "self" ||
+            !_cur_struct.empty(); // inside method body — already handled above
+
+        if (!skip_check) {
+          bool known =
+              var_types.count(name)        || // declared variable or struct type
+              var_types.count(raw_id)      || // pre-mangling name
+              is_known_function(name)      || // user / builtin function
+              is_known_function(raw_id)    ||
+              is_known_type(name)          || // struct/enum type name used as value
+              is_known_type(raw_id)        ||
+              _enum_names.count(raw_id)    || // enum type name itself
+              builtin_types().count(raw_id)||  // primitive type keyword used as sizeof arg etc.
+              // enum *members* — they live in var_types if the enum was declared in scope,
+              // but for C-scoped enums whose members we didn't register, allow them through
+              // if the name is ALL_CAPS (common C enum convention) or is all alpha/underscore
+              // and short (heuristic: true/false/NULL-like literals).
+              raw_id == "true" || raw_id == "false" || raw_id == "NULL" ||
+              // Check ignored namespaces — a symbol imported via 'ignore namespace'
+              // may resolve without qualification
+              !resolve_ignored_ns(raw_id).empty();
+
+          // Also accept any name that resolves in the current namespace
+          if (!known && !_cur_namespace.empty()) {
+            auto &ns_map = _namespaces[_cur_namespace];
+            known = ns_map.count(raw_id) > 0;
+          }
+          // Accept enum *members*: they are not individually stored in var_types
+          // but their parent enum IS in _enum_names. We can't distinguish member
+          // names cheaply, so we allow any identifier that follows an enum name in
+          // a :: context (already handled above) or appears to be an ALL_CAPS
+          // constant (common for enum/define values).
+          if (!known) {
+            bool all_caps_or_underscore = !raw_id.empty();
+            for (char c : raw_id) {
+              if (!std::isupper((unsigned char)c) && c != '_' && !std::isdigit((unsigned char)c)) {
+                all_caps_or_underscore = false;
+                break;
+              }
+            }
+            if (all_caps_or_underscore && raw_id.size() >= 2)
+              known = true; // likely an enum member or #define constant
+          }
+
+          if (!known) {
+            // Build "did you mean?" candidates from var_types keys
+            std::vector<std::string> candidates;
+            for (const auto &[vn, _] : var_types) {
+              if (vn == "STRUCT" || vn == "GENERIC_STRUCT") continue;
+              size_t common = 0;
+              size_t minlen = std::min(vn.size(), raw_id.size());
+              for (size_t ci = 0; ci < minlen; ci++) {
+                if (vn[ci] == raw_id[ci]) common++;
+                else break;
+              }
+              if ((common >= 3 && common * 2 >= minlen) ||
+                  (minlen > 0 && common == minlen && minlen >= 2))
+                candidates.push_back(vn);
+            }
+            // Also check func_return_types for close function names
+            for (const auto &[fn, _] : func_return_types) {
+              size_t common = 0;
+              size_t minlen = std::min(fn.size(), raw_id.size());
+              for (size_t ci = 0; ci < minlen; ci++) {
+                if (fn[ci] == raw_id[ci]) common++;
+                else break;
+              }
+              if ((common >= 3 && common * 2 >= minlen) ||
+                  (minlen > 0 && common == minlen && minlen >= 2))
+                candidates.push_back(fn + "()");
+            }
+            std::string msg =
+              "Use of undeclared identifier '" + raw_id + "'.\n"
+              "  This variable has not been declared in the current scope.\n"
+              "  Declare it first, e.g.:  int " + raw_id + " = ...";
+            if (!candidates.empty()) {
+              msg += "\n  Did you mean: ";
+              for (size_t ci = 0; ci < candidates.size() && ci < 3; ci++) {
+                if (ci) msg += ", ";
+                msg += "'" + candidates[ci] + "'";
+              }
+              msg += "?";
+            }
+            throw XenonError("NameError", msg, tok.line, tok.col);
+          }
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────
+
+      // Warn when a bare function name is used as a value without calling it.
+      // The expression is valid C (it yields the function's address), but in
+      // Xenon this almost always means the user forgot the parentheses.
+      if ((is_known_function(name) || is_known_function(tok.value)) &&
+          current().type != TT::LPAREN) {
+        emit_warning("BareFunction",
+          "'" + tok.value + "' is a function but is used here without '()' — "
+          "this evaluates to the memory address of the function, not its return value.\n"
+          "  Did you mean '" + tok.value + "(...)'?",
+          tok.line, tok.col);
+      }
+
       return name;
     }
 
@@ -4949,12 +7304,14 @@ private:
   std::string emit_call(const std::string &fname, const Token &call_tok,
                         const std::string &explicit_type_arg = "") {
     // ── Undefined function check ───────────────────────────────────────────
-    // Skip the check for names that start with '_' (internal/C runtime helpers)
-    // or contain '__' (mangled namespace/struct names already validated at
-    // definition time), or are a known alias target.
+    // Skip only for '_'-prefixed C internals, or mangled names that are
+    // actually registered (definition-time validation). A mangled name that
+    // isn't registered (e.g. bogus::nonexistent() → bogus__nonexistent) must
+    // still be flagged — otherwise it silently emits broken C.
+    bool is_mangled = fname.find("__") != std::string::npos;
     bool skip_undef_check =
         (!fname.empty() && fname[0] == '_') ||
-        fname.find("__") != std::string::npos;
+        (is_mangled && is_known_function(fname));
     if (!skip_undef_check && !is_known_function(fname)) {
       // Build a helpful "did you mean?" list from func_return_types keys
       std::vector<std::string> candidates;
@@ -4987,23 +7344,389 @@ private:
     }
     // ──────────────────────────────────────────────────────────────────────
 
+    // ── .h-imported functions require unsafe { } ──────────────────────────
+    // Functions imported from C headers (.h files) are foreign and cannot be
+    // safety-verified by the compiler.  Calling them outside an unsafe block
+    // is therefore a hard error — exactly like Rust's extern "C" rule.
+    if (_h_imported_functions.count(fname) && !_in_unsafe_block) {
+      throw XenonError("SafetyError",
+        "Call to C header function '" + fname + "' outside an unsafe block.\n"
+        "  Functions imported from .h files are foreign and unverified — their\n"
+        "  memory safety, null handling, and side-effects cannot be checked.\n"
+        "  Wrap the call in an unsafe block to assert you have verified it:\n\n"
+        "      unsafe {\n"
+        "          " + fname + "(...)\n"
+        "      }\n\n"
+        "  This mirrors Rust's rule: all extern \"C\" calls require unsafe.",
+        call_tok.line, call_tok.col);
+    }
+    // ──────────────────────────────────────────────────────────────────────
+
     // Collect arg start positions BEFORE consuming them
     bool is_tmpl = template_funcs.count(fname) > 0;
     std::vector<size_t> arg_starts;
     std::vector<std::string> args;
+    // For brace-init args: record how many elements each had (-1 = not brace-init)
+    std::vector<int> arg_brace_elem_counts;
     while (current().type != TT::RPAREN) {
       if (current().type == TT::TEOF)
         throw XenonError("SyntaxError",
                            "Missing closing ')' in call to '" + fname +
                            "' — reached end of file",
                            call_tok.line, call_tok.col);
-      if (is_tmpl)
-        arg_starts.push_back(pos);
+      arg_starts.push_back(pos);
+      if (is_tmpl) { /* already pushed */ }
+      // Detect brace-init arg: peek at current token
+      bool is_brace_arg = (current().type == TT::LBRACE);
+      int brace_elems = -1;
+      if (is_brace_arg) {
+        // Count commas at depth 1 inside the braces to get element count
+        size_t scan = pos + 1; // skip opening '{'
+        int depth = 1;
+        int elem_count = (scan < tokens.size() && tokens[scan].type != TT::RBRACE) ? 1 : 0;
+        while (scan < tokens.size() && depth > 0) {
+          TT st = tokens[scan].type;
+          if (st == TT::LBRACE) { depth++; }
+          else if (st == TT::RBRACE) { depth--; }
+          else if (st == TT::COMMA && depth == 1) { elem_count++; }
+          else if (st == TT::TEOF) break;
+          scan++;
+        }
+        brace_elems = elem_count;
+      }
+      arg_brace_elem_counts.push_back(brace_elems);
       args.push_back(parse_expr());
       if (current().type == TT::COMMA)
         advance();
     }
     expect(TT::RPAREN, false);
+
+    // ── Argument count check ───────────────────────────────────────────────
+    // Only check user-defined functions (in func_param_types but NOT in
+    // builtin_functions or _h_imported_functions — those may be variadic).
+    // Also skip template functions (their param count is validated at
+    // instantiation time) and struct-method calls (self is injected).
+    if (!is_tmpl &&
+        !builtin_functions().count(fname) &&
+        !_h_imported_functions.count(fname)) {
+      auto pit = func_param_types.find(fname);
+      if (pit != func_param_types.end()) {
+        int expected = (int)pit->second.size();
+        int got_n    = (int)args.size();
+        // Struct methods have 'self' injected as the first param — callers
+        // don't pass it, so subtract 1 from expected.
+        // More reliable method detection: the stored param[0] ends with '*'
+        // and the function name contains '__' (mangled method).
+        int caller_expected = expected;
+        // Struct methods have 'self' injected as the first hidden param.
+        // A function is a true struct method iff it is registered in
+        // struct_methods[StructName] under its short (post-__) name.
+        // Namespace functions like std__string__Print are NOT in struct_methods
+        // even when their first param is a struct pointer, so they are safe.
+        {
+          size_t dpos = fname.rfind("__");
+          if (dpos != std::string::npos) {
+            std::string struct_part = fname.substr(0, dpos);
+            std::string method_part = fname.substr(dpos + 2);
+            auto smit = struct_methods.find(struct_part);
+            if (smit != struct_methods.end() && smit->second.count(method_part))
+              caller_expected = expected - 1;
+          }
+        }
+        if (got_n != caller_expected) {
+          // Build a nice param-list hint
+          std::vector<std::string> param_hints;
+          int hint_start = (caller_expected != expected) ? 1 : 0;
+          for (int pi = hint_start; pi < expected && pi < (int)pit->second.size(); pi++)
+            param_hints.push_back(pit->second[pi]);
+          std::string hint;
+          if (!param_hints.empty())
+            hint = " (" + join(param_hints, ", ") + ")";
+          std::string msg = "Wrong number of arguments to '" + fname + "':\n"
+            "  Expected " + std::to_string(caller_expected) + " argument" +
+            (caller_expected == 1 ? "" : "s") + hint + ",\n"
+            "  but got " + std::to_string(got_n) + ".\n";
+          if (got_n < caller_expected)
+            msg += "  Too few arguments — did you forget to pass something?";
+          else
+            msg += "  Too many arguments — did you pass an extra value by mistake?";
+          throw XenonError("ArgCountError", msg, call_tok.line, call_tok.col);
+        }
+      }
+    }
+    // ──────────────────────────────────────────────────────────────────────
+
+    // ── Brace-init element count check ────────────────────────────────────
+    // If a brace-init {…} is passed to a param declared as type[N],
+    // verify that the number of elements matches N exactly.
+    if (!is_tmpl &&
+        !builtin_functions().count(fname) &&
+        !_h_imported_functions.count(fname)) {
+      auto ait = func_param_array_sizes.find(fname);
+      if (ait != func_param_array_sizes.end()) {
+        const auto &param_sizes = ait->second;
+        // Determine offset: struct methods have 'self' as param[0]
+        int self_offset = 0;
+        {
+          auto pit2 = func_param_types.find(fname);
+          if (pit2 != func_param_types.end() &&
+              fname.find("__") != std::string::npos &&
+              !pit2->second.empty() && !pit2->second[0].empty() &&
+              pit2->second[0].back() == '*')
+            self_offset = 1;
+        }
+        for (size_t ai = 0; ai < arg_brace_elem_counts.size(); ai++) {
+          int bcount = arg_brace_elem_counts[ai];
+          if (bcount < 0) continue; // not a brace-init arg
+          size_t param_idx = ai + (size_t)self_offset;
+          if (param_idx >= param_sizes.size()) continue;
+          int declared_size = param_sizes[param_idx];
+          if (declared_size < 0) continue; // param has no declared array size
+          if (bcount != declared_size) {
+            int arg_line = (arg_starts[ai] < tokens.size())
+                           ? tokens[arg_starts[ai]].line : call_tok.line;
+            int arg_col  = (arg_starts[ai] < tokens.size())
+                           ? tokens[arg_starts[ai]].col  : call_tok.col;
+            std::string snip;
+            if (arg_line > 0 && !g_current_source.empty())
+              snip = extract_line_from_source(g_current_source, arg_line);
+            throw XenonError("TypeError",
+              "argument " + std::to_string((int)ai + 1) + " of '" + fname +
+              "': brace initializer has " + std::to_string(bcount) +
+              " element" + (bcount == 1 ? "" : "s") +
+              " but parameter is declared as [" + std::to_string(declared_size) +
+              "] — element count must match exactly",
+              arg_line, arg_col, snip);
+          }
+        }
+      }
+    }
+    // ──────────────────────────────────────────────────────────────────────
+
+    // ── Argument type check ────────────────────────────────────────────────
+    // For user-defined functions with known param types, verify each argument's
+    // inferred type is compatible with the declared parameter type.
+    // We skip builtins, templates (checked at instantiation), and variadic
+    // functions imported from headers.
+    if (!is_tmpl &&
+        !builtin_functions().count(fname) &&
+        !_h_imported_functions.count(fname)) {
+      auto pit = func_param_types.find(fname);
+      if (pit != func_param_types.end()) {
+        // Save and restore pos around type inference (non-destructive peek)
+        size_t saved_pos = pos;
+        const auto &ptypes = pit->second;
+        int pidx = 0;
+        // Walk argument_starts list for type inference; rebuild by rescanning
+        // the already-parsed args list via saved arg_starts collected below.
+        // We re-scan from just after the LPAREN of the call to infer each arg.
+        // pos is now just after the RPAREN — re-scan from saved arg positions.
+        // Use infer_type_at on the token positions of each arg.
+        // Re-build the list of arg token positions by re-scanning from LPAREN.
+        {
+          // Find the LPAREN that opened this call: it's at (saved call_tok pos + 1)
+          // We stored the call token; re-scan from there to collect arg start positions.
+          size_t scan_pos = saved_pos; // pos is now PAST the closing RPAREN
+          // Walk backwards from saved_pos to find the LPAREN:
+          // Actually, we need the start positions of the args.
+          // Easier: we recorded args already; walk the tokens from call_tok.col
+          // forward.  We'll use a fresh scan starting from just before pos was
+          // advanced past RPAREN.
+          // Simplest correct approach: rescan from the token after the fname token.
+          // We know fname was at (call_tok position).  Find it in the token stream.
+          // Rather than tracking it precisely, we do a lightweight rescan:
+          // find the LPAREN right after this fname in the window just before saved_pos.
+          size_t lp_pos = saved_pos; // fallback
+          // search backward for the LPAREN that belongs to this call
+          // (safe because we just parsed the call and pos is at next token)
+          if (lp_pos > 0) {
+            size_t back = lp_pos;
+            while (back > 0 && tokens[back].type != TT::RPAREN) back--;
+            // Now find the matching LPAREN before that RPAREN
+            int dep = 0;
+            size_t rp = back;
+            for (size_t k = rp; k > 0; k--) {
+              if (tokens[k].type == TT::RPAREN) dep++;
+              else if (tokens[k].type == TT::LPAREN) {
+                dep--;
+                if (dep == 0) { lp_pos = k; break; }
+              }
+            }
+          }
+          // Collect arg start positions
+          std::vector<size_t> arg_tok_starts;
+          {
+            size_t k = lp_pos + 1;
+            int dep = 0;
+            size_t cur_start = k;
+            while (k < saved_pos && tokens[k].type != TT::RPAREN) {
+              if (tokens[k].type == TT::LPAREN || tokens[k].type == TT::LSBRACKET) dep++;
+              else if (tokens[k].type == TT::RPAREN || tokens[k].type == TT::RSBRACKET) {
+                if (dep == 0) break;
+                dep--;
+              } else if (tokens[k].type == TT::COMMA && dep == 0) {
+                arg_tok_starts.push_back(cur_start);
+                cur_start = k + 1;
+              }
+              k++;
+            }
+            if (cur_start < k) arg_tok_starts.push_back(cur_start);
+          }
+
+          // Adjust pidx for struct methods (self is implicit)
+          int ptype_start = 0;
+          if (fname.find("__") != std::string::npos &&
+              !ptypes.empty() && !ptypes[0].empty() &&
+              ptypes[0].back() == '*')
+            ptype_start = 1;
+
+          for (size_t ai = 0; ai < arg_tok_starts.size(); ai++) {
+            int pi = (int)ai + ptype_start;
+            if (pi >= (int)ptypes.size()) break;
+            const std::string &expected_c = ptypes[pi];
+            if (expected_c.empty()) continue;
+
+            // Infer the type of the argument at this token position
+            size_t arg_pos = arg_tok_starts[ai];
+            // Skip leading whitespace-equivalent tokens
+            while (arg_pos < saved_pos &&
+                   (tokens[arg_pos].type == TT::COMMA)) arg_pos++;
+            if (arg_pos >= saved_pos) continue;
+
+            pos = arg_pos;
+            TypeInfo arg_ti = infer_ti_ternary();
+            std::string got_c = arg_ti.c_type();
+
+            pos = saved_pos; // restore regardless
+
+            if (got_c.empty() || got_c == "?" || expected_c == "void*") continue;
+
+            // Compute compatibility: identical or numeric promotions are fine.
+            // We only hard-error on clear category mismatches
+            // (pointer vs scalar, or str/char* vs int, etc.).
+            bool expected_is_ptr = (!expected_c.empty() && expected_c.back() == '*');
+            bool got_is_ptr      = (!got_c.empty()      && got_c.back()      == '*');
+
+            // Different pointer/scalar categories → definite mismatch
+            if (expected_is_ptr != got_is_ptr) {
+              // Exception: null literal (void*) can be passed for any ptr param
+              if (got_c == "void*" && expected_is_ptr) continue;
+              // Exception: 0 literal inferred as int but intended as null ptr
+              // (user wrote `consume(0)`) — let C compiler handle it
+              if (got_c == "int" && expected_is_ptr) continue;
+
+              std::string friendly_expected = expected_c;
+              std::string friendly_got      = got_c;
+              // Make pointer types a bit friendlier in error messages
+              auto friendlify = [](const std::string &ct) -> std::string {
+                if (ct == "char*") return "str";
+                if (ct == "void*") return "ptr";
+                if (ct.size() > 1 && ct.back() == '*')
+                  return "ptr " + ct.substr(0, ct.size() - 1);
+                return ct;
+              };
+              std::string exp_f = friendlify(friendly_expected);
+              std::string got_f = friendlify(friendly_got);
+
+              // Find the token line/col for the argument
+              int arg_line = (arg_tok_starts[ai] < tokens.size())
+                             ? tokens[arg_tok_starts[ai]].line : 0;
+              int arg_col  = (arg_tok_starts[ai] < tokens.size())
+                             ? tokens[arg_tok_starts[ai]].col  : 0;
+              std::string snip;
+              if (arg_line > 0 && !g_current_source.empty())
+                snip = extract_line_from_source(g_current_source, arg_line);
+
+              throw XenonError("TypeError",
+                "argument " + std::to_string((int)ai + 1) + " of '" + fname + "': "
+                "expected '" + exp_f + "' but got '" + got_f + "' — "
+                "types are incompatible (pass a value of the correct type, "
+                "or use cast() for an explicit conversion)",
+                arg_line, arg_col, snip);
+            }
+
+            // Same category (both pointers or both scalars):
+            // within-category mismatches (e.g. int* vs char*) are caught here.
+            if (expected_is_ptr && got_is_ptr && expected_c != got_c) {
+              // void* on either side is compatible (C-style generic pointer)
+              if (expected_c == "void*" || got_c == "void*") continue;
+              // char* ↔ str — same underlying type
+              if ((expected_c == "char*" || got_c == "char*") &&
+                  (expected_c == "char*" || got_c == "char*")) continue;
+
+              auto friendlify_ptr = [](const std::string &ct) -> std::string {
+                if (ct == "char*") return "str";
+                if (ct == "void*") return "ptr";
+                if (ct.size() > 1 && ct.back() == '*')
+                  return "ptr " + ct.substr(0, ct.size() - 1);
+                return ct;
+              };
+
+              int arg_line = (arg_tok_starts[ai] < tokens.size())
+                             ? tokens[arg_tok_starts[ai]].line : 0;
+              int arg_col  = (arg_tok_starts[ai] < tokens.size())
+                             ? tokens[arg_tok_starts[ai]].col  : 0;
+              std::string snip;
+              if (arg_line > 0 && !g_current_source.empty())
+                snip = extract_line_from_source(g_current_source, arg_line);
+
+              throw XenonError("TypeError",
+                "argument " + std::to_string((int)ai + 1) + " of '" + fname + "': "
+                "expected '" + friendlify_ptr(expected_c) +
+                "' but got '" + friendlify_ptr(got_c) + "' — "
+                "pointer types do not match; use cast() for an explicit reinterpret",
+                arg_line, arg_col, snip);
+            }
+
+            // ── Scalar-vs-scalar type mismatch ─────────────────────────────
+            // Both are non-pointer scalars: flag clear category mismatches.
+            // We allow numeric promotions (int→float, int→double, etc.) since
+            // C does these implicitly and they are safe. We flag:
+            //   • bool/char passed where a numeric type is expected and vice-versa
+            //     only when the mismatch is an unambiguous programmer error.
+            // Concretely: str(char*) vs any scalar already caught above.
+            // Additional case: struct type passed where a numeric type expected
+            // (and vice-versa) — but we can't easily detect that without
+            // tracking struct names through TypeInfo, so we skip it here.
+            if (!expected_is_ptr && !got_is_ptr && expected_c != got_c) {
+              // Build a numeric-type set
+              static const std::set<std::string> numeric_types = {
+                "int","long","short","float","double",
+                "uint8_t","uint32_t","uint64_t","bool","char"
+              };
+              bool exp_numeric = numeric_types.count(expected_c) > 0;
+              bool got_numeric = numeric_types.count(got_c)      > 0;
+
+              // Both numeric → safe C promotion, allow it (int→float etc.)
+              if (exp_numeric && got_numeric) {
+                // Only hard-error on truly incompatible combos:
+                // passing a float/double where a pointer-sized int is expected
+                // is not something we catch here — C handles it.
+                // So: no error for numeric↔numeric mismatches.
+              } else if (exp_numeric != got_numeric && !got_c.empty() && got_c != "int") {
+                // One side is numeric, the other is a struct/unknown type.
+                // Only fire when we have real type info on both sides.
+                int arg_line2 = (arg_tok_starts[ai] < tokens.size())
+                               ? tokens[arg_tok_starts[ai]].line : 0;
+                int arg_col2  = (arg_tok_starts[ai] < tokens.size())
+                               ? tokens[arg_tok_starts[ai]].col  : 0;
+                std::string snip2;
+                if (arg_line2 > 0 && !g_current_source.empty())
+                  snip2 = extract_line_from_source(g_current_source, arg_line2);
+                throw XenonError("TypeError",
+                  "argument " + std::to_string((int)ai + 1) + " of '" + fname + "': "
+                  "expected '" + expected_c + "' but got '" + got_c + "' — "
+                  "numeric type and struct/opaque type are incompatible; "
+                  "check you are passing the correct value",
+                  arg_line2, arg_col2, snip2);
+              }
+            }
+          }
+        }
+        pos = saved_pos; // final restore (defensive)
+      }
+    }
+    // ──────────────────────────────────────────────────────────────────────
 
     std::string call_name = fname;
     if (is_tmpl) {
@@ -5148,11 +7871,18 @@ private:
         if (pos + 1 < tokens.size() && tokens[pos + 1].type == TT::IDENTIFIER)
           struct_name = tokens[pos + 1].value;
         std::string code = parse_type_definition();
+        std::string mangled_name = struct_name.empty() ? "" : (fq_ns_name + "__" + struct_name);
         if (!code.empty()) {
           headers.push_back(line_directive(t) + code);
-          // Register struct in namespace
-          if (!struct_name.empty())
-            ns_map[struct_name] = fq_ns_name + "__" + struct_name;
+        }
+        // Register in namespace map whether or not code was emitted (generic structs return "")
+        if (!struct_name.empty()) {
+          ns_map[struct_name] = mangled_name;
+          // Also register bare name in var_types so inner-namespace code can
+          // use the short name (e.g. MyStruct x = ...) without qualification.
+          auto it_vt = var_types.find(mangled_name);
+          if (it_vt != var_types.end())
+            var_types[struct_name] = it_vt->second; // propagate STRUCT/GENERIC_STRUCT tag
         }
       } else if (t.type == TT::ENUM_KW) {
         std::string code = parse_enum();
@@ -5256,10 +7986,42 @@ private:
       advance();
     Token &t = current();
 
+    // $bounds: assert — consume the annotation token, emit no C code.
+    // Its presence in the token stream is detected by the subscript codegen
+    // on the NEXT statement to suppress bounds checking.
+    if (t.type == TT::BOUNDS_ASSERT) {
+      advance();
+      return "";
+    }
+
+    // $attribute: drop — valid only inside a 'type' body.  If seen here it
+    // means the user placed it outside a struct, which is a syntax error.
+    if (t.type == TT::ATTR_DROP) {
+      throw XenonError("SyntaxError",
+        "'$attribute: drop' is only valid inside a 'type' body before a function definition. "
+        "Move it inside the struct that owns the destructor.",
+        t.line, t.col);
+    }
+
     if (t.type == TT::TYPE)
       return parse_type_definition();
     if (t.type == TT::ENUM_KW)
       return parse_enum();
+
+    // use module::something  — import a module path for later qualified calls
+    if (t.type == TT::USE_KW) {
+      advance();
+      // Collect the module path: one or more IDENTIFIER separated by ::
+      // e.g.  use module::something  ->  "module::something"
+      std::string module_path = expect(TT::IDENTIFIER, false).value;
+      while (current().type == TT::COLON &&
+             pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
+        advance(); advance(); // consume ::
+        module_path += "::" + expect(TT::IDENTIFIER, false).value;
+      }
+      _used_modules.insert(module_path);
+      return "";
+    }
 
     // in namespace NAME are { ... }
     if (t.type == TT::IN_KW) {
@@ -5354,7 +8116,7 @@ private:
                          unsafe_tok.line, unsafe_tok.col);
       expect(TT::RBRACE, false);
       _in_unsafe_block = prev_unsafe;
-      return "/* unsafe */ {\n" + join(body_stmts, "\n") + "\n}";
+      return "/* unsafe: begin */\n" + join(body_stmts, "\n") + "\n/* unsafe: end */";
     }
 
     if (t.type == TT::HLT) {
@@ -5692,13 +8454,71 @@ private:
       // emit_scanf and other raw-type consumers work correctly (e.g. "str" not
       // "char*")
       var_types[name] = c_type_to_raw(inferred_type);
+
+      // ── RAII: let/var from heap allocators get __attribute__((cleanup)) ──
+      if (!tcc_mode && !inferred_type.empty() && inferred_type.back() == '*') {
+        bool is_heap = false;
+        static const std::vector<std::string> alloc_names = {"malloc","calloc","realloc"};
+        for (const auto &an : alloc_names) {
+          if (val.find(an + "(") != std::string::npos ||
+              val.find(an + " (") != std::string::npos) {
+            is_heap = true; break;
+          }
+        }
+        if (is_heap) {
+          ensure_raii_free_shim();
+          _raii_var_drop_expr[name] = "/* RAII-freed */";
+          return inferred_type + " __attribute__((cleanup(_xen_raii_free_ptr_))) " + name + " = " + val + ";";
+        }
+      }
+
       return inferred_type + " " + name + " = " + val + ";";
+    }
+
+    // ── Option<T> variable declaration ───────────────────────────────────────
+    // Syntax:  Option<int> x            (uninitialized, starts as None)
+    //          Option<int> x = Some(5)
+    //          Option<str> x = None
+    if (t.type == TT::OPTION_KW) {
+      Token opt_tok = advance(); // consume 'Option'
+      expect(TT::LT, false);    // consume '<'
+      // Collect inner type (may be ptr T or a keyword/identifier)
+      std::string inner_raw;
+      bool inner_is_ptr = false;
+      if (current().type == TT::PTR) {
+        advance(); inner_is_ptr = true;
+        inner_raw = advance().value;
+      } else {
+        inner_raw = advance().value;
+      }
+      expect(TT::GT, false); // consume '>'
+      std::string c_inner = raw_to_c(inner_raw);
+      if (inner_is_ptr) c_inner += "*";
+      std::string mangled = ensure_option_struct(c_inner);
+
+      std::string varname = safe_name(expect(TT::IDENTIFIER, false).value);
+      var_types[varname] = mangled;
+
+      if (current().type == TT::ASSIGN) {
+        advance();
+        std::string rhs = parse_expr();
+        return mangled + " " + varname + " = " + rhs + ";";
+      }
+      // Default to None
+      return mangled + " " + varname + " = {0};";
     }
 
     // Type declarations (var decl)
     // Handle generic struct instantiation: Vec<int> x = ...
-    if (t.type == TT::IDENTIFIER && _generic_structs.count(safe_name(t.value))) {
-      std::string gen_name = safe_name(advance().value);
+    // Also handles namespace-qualified generic structs (e.g. ns::Vec<int> from inside ns)
+    {
+      std::string gen_lookup = safe_name(t.value);
+      // Try namespace-mangled name if bare name not found
+      if (t.type == TT::IDENTIFIER && !_generic_structs.count(gen_lookup) && !_cur_namespace.empty())
+        gen_lookup = _cur_namespace + "__" + gen_lookup;
+    if (t.type == TT::IDENTIFIER && _generic_structs.count(gen_lookup)) {
+      advance(); // consume the struct name token
+      std::string gen_name = gen_lookup; // use the resolved (possibly mangled) name
       if (current().type == TT::LT) {
         advance(); // consume '<'
         // collect concrete type (may be 'ptr X' or a plain keyword/identifier)
@@ -5742,11 +8562,35 @@ private:
       }
       return gen_name + " " + varname + ";";
     }
+    } // end gen_lookup scope, considering the current
+    // namespace.  Returns the mangled name if found, or "" otherwise.
+    auto resolve_type_name = [&](const std::string &raw) -> std::string {
+      // 1. Direct lookup (already mangled or global)
+      auto it = var_types.find(raw);
+      if (it != var_types.end() && (it->second == "STRUCT" || it->second == "GENERIC_STRUCT"))
+        return raw;
+      // 2. Namespace-qualified: ns__raw
+      if (!_cur_namespace.empty()) {
+        std::string mangled = _cur_namespace + "__" + raw;
+        auto it2 = var_types.find(mangled);
+        if (it2 != var_types.end() && (it2->second == "STRUCT" || it2->second == "GENERIC_STRUCT"))
+          return mangled;
+      }
+      // 3. Ignored namespaces
+      for (auto &ns : _ignored_namespaces) {
+        std::string r = resolve_qualified(ns, raw);
+        if (!r.empty()) {
+          auto it3 = var_types.find(r);
+          if (it3 != var_types.end() && (it3->second == "STRUCT" || it3->second == "GENERIC_STRUCT"))
+            return r;
+        }
+      }
+      return "";
+    };
 
     bool is_custom =
         (t.type == TT::IDENTIFIER &&
-         ((var_types.count(t.value) && var_types[t.value] == "STRUCT") ||
-          _enum_names.count(t.value)));
+         (!resolve_type_name(t.value).empty() || _enum_names.count(t.value)));
 
     // ── Unknown type check ────────────────────────────────────────────────
     // Pattern: IDENTIFIER IDENTIFIER  →  "TYPE varName" declaration.
@@ -5799,6 +8643,68 @@ private:
         throw XenonError("TypeError", tmsg, t.line, t.col);
       }
     }
+    // ── Namespace-qualified type declaration: NS::Type varName [= expr] ──────
+    // Pattern: IDENTIFIER COLON COLON IDENTIFIER IDENTIFIER
+    // e.g.  Math::Vec v = ...   or   Gfx::Sprite s
+    // The existing type_decl_toks block only handles bare type names; qualified
+    // ones fall through silently and produce broken C.  Catch and validate here.
+    if (t.type == TT::IDENTIFIER &&
+        pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON &&
+        pos + 2 < tokens.size() && tokens[pos + 2].type == TT::COLON &&
+        pos + 3 < tokens.size() && tokens[pos + 3].type == TT::IDENTIFIER &&
+        pos + 4 < tokens.size() && tokens[pos + 4].type == TT::IDENTIFIER) {
+      // Consume NS :: TypeName
+      std::string ns_tok = advance().value;       // NS
+      advance(); advance();                        // ::
+      std::string type_tok_val = advance().value;  // TypeName
+      // Build mangled name — handle chained NS::Sub::Type via loop
+      std::string mangled_type = ns_tok + "__" + type_tok_val;
+      while (current().type == TT::COLON &&
+             pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON &&
+             pos + 2 < tokens.size() && tokens[pos + 2].type == TT::IDENTIFIER) {
+        advance(); advance(); // ::
+        mangled_type += "__" + advance().value;
+      }
+      // Validate the resolved type actually exists
+      if (!is_known_type(mangled_type) && !var_types.count(mangled_type)) {
+        // Build candidates
+        std::vector<std::string> type_candidates;
+        for (const auto &[tn, tv] : var_types) {
+          if (tv == "STRUCT" || tv == "GENERIC_STRUCT") {
+            size_t common = 0;
+            size_t minlen = std::min(tn.size(), mangled_type.size());
+            for (size_t ci = 0; ci < minlen; ci++) {
+              if (tn[ci] == mangled_type[ci]) common++;
+              else break;
+            }
+            if (common >= 3 || (minlen > 0 && common * 2 >= minlen))
+              type_candidates.push_back(tn);
+          }
+        }
+        std::string display = ns_tok + "::" + type_tok_val;
+        std::string tmsg = "Unknown type '" + display + "'.\n"
+          "  Resolved to '" + mangled_type + "' — not found in any imported namespace.\n"
+          "  If this type is defined in a .xen file, add: link \"the_file.xen\"\n"
+          "  If it is from a C header, add: link \"the_header.h\"";
+        if (!type_candidates.empty()) {
+          tmsg += "\n  Did you mean: ";
+          for (size_t ci = 0; ci < type_candidates.size() && ci < 3; ci++) {
+            if (ci) tmsg += ", ";
+            tmsg += "'" + type_candidates[ci] + "'";
+          }
+          tmsg += "?";
+        }
+        throw XenonError("TypeError", tmsg, t.line, t.col);
+      }
+      // Emit the declaration
+      std::string varname = safe_name(expect(TT::IDENTIFIER, false).value);
+      var_types[varname] = mangled_type;
+      if (current().type == TT::ASSIGN) {
+        advance();
+        return mangled_type + " " + varname + " = " + parse_expr() + ";";
+      }
+      return mangled_type + " " + varname + ";";
+    }
     // ─────────────────────────────────────────────────────────────────────
     static const std::set<TT> type_decl_toks = {
         TT::INT,     TT::FLOAT,   TT::STR,  TT::PTR,  TT::LONG,
@@ -5807,6 +8713,13 @@ private:
 
     if (type_decl_toks.count(t.type) || is_custom) {
       std::string vtype_raw = advance().value;
+      // If vtype_raw is a bare struct name that resolves via namespace, use the
+      // mangled name for C emission while keeping vtype_raw for var_types tracking.
+      std::string vtype_raw_resolved = resolve_type_name(vtype_raw);
+      if (!vtype_raw_resolved.empty() && vtype_raw_resolved != vtype_raw) {
+        // Keep vtype_raw as-is for the var_types tag, but use mangled for C output
+        // We'll fix it up below by overriding vtype.
+      }
       std::string vtype;
       static const std::map<std::string, std::string> umap = {
           {"u8", "uint8_t"}, {"u32", "uint32_t"}, {"u64", "uint64_t"}};
@@ -5841,10 +8754,14 @@ private:
         } else {
           vtype = (vtype_raw == "str") ? "char*" : vtype_raw;
         }
+        // If the bare name resolved to a namespace-mangled struct, use mangled
+        if (!vtype_raw_resolved.empty() && vtype_raw_resolved != vtype_raw)
+          vtype = vtype_raw_resolved;
       }
 
       std::string name = safe_name(expect(TT::IDENTIFIER, false).value);
-      var_types[name] = vtype_raw;
+      // Store the resolved (mangled) type name in var_types so field access etc. works
+      var_types[name] = vtype_raw_resolved.empty() ? vtype_raw : vtype_raw_resolved;
 
       // array
       if (current().type == TT::LSBRACKET) {
@@ -5875,7 +8792,150 @@ private:
       // with init
       if (current().type == TT::ASSIGN) {
         advance();
-        return vtype + " " + name + " = " + parse_expr() + ";";
+        // Check for operator(=) overload — e.g. String a = "hi" should invoke
+        // the user-defined = overload if one is registered.
+        // We must capture rhs_pos BEFORE parse_expr() consumes the tokens.
+        if (_op_overloads.count("=") && is_custom) {
+          size_t rhs_pos = pos; // token position of the RHS (used for type inference)
+          std::string rhs = parse_expr();
+          const OverloadEntry *ov = resolve_overload("=", rhs_pos, rhs_pos);
+          if (ov) {
+            // Declare uninitialized, then call the overload with a pointer to
+            // the lhs so the overload can mutate the real variable.
+            // The overload returns void — no assignment prefix.
+            return vtype + " " + name + ";\n    " +
+                   ov->func_name + "(&" + name + ", " + rhs + ");";
+          }
+          return vtype + " " + name + " = " + rhs + ";";
+        }
+        // ── Runtime bounds tracking for heap-pointer subscripts ─────────────
+        // Peek at the RHS before consuming it: if it's malloc/calloc/realloc,
+        // compute the element count (alloc_bytes / sizeof(elem)) and store it
+        // in _ptr_alloc_elems[name] as a C expression so that parse_primary
+        // can wrap subscripts with a runtime bounds + null check.
+        // We do this here (parse time) because scan_body_for_unsafe_ops runs
+        // after code generation and cannot influence the emitted C.
+        if (vtype_raw == "ptr" &&
+            pos < tokens.size() && tokens[pos].type == TT::IDENTIFIER &&
+            token_is_heap_alloc(tokens[pos].value)) {
+          // The elem type is the pointee of vtype, e.g. "int*" → "int"
+          std::string pointee = vtype;
+          if (!pointee.empty() && pointee.back() == '*')
+            pointee = pointee.substr(0, pointee.size() - 1);
+          // Snapshot token range for the call: IDENT LPAREN ... RPAREN
+          size_t call_start = pos;
+          // Find the closing RPAREN
+          size_t scan = pos + 1;
+          if (scan < tokens.size() && tokens[scan].type == TT::LPAREN) {
+            size_t d2 = 1; scan++;
+            while (scan < tokens.size() && d2 > 0) {
+              if (tokens[scan].type == TT::LPAREN) d2++;
+              else if (tokens[scan].type == TT::RPAREN) d2--;
+              if (d2 > 0) scan++;
+            }
+            size_t call_end = scan + 1; // past RPAREN
+            auto [nbytes, det_type] = parse_malloc_args(tokens, call_start, call_end, var_types);
+            std::string actual_elem = det_type.empty() ? pointee : det_type;
+            long long esz = get_sizeof_type(actual_elem);
+            if (nbytes > 0 && esz > 0) {
+              // Compile-time known: store literal element count
+              _ptr_alloc_elems[name] = std::to_string(nbytes / esz);
+            } else if (!actual_elem.empty() && esz > 0) {
+              // Bytes unknown at compile time but element size is known:
+              // Emit a C expression: the malloc arg text divided by sizeof
+              // Reconstruct the malloc argument as source text
+              size_t arg_s = call_start + 2; // skip IDENT + LPAREN
+              std::string arg_text;
+              int dd = 0;
+              for (size_t k = arg_s; k < tokens.size(); k++) {
+                if (tokens[k].type == TT::RPAREN && dd == 0) break;
+                if (tokens[k].type == TT::LPAREN) dd++;
+                else if (tokens[k].type == TT::RPAREN) dd--;
+                if (!arg_text.empty()) arg_text += " ";
+                arg_text += tokens[k].value;
+              }
+              if (!arg_text.empty())
+                _ptr_alloc_elems[name] = "((" + arg_text + ") / sizeof(" + actual_elem + "))";
+            }
+          }
+        } else if (vtype_raw == "ptr" &&
+                   pos < tokens.size() && tokens[pos].type == TT::IDENTIFIER &&
+                   !token_is_heap_alloc(tokens[pos].value)) {
+          // ── Alias tracking: ptr double q = p ─────────────────────────────
+          // The RHS is a plain identifier (not malloc). If it resolves to a
+          // tracked pointer, record q as an alias of p so subscripts on q
+          // inherit the element-count bounds.
+          std::string rhs_name = safe_name(tokens[pos].value);
+          if (resolve_ptr_elems(rhs_name) != nullptr)
+            _ptr_aliases[name] = rhs_name;
+        }
+
+        // ── RAII: ptr vars from heap allocators get __attribute__((cleanup)) ──
+        // This causes the C compiler to emit free() automatically at scope exit,
+        // covering all paths (early return, break, etc.) with zero runtime cost.
+        // Disabled in TCC mode (which doesn't support __attribute__((cleanup))).
+        bool _is_heap_init = (vtype_raw == "ptr" && !tcc_mode &&
+                              pos < tokens.size() &&
+                              tokens[pos].type == TT::IDENTIFIER &&
+                              token_is_heap_alloc(tokens[pos].value));
+        // (pos now points at the RHS — check BEFORE we parse_expr())
+        // We need to snapshot whether current RHS is a heap alloc; pos hasn't moved yet.
+        // Re-check after alias detection: if vtype_raw == "ptr" and the prev token
+        // was a heap allocator, _is_heap_init is still valid.
+        (void)_is_heap_init; // used below after RHS parsing
+
+        // Parse the RHS
+        std::string rhs_expr = parse_expr();
+
+        if (vtype_raw == "ptr" && !tcc_mode) {
+          // Re-detect heap init from what we know: _ptr_alloc_elems[name] was
+          // populated iff this was a heap alloc (set above in the malloc-tracking
+          // block).  Use that as the signal.
+          bool was_heap = _ptr_alloc_elems.count(name) > 0 ||
+                          // Also catch: ptr T x = malloc(...)  even when compile-time
+                          // size is unknown (alloc_bytes == -1 but elem_type recorded).
+                          false; // conservative: only auto-free when we tracked it
+          // Broader: any ptr = allocator_call should be RAII-freed.
+          // We detect by scanning rhs_expr for the alloc name prefix.
+          static const std::vector<std::string> alloc_prefixes = {"malloc","calloc","realloc"};
+          for (const auto &ap : alloc_prefixes) {
+            if (rhs_expr.find(ap + "(") != std::string::npos ||
+                rhs_expr.find(ap + " (") != std::string::npos) {
+              was_heap = true;
+              break;
+            }
+          }
+          if (was_heap) {
+            ensure_raii_free_shim();
+            // We must cast the pointer-to-variable to void** for the shim.
+            // Declare as void* with __attribute__((cleanup)) but store in the
+            // original typed variable.  The cleanest approach: declare the typed
+            // variable normally, then declare a void* alias with the cleanup attr
+            // that aliases the typed var.  But C forbids aliasing of different types.
+            //
+            // Instead: declare as the exact pointer type WITH __attribute__((cleanup)).
+            // The cleanup function prototype expects void**, which GCC/Clang accept
+            // because the attribute only names the function — types are checked at the
+            // call generated by the compiler which uses a compatible __typeof__ cast.
+            // This is the standard GCC RAII idiom.
+            _raii_var_drop_expr[name] = "/* RAII-freed */";
+            return vtype + " __attribute__((cleanup(_xen_raii_free_ptr_))) " + name + " = " + rhs_expr + ";";
+          }
+        }
+
+        // ── RAII: struct vars with $attribute: drop ──────────────────────────
+        // If the declared type has a registered drop function, attach cleanup.
+        {
+          std::string struct_lookup = vtype_raw_resolved.empty() ? vtype_raw : vtype_raw_resolved;
+          if (!tcc_mode && struct_drop_funcs.count(struct_lookup)) {
+            ensure_raii_drop_shim(struct_lookup);
+            _raii_var_drop_expr[name] = struct_lookup + "__drop(&" + name + ")";
+            std::string shim_fn = "_xen_raii_drop_" + struct_lookup + "_";
+            return vtype + " __attribute__((cleanup(" + shim_fn + "))) " + name + " = " + rhs_expr + ";";
+          }
+        }
+
+        return vtype + " " + name + " = " + rhs_expr + ";";
       }
       // no init — BUG-M FIXED
       if (vtype_raw == "str")
@@ -5887,6 +8947,18 @@ private:
 
       if (umap.count(vtype_raw))
         return vtype + " " + name + " = 0;";
+
+      // ── RAII: struct vars with $attribute: drop (no-init case) ───────────
+      {
+        std::string struct_lookup = vtype_raw_resolved.empty() ? vtype_raw : vtype_raw_resolved;
+        if (!tcc_mode && struct_drop_funcs.count(struct_lookup)) {
+          ensure_raii_drop_shim(struct_lookup);
+          _raii_var_drop_expr[name] = struct_lookup + "__drop(&" + name + ")";
+          std::string shim_fn = "_xen_raii_drop_" + struct_lookup + "_";
+          return vtype + " __attribute__((cleanup(" + shim_fn + "))) " + name + ";";
+        }
+      }
+
       return vtype + " " + name + ";";
     }
 
@@ -5979,6 +9051,92 @@ private:
     }
 
     // if
+    // ── if let Some(x) = opt then ... [else ...] end ─────────────────────────
+    // Desugars to:
+    //   if (opt.has_value) { T x = opt.value; ... }
+    // Pattern: IF LET_KW SOME_KW LPAREN IDENTIFIER RPAREN ASSIGN expr THEN body END
+    if (t.type == TT::IF &&
+        pos + 1 < tokens.size() && tokens[pos + 1].type == TT::LET_KW) {
+      Token if_tok = advance(); // consume 'if'
+      advance();                // consume 'let'
+      if (current().type != TT::SOME_KW)
+        throw XenonError("SyntaxError",
+          "'if let' must be followed by 'Some(binding)'"
+          " (e.g. 'if let Some(x) = opt then ... end')",
+          if_tok.line, if_tok.col);
+      advance(); // consume 'Some'
+      expect(TT::LPAREN, false);
+      Token bind_tok = current();
+      std::string binding = safe_name(expect(TT::IDENTIFIER, false).value);
+      expect(TT::RPAREN, false);
+      expect(TT::ASSIGN, false);
+      // Parse the Option expression being tested
+      std::string opt_expr = parse_expr();
+      expect(TT::THEN, false);
+
+      // Figure out the concrete inner type from opt_expr's var_types entry
+      // (best-effort: fall back to "int" so we always emit valid C)
+      std::string inner_c_type = "int";
+      std::string opt_struct_type = "";
+      // opt_expr is typically a plain identifier — check var_types
+      {
+        std::string bare = opt_expr;
+        // strip any trailing whitespace/parens that parse_expr may have added
+        while (!bare.empty() && (bare.back() == ' ' || bare.back() == ')')) bare.pop_back();
+        auto vit = var_types.find(bare);
+        if (vit != var_types.end() &&
+            vit->second.size() > 7 &&
+            vit->second.substr(0, 7) == "Option_") {
+          opt_struct_type = vit->second;
+          // inner type = field "value" type in struct_field_types
+          auto fit = struct_field_types.find(opt_struct_type);
+          if (fit != struct_field_types.end()) {
+            auto fvit = fit->second.find("value");
+            if (fvit != fit->second.end())
+              inner_c_type = fvit->second;
+          }
+        }
+      }
+
+      // Snapshot scope, add binding inside body scope
+      auto scope_let = var_types;
+      var_types[binding] = inner_c_type;
+
+      std::vector<std::string> body;
+      // Emit binding declaration as first statement in block
+      body.push_back("    " + inner_c_type + " " + binding + " = (" + opt_expr + ").value;");
+      while (current().type != TT::ELSE && current().type != TT::END &&
+             current().type != TT::TEOF) {
+        Token tok2 = current();
+        std::string s = parse_statement();
+        if (!s.empty()) body.push_back(line_directive(tok2) + "    " + s);
+      }
+      if (current().type == TT::TEOF)
+        throw XenonError("SyntaxError",
+          "Unterminated 'if let' — missing 'end'",
+          if_tok.line, if_tok.col);
+
+      var_types = scope_let;
+
+      std::string else_part;
+      if (current().type == TT::ELSE) {
+        advance();
+        auto scope_else = var_types;
+        std::vector<std::string> else_body;
+        while (current().type != TT::END && current().type != TT::TEOF) {
+          Token tok2 = current();
+          std::string s = parse_statement();
+          if (!s.empty()) else_body.push_back(line_directive(tok2) + "    " + s);
+        }
+        var_types = scope_else;
+        else_part = " else {\n" + join(else_body, "\n") + "\n}";
+      }
+      expect(TT::END, false);
+
+      return "if ((" + opt_expr + ").has_value) {\n" +
+             join(body, "\n") + "\n}" + else_part;
+    }
+
     if (t.type == TT::IF) {
       advance();
       std::string cond = parse_expr();
@@ -6211,7 +9369,7 @@ private:
           advance();
           std::string idx = parse_expr();
           expect(TT::RSBRACKET, false);
-          name = name + "[(int)(" + idx + ")]";
+          name = name + "[(size_t)(" + idx + ")]";
         } else if (current().type == TT::DOT) {
           advance();
           name = name + "." + expect(TT::IDENTIFIER, false).value;
@@ -6232,14 +9390,21 @@ private:
       if (current().type == TT::COLON &&
           pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
         std::string ns_path = raw_id;
+        std::string ns_path_colons = raw_id;
         advance(); advance(); // consume ::
         std::string sym = expect(TT::IDENTIFIER, false).value;
         // Chain: keep consuming ::IDENTIFIER while the current sym is a sub-namespace
         while (current().type == TT::COLON &&
                pos + 1 < tokens.size() && tokens[pos + 1].type == TT::COLON) {
           ns_path = ns_path + "__" + sym;
+          ns_path_colons = ns_path_colons + "::" + sym;
           advance(); advance();
           sym = expect(TT::IDENTIFIER, false).value;
+        }
+        // ── Module function auto-load ─────────────────────────────────────
+        if (current().type == TT::LPAREN) {
+          std::string full_use_path = ns_path_colons + "::" + sym;
+          maybe_load_module_call(full_use_path, t);
         }
         std::string resolved = resolve_qualified(ns_path, sym);
         if (resolved.empty()) resolved = ns_path + "__" + sym;
@@ -6300,9 +9465,98 @@ private:
              current().type == TT::ARROW) {
         if (current().type == TT::LSBRACKET) {
           advance();
+          size_t _lhs_idx_pos = pos;
           std::string idx = parse_expr();
           expect(TT::RSBRACKET, false);
-          name = name + "[(int)(" + idx + ")]";
+          // ── $bounds: assert suppression ─────────────────────────────────
+          bool _lhs_bounds_asserted = false;
+          if (_lhs_idx_pos >= 3) {
+            for (size_t _bk = _lhs_idx_pos - 1; _bk > 0 && _bk + 4 >= _lhs_idx_pos; _bk--) {
+              if (tokens[_bk].type == TT::BOUNDS_ASSERT) { _lhs_bounds_asserted = true; break; }
+              if (tokens[_bk].type == TT::SEMICOLON || tokens[_bk].type == TT::LBRACE) break;
+            }
+          }
+          if (_lhs_bounds_asserted) {
+            name = name + "[(size_t)(" + idx + ")]";
+          } else {
+            // ── Alias-aware element-count lookup ────────────────────────────
+            const std::string *_lhs_elems_ptr = resolve_ptr_elems(name);
+            if (_memory_safe && !_in_unsafe_block && _lhs_elems_ptr != nullptr) {
+              const std::string &n_elems = *_lhs_elems_ptr;
+              // ── Look-back: try to resolve index statically ──────────────
+              size_t _lhs_body_start = 0;
+              { int _depth = 0;
+                for (size_t _bk = (_lhs_idx_pos > 0 ? _lhs_idx_pos - 1 : 0); _bk > 0; _bk--) {
+                  if (tokens[_bk].type == TT::RBRACE) _depth++;
+                  else if (tokens[_bk].type == TT::LBRACE) {
+                    if (_depth == 0) { _lhs_body_start = _bk + 1; break; }
+                    _depth--;
+                  }
+                }
+              }
+              bool _lhs_static_resolved = false;
+              if (_lhs_idx_pos < tokens.size() && tokens[_lhs_idx_pos].type == TT::IDENTIFIER) {
+                std::string _idx_var = tokens[_lhs_idx_pos].value;
+                auto [_known, _val] = resolve_index_statically(_idx_var, _lhs_idx_pos, _lhs_body_start);
+                if (_known) {
+                  _lhs_static_resolved = true;
+                  long long _n = -1;
+                  try { _n = std::stoll(n_elems); } catch (...) {}
+                  if (_val < 0) {
+                    transpile_errors.push_back(
+                      XenonError("OOBAccess",
+                        "index '" + _idx_var + "' (=" + std::to_string(_val) +
+                        ") on pointer '" + name + "' is negative — undefined behaviour",
+                        tokens[_lhs_idx_pos].line, tokens[_lhs_idx_pos].col).what());
+                  } else if (_n >= 0 && _val >= _n) {
+                    transpile_errors.push_back(
+                      XenonError("OOBAccess",
+                        "index '" + _idx_var + "' (=" + std::to_string(_val) +
+                        ") on pointer '" + name + "' is out of bounds (size=" +
+                        std::to_string(_n) + ")",
+                        tokens[_lhs_idx_pos].line, tokens[_lhs_idx_pos].col).what());
+                  }
+                  name = name + "[(size_t)(" + idx + ")]";
+                }
+              }
+              if (!_lhs_static_resolved) {
+                emit_warning("BoundsCheck",
+                  "cannot statically verify index '" + idx + "' on pointer '" + name +
+                  "' — runtime bounds check inserted (suppress with '$bounds: assert' on the previous line)",
+                  current().line, current().col);
+                if (!has_header("_XEN_IDX")) {
+                  if (tcc_mode) {
+                    headers.push_back(
+                      "/* ── Xenon runtime pointer safety (null + bounds) [TCC/C99] ── */\n"
+                      "#include <stdlib.h>\n"
+                      "#include <stdio.h>\n"
+                      "#define _XEN_IDX(p,i,n) \\\n"
+                      "  (((p)==NULL ? \\\n"
+                      "     (fprintf(stderr,\"[Xenon] null pointer dereference\\n\"),abort(),0) : 0), \\\n"
+                      "   ((long long)(i)<0||(long long)(i)>=(long long)(n) ? \\\n"
+                      "     (fprintf(stderr,\"[Xenon] index %lld out of bounds (size=%lld)\\n\",(long long)(i),(long long)(n)),abort(),0) : 0), \\\n"
+                      "   (p)[(size_t)(i)])\n"
+                    );
+                  } else {
+                    headers.push_back(
+                      "/* ── Xenon runtime pointer safety (null + bounds) ── */\n"
+                      "#include <stdlib.h>\n"
+                      "#include <stdio.h>\n"
+                      "#define _XEN_IDX(p,i,n) \\\n"
+                      "  ((__builtin_expect((p)==NULL,0) ? \\\n"
+                      "     (fprintf(stderr,\"[Xenon] null pointer dereference\\n\"),abort(),0) : 0), \\\n"
+                      "   (__builtin_expect((long long)(i)<0||(long long)(i)>=(long long)(n),0) ? \\\n"
+                      "     (fprintf(stderr,\"[Xenon] index %lld out of bounds (size=%lld)\\n\",(long long)(i),(long long)(n)),abort(),0) : 0), \\\n"
+                      "   (p)[(size_t)(i)])\n"
+                    );
+                  }
+                }
+                name = "_XEN_IDX(" + name + ", " + idx + ", " + n_elems + ")";
+              }
+            } else {
+              name = name + "[(size_t)(" + idx + ")]";
+            }
+          }
         } else if (current().type == TT::DOT) {
           advance();
           std::string field = expect(TT::IDENTIFIER, false).value;
@@ -6365,12 +9619,13 @@ private:
         // Check for = operator overload
         if (_op_overloads.count("=")) {
           Token assign_tok = current();
+          size_t lhs_pos = pos - 1; // position of the lhs identifier (already consumed above)
           size_t rhs_pos = pos + 1; // one past the '=' token
           advance();
           std::string rhs = parse_expr();
-          const OverloadEntry *ov = resolve_overload("=", pos, rhs_pos);
+          const OverloadEntry *ov = resolve_overload("=", lhs_pos, rhs_pos);
           if (ov)
-            return name + " = " + ov->func_name + "(" + name + ", " + rhs + ");";
+            return ov->func_name + "(&" + name + ", " + rhs + ");";          return name + " = " + rhs + ";";
         }
         advance();
         std::string rhs = parse_expr();
@@ -6383,16 +9638,33 @@ private:
       };
       if (compound.count(current().type)) {
         TT compound_tt = current().type;
+        size_t lhs_pos = pos - 1;
         advance();
+        size_t rhs_pos = pos;
         std::string cop = compound.at(compound_tt);
-        return name + " " + cop + " " + parse_expr() + ";";
+        std::string rhs = parse_expr();
+        if (_op_overloads.count(cop)) {
+          const OverloadEntry *ov = resolve_overload(cop, lhs_pos, rhs_pos);
+          if (ov) return name + " = " + ov->func_name + "(" + name + ", " + rhs + ");";
+        }
+        return name + " " + cop + " " + rhs + ";";
       }
       if (current().type == TT::INCR) {
+        size_t operand_pos = pos - 1;
         advance();
+        if (_op_overloads.count("++post")) {
+          const OverloadEntry *ov = resolve_overload("++post", operand_pos, operand_pos);
+          if (ov && !ov->is_binary) return ov->func_name + "(" + name + ");";
+        }
         return name + "++;";
       }
       if (current().type == TT::DECR) {
+        size_t operand_pos = pos - 1;
         advance();
+        if (_op_overloads.count("--post")) {
+          const OverloadEntry *ov = resolve_overload("--post", operand_pos, operand_pos);
+          if (ov && !ov->is_binary) return ov->func_name + "(" + name + ");";
+        }
         return name + "--;";
       }
       if (current().type == TT::LPAREN) {
@@ -6405,6 +9677,8 @@ private:
             name = it->second; // use mangled name
           }
         }
+        // ── Single-segment module call: use something → something() ───────
+        maybe_load_module_call(raw_id, t);
         advance();
         return emit_call(name, call_tok) + ";";
       }
@@ -6447,6 +9721,9 @@ private:
       expect(TT::RPAREN, false);
       auto it = var_types.find(name);
       std::string vt = (it != var_types.end()) ? it->second : "";
+      // Mark this variable as having a runtime-determined value so the
+      // look-back index resolver knows any conditional on it is non-static.
+      _runtime_vars.insert(name);
       return emit_scanf(name, vt, t);
     }
 
@@ -6726,7 +10003,7 @@ private:
         TT::INT,     TT::FLOAT,   TT::STR,    TT::LONG,  TT::SHORT,
         TT::DOUBLE,  TT::VOID,    TT::M256,   TT::M256I, TT::IDENTIFIER,
         TT::BOOL_KW, TT::CHAR_KW, TT::PTR,    TT::U8,    TT::U32,
-        TT::U64,     TT::LET_KW,  TT::VAR_KW,
+        TT::U64,     TT::LET_KW,  TT::VAR_KW, TT::OPTION_KW,
     };
     Token &rt = current();
     if (!valid_ret.count(rt.type))
@@ -6734,8 +10011,104 @@ private:
                          "Expected a return type after 'function', got '" +
                              rt.value + "'"
                              " — valid types include: int, float, str, bool, void, char,"
-                             " long, double, short, u8, u32, u64, or a struct name",
+                             " long, double, short, u8, u32, u64, Option<T>, or a struct name",
                          rt.line, rt.col);
+
+    // ── Option<T> return type ─────────────────────────────────────────────
+    if (rt.type == TT::OPTION_KW) {
+      advance(); // consume 'Option'
+      expect(TT::LT, false);
+      std::string inner_raw;
+      bool inner_is_ptr = false;
+      if (current().type == TT::PTR) { advance(); inner_is_ptr = true; }
+      inner_raw = advance().value;
+      expect(TT::GT, false);
+      std::string c_inner = raw_to_c(inner_raw);
+      if (inner_is_ptr) c_inner += "*";
+      std::string mangled = ensure_option_struct(c_inner);
+      // Now parse the function name and body using the mangled return type.
+      // We re-enter parse_function_body's flow below by constructing ret_type manually.
+      // Rather than duplicating the whole function, we replace rt and raw_ret inline.
+      bool infer_ret = false;
+      std::string ret_type = inl ? "static inline " + mangled : mangled;
+      std::string raw_ret = mangled; // used for func_return_types registration
+
+      // Register the current function name in func_return_types BEFORE parsing
+      // the body so recursive calls see the correct return type.
+      // We peek at the function name token to do early registration.
+      std::string fname_peek_raw;
+      {
+        size_t p2 = pos;
+        // skip optional generic <T> on function name
+        fname_peek_raw = (p2 < tokens.size()) ? tokens[p2].value : "";
+      }
+      if (!fname_peek_raw.empty()) {
+        std::string fname_peek = mangle_with_ns(fname_peek_raw);
+        func_return_types[fname_peek] = mangled;
+        func_return_types[fname_peek_raw] = mangled;
+      }
+
+      // Fall through into the rest of parse_function_body using the mangled type.
+      // We handle this by running the rest of the function inline here and returning.
+      std::string fname_raw2 = expect(TT::IDENTIFIER, false).value;
+      std::string func_type_param2;
+      if (current().type == TT::LT) {
+        advance();
+        func_type_param2 = advance().value;
+        expect(TT::GT, false);
+      }
+      std::string fname2 = mangle_with_ns(fname_raw2);
+      func_return_types[fname2]     = mangled;
+      func_return_types[fname_raw2] = mangled;
+
+      // ── Struct method check ──────────────────────────────────────────────
+      if (!_cur_struct.empty()) {
+        std::string method_name = _cur_struct + "__" + fname_raw2;
+        struct_methods[_cur_struct].insert(fname_raw2);
+        func_return_types[method_name] = mangled;
+        fname2 = method_name;
+      }
+
+      // Parameters
+      expect(TT::LPAREN, false);
+      std::vector<std::string> params_v;
+      auto prev_vt2 = var_types;
+      if (!_cur_struct.empty()) {
+        var_types["self"] = _cur_struct;
+        params_v.push_back(_cur_struct + "* self");
+      }
+      while (current().type != TT::RPAREN && current().type != TT::TEOF) {
+        // Re-use the lightweight param parser inline
+        std::string pt_raw = advance().value;
+        std::string pt;
+        if (pt_raw == "ptr") { pt = raw_to_c(advance().value) + "*"; }
+        else if (pt_raw == "str") pt = "char*";
+        else pt = raw_to_c(pt_raw);
+        std::string pname = safe_name(expect(TT::IDENTIFIER, false).value);
+        var_types[pname] = pt_raw;
+        params_v.push_back(pt + " " + pname);
+        if (current().type == TT::COMMA) advance();
+      }
+      expect(TT::RPAREN, false);
+      expect(TT::LBRACE, false);
+
+      // Body
+      std::vector<std::string> body_stmts;
+      while (current().type != TT::RBRACE && current().type != TT::TEOF) {
+        Token btok = current();
+        std::string s = parse_statement();
+        if (!s.empty()) body_stmts.push_back(line_directive(btok) + "    " + s);
+      }
+      if (current().type == TT::TEOF)
+        throw XenonError("SyntaxError",
+          "Unterminated function '" + fname_raw2 + "' — missing closing '}'",
+          fn_tok.line, fn_tok.col);
+      expect(TT::RBRACE, false);
+      var_types = prev_vt2;
+
+      std::string sig = ret_type + " " + fname2 + "(" + join(params_v, ", ") + ")";
+      return sig + " {\n" + join(body_stmts, "\n") + "\n}\n";
+    }
     std::string raw_ret = advance().value;
     bool infer_ret = (raw_ret == "let" || raw_ret == "var");
     std::string ret_type;
@@ -6854,6 +10227,7 @@ private:
       std::string name;
       bool infer;
       bool is_array;
+      int array_size{-1}; // declared size if is_array, -1 otherwise
     };
     std::vector<ParamInfo> param_infos;
 
@@ -6943,6 +10317,10 @@ private:
       pi.is_array = false;
       if (current().type == TT::LSBRACKET) {
         advance();
+        // Capture the declared size (if it's a literal number)
+        if (current().type == TT::NUMBER) {
+          try { pi.array_size = std::stoi(current().value); } catch (...) {}
+        }
         while (current().type != TT::RSBRACKET && current().type != TT::TEOF)
           advance();
         if (current().type == TT::RSBRACKET)
@@ -6971,6 +10349,42 @@ private:
         advance();
     }
     expect(TT::RPAREN, false);
+
+    // ── Forward declaration: no '{' after the parameter list ─────────────
+    // Syntax:  function float fabsf(float val)
+    // No body means this is a forward/extern declaration.  Emit a C
+    // prototype and return immediately — no body to parse.
+    if (current().type != TT::LBRACE) {
+      // Build the params string
+      std::vector<std::string> fwd_params;
+      if (is_struct_method)
+        fwd_params.push_back(_cur_struct + "* self");
+      for (const auto &pi : param_infos)
+        fwd_params.push_back((pi.infer ? std::string("int") : pi.c_type) + " " + pi.name);
+      func_param_types[fname] = [&]{
+        std::vector<std::string> pt;
+        if (is_struct_method) pt.push_back(_cur_struct + "*");
+        for (const auto &pi : param_infos) pt.push_back(pi.infer ? std::string("int") : pi.c_type);
+        return pt;
+      }();
+      func_param_array_sizes[fname] = [&]{
+        std::vector<int> sz;
+        if (is_struct_method) sz.push_back(-1);
+        for (const auto &pi : param_infos) sz.push_back(pi.array_size);
+        return sz;
+      }();
+      var_types = saved_var_types;
+      _cur_func = saved_cur_func;
+      _cur_func_ret = saved_cur_func_ret;
+      // Consume optional semicolon after forward decl
+      if (current().type == TT::SEMICOLON) advance();
+      // Emit as a C extern function prototype
+      std::string fwd_ret = infer_ret ? std::string("int") : ret_type;
+      // Strip "static inline " prefix — forward decls can't be static inline
+      if (fwd_ret.substr(0, 14) == "static inline ")
+        fwd_ret = fwd_ret.substr(14);
+      return fwd_ret + " " + fname + "(" + join(fwd_params, ", ") + ");\n";
+    }
 
     // -----------------------------------------------------------------------
     // Check if this is a template function (has any let/var params)
@@ -7142,15 +10556,13 @@ private:
       auto violations = scan_body_for_unsafe_ops(
           body_tok_start, body_tok_end_for_check, local_vt, known_sizes);
 
-      bool func_is_unsafe = _unsafe_functions.count(fname) > 0;
-
       if (!violations.empty()) {
         // ── Partition violations: hard errors vs warnings ─────────────────
         // Hard: undefined behaviour or correctness bugs that must be fixed.
         // Soft: style/safety hints that compile fine but deserve attention.
         static const std::set<std::string> warn_kinds = {
           "ShadowedVariable", "SignedUnsignedMismatch",
-          "ImplicitNarrowing", "UnusedReturnValue",
+          "ImplicitNarrowing", "UnusedReturnValue", "FormatInjection",
         };
 
         // Rephrase each violation message to be crisp (≤ one line).
@@ -7200,6 +10612,9 @@ private:
           // NullDeref
           if (v.kind == "NullDeref")
             return v.message;
+          // DanglingDeref
+          if (v.kind == "DanglingDeref")
+            return v.message;
           // ConstViolation
           if (v.kind == "ConstViolation") {
             size_t a = v.message.find("'"), b = v.message.find("'",a+1);
@@ -7238,6 +10653,13 @@ private:
                              ? v.message.substr(a+1,b-a-1) : "str";
             return "mutating str '" + nm + "' via index — wrap in unsafe { }";
           }
+          // FormatInjection
+          if (v.kind == "FormatInjection") {
+            size_t a = v.message.find("'"), b = v.message.find("'", a+1);
+            std::string nm = (a!=std::string::npos && b!=std::string::npos)
+                             ? v.message.substr(a+1,b-a-1) : "var";
+            return "format-string injection via '" + nm + "' — use a literal format string";
+          }
           return v.message;
         };
 
@@ -7247,21 +10669,71 @@ private:
             emit_warning(v.kind, crisp(v), v.line, v.col);
         }
 
-        // Collect hard errors
+        // Collect hard errors — unsafe function status does NOT suppress these;
+        // only code inside an explicit unsafe { } block is exempt (handled by
+        // unsafe_depth tracking inside scan_body_for_unsafe_ops).
         std::vector<UnsafeViolation> hard;
         for (const auto &v : violations)
-          if (!warn_kinds.count(v.kind) && !func_is_unsafe)
+          if (!warn_kinds.count(v.kind))
             hard.push_back(v);
 
         if (!hard.empty()) {
+          // Helper: return a human-readable safe fix for each violation kind.
+          // Shown before the unsafe {} fallback.
+          auto safe_fix = [](const UnsafeViolation &v) -> std::string {
+            if (v.kind == "OOBAccess")
+              return "add a bounds check before the index (e.g. \'if (i < len) { ... }\')";
+            if (v.kind == "NullDeref")
+              return "check the pointer is non-null before use (e.g. \'if (p != null) { ... }\')";
+            if (v.kind == "UseAfterFree")
+              return "stop using the pointer after free() — set it to null immediately after freeing";
+            if (v.kind == "DoubleFree")
+              return "free the pointer only once — set it to null after freeing";
+            if (v.kind == "MemoryLeak")
+              return "call free() on the pointer before it goes out of scope";
+            if (v.kind == "DanglingDeref")
+              return "ensure the pointed-to value outlives this pointer, or copy the value";
+            if (v.kind == "StrMutation")
+              return "use a char[] array instead of str if you need mutable character access";
+            if (v.kind == "Uninitialised")
+              return "initialise the variable before use (e.g. \'int x = 0;\')";
+            if (v.kind == "DivisionByZero")
+              return "guard with \'if (divisor != 0)\' before dividing";
+            if (v.kind == "FreeOfBorrowed")
+              return "only free memory you own — remove the free() or transfer ownership explicitly";
+            return "fix the underlying issue described above";
+          };
+
           std::ostringstream msg;
           msg << "'" << fname << "' has " << hard.size()
               << " unsafe operation" << (hard.size() > 1 ? "s" : "")
-              << " — declare as 'unsafe function' or wrap each in 'unsafe { }'";
+              << " (declaring the function \'unsafe\' only permits unsafe blocks;"
+              << " the body itself is still checked)";
           for (const auto &v : hard) {
+            std::string lnum_str = (v.line > 0) ? std::to_string(v.line) : "?";
             msg << "\n    [" << v.kind << "]";
             if (v.line > 0) msg << " line " << v.line << ":" << v.col;
             msg << " — " << crisp(v);
+            // Source snippet with line number in gutter
+            if (v.line > 0 && !g_current_source.empty()) {
+              std::string snip = extract_line_from_source(g_current_source, v.line);
+              if (!snip.empty()) {
+                size_t lp = snip.find_first_not_of(" \t");
+                std::string trimmed = (lp == std::string::npos) ? snip : snip.substr(lp);
+                msg << "\n      " << lnum_str << " | " << trimmed;
+                if (v.col > 0 && lp != std::string::npos) {
+                  int adjusted_col = v.col - (int)lp;
+                  std::string gutter_pad(lnum_str.size(), ' ');
+                  if (adjusted_col >= 1)
+                    msg << "\n        " << gutter_pad << "| "
+                        << std::string(adjusted_col - 1, ' ') << "^";
+                }
+              }
+            }
+            // Recommend the safe fix first
+            msg << "\n      fix: " << safe_fix(v);
+            // Then suggest unsafe {} as a last resort (indented → rendered grey)
+            msg << "\n      or:  wrap in \'unsafe { }\' to suppress if you have verified this manually";
           }
           var_types = saved_var_types;
           _cur_func = saved_cur_func;
@@ -7270,6 +10742,64 @@ private:
         }
       }
     }
+
+    // -----------------------------------------------------------------------
+    // Borrow checker pass (simple move semantics for ptr variables)
+    // Runs for ALL functions — unsafe function status only grants permission
+    // to use unsafe { } blocks; code outside those blocks is still checked.
+    // The scanner itself suppresses violations inside unsafe { } via
+    // unsafe_depth tracking.
+    // -----------------------------------------------------------------------
+    if (_borrow_check && _memory_safe) {
+      {
+        auto local_vt = var_types;
+        size_t safe_body_end = std::min(body_tok_end_for_check, tokens.size());
+        auto borrow_violations = scan_body_for_borrow_errors(
+            body_tok_start, safe_body_end, local_vt);
+        if (!borrow_violations.empty()) {
+          std::ostringstream msg;
+          msg << "'" << fname << "' has " << borrow_violations.size()
+              << " borrow error" << (borrow_violations.size() > 1 ? "s" : "")
+              << " — see fixes below (pass -no-check:borrow to disable globally)";
+          for (const auto &v : borrow_violations) {
+            std::string lnum_str = (v.line > 0) ? std::to_string(v.line) : "?";
+            msg << "\n    [" << v.kind << "]";
+            if (v.line > 0) msg << " line " << v.line << ":" << v.col;
+            msg << " — " << v.message;
+            // Source snippet with line number in gutter
+            if (v.line > 0 && !g_current_source.empty()) {
+              std::string snip = extract_line_from_source(g_current_source, v.line);
+              if (!snip.empty()) {
+                size_t lp = snip.find_first_not_of(" \t");
+                std::string trimmed = (lp == std::string::npos) ? snip : snip.substr(lp);
+                msg << "\n      " << lnum_str << " | " << trimmed;
+                if (v.col > 0 && lp != std::string::npos) {
+                  int adjusted_col = v.col - (int)lp;
+                  std::string gutter_pad(lnum_str.size(), ' ');
+                  if (adjusted_col >= 1)
+                    msg << "\n        " << gutter_pad << "| "
+                        << std::string(adjusted_col - 1, ' ') << "^";
+                }
+              }
+            }
+            // Safe fix first
+            if (v.kind == "BorrowError")
+              msg << "\n      fix: re-initialise the variable or avoid using it after it has been moved";
+            else if (v.kind == "FreeOfBorrowed")
+              msg << "\n      fix: only free memory you own — remove the free() or transfer ownership explicitly";
+            else
+              msg << "\n      fix: correct the ownership issue described above";
+            // Unsafe as last resort (indented => rendered grey)
+            msg << "\n      or:  wrap in 'unsafe { }' to suppress if you have verified this manually";
+          }
+          var_types = saved_var_types;
+          _cur_func = saved_cur_func;
+          _cur_func_ret = saved_cur_func_ret;
+          throw XenonError("BorrowError", msg.str(), fn_tok.line, fn_tok.col);
+        }
+      }
+    }
+
     // Record for the return-statement validator
     _cur_func_ret = ret_type;
 
@@ -7290,6 +10820,13 @@ private:
         ptypes.push_back(pi.c_type);
       }
       func_param_types[fname] = ptypes;
+      // Also record per-param declared array sizes for brace-init checking
+      {
+        std::vector<int> asz;
+        if (is_struct_method) asz.push_back(-1);
+        for (const auto &pi : param_infos) asz.push_back(pi.array_size);
+        func_param_array_sizes[fname] = asz;
+      }
     }
 
     // -----------------------------------------------------------------------
@@ -7315,6 +10852,54 @@ private:
     var_types = saved_var_types;
     _cur_func = saved_cur_func;
     _cur_func_ret = saved_cur_func_ret;
+
+    // -----------------------------------------------------------------------
+    // Missing-return check: non-void functions MUST have at least one return
+    // statement at the top-level body scope. This is enforced regardless of
+    // whether the function is declared unsafe — unsafe only affects memory
+    // safety rules, not control-flow completeness.
+    // -----------------------------------------------------------------------
+    {
+      // Compute the base C type to determine void-ness (strip static inline)
+      std::string bare_ret = ret_type;
+      if (bare_ret.substr(0, 14) == "static inline ")
+        bare_ret = bare_ret.substr(14);
+      // Only enforce for non-void, non-inferred returns
+      bool needs_return = (!bare_ret.empty() &&
+                           bare_ret != "void" &&
+                           bare_ret != "__infer__" &&
+                           !infer_ret);
+      if (needs_return) {
+        // Scan body tokens for a return at brace-depth 0
+        bool has_top_level_return = false;
+        int scan_depth = 0;
+        for (size_t si = body_tok_start; si < body_tok_end_for_check && si < tokens.size(); si++) {
+          const Token &st = tokens[si];
+          if (st.type == TT::LBRACE) { scan_depth++; continue; }
+          if (st.type == TT::RBRACE) { scan_depth--; continue; }
+          if (st.type == TT::RETURN && scan_depth == 0) {
+            // Make sure this is a value-returning return (next token is not ; or })
+            if (si + 1 < body_tok_end_for_check) {
+              TT nt = tokens[si+1].type;
+              if (nt != TT::SEMICOLON && nt != TT::RBRACE && nt != TT::TEOF)
+                has_top_level_return = true;
+            }
+          }
+        }
+        if (!has_top_level_return) {
+          // Derive the snippet for the function header line
+          std::string fn_snip;
+          if (!g_current_source.empty())
+            fn_snip = extract_line_from_source(g_current_source, fn_tok.line);
+          throw XenonError("MissingReturn",
+            "function '" + fname + "' has return type '" + bare_ret +
+            "' but does not return a value on all paths — "
+            "non-void functions must always return a value (even if unsafe)",
+            fn_tok.line, fn_tok.col,
+            fn_snip);
+        }
+      }
+    }
 
     // -----------------------------------------------------------------------
     // User-input taint analysis + runtime check injection.
@@ -7519,22 +11104,39 @@ private:
   void scan_h_full(const std::string &path) {
     if (path.empty() || !fs::exists(path)) return;
 
-    // ── 1. Preprocess with gcc -E ─────────────────────────────────────────
-    // Build include flags so the header can find its own transitive deps.
-    std::string inc_flags;
-    for (const auto &ip : _include_paths)
-      inc_flags += " -I\"" + ip + "\"";
-    for (const auto &sp : system_include_paths())
-      inc_flags += " -isystem \"" + sp + "\"";
-
-    std::string cmd = "gcc -E -dD -P" + inc_flags + " \"" + path + "\" 2>/dev/null";
-    FILE *pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return;
-    std::string src;
-    char buf[8192];
-    while (fgets(buf, sizeof(buf), pipe)) src += buf;
-    pclose(pipe);
+    // ── 1. Read the .h file directly ─────────────────────────────────────
+    std::ifstream hf(path);
+    if (!hf) return;
+    std::string src((std::istreambuf_iterator<char>(hf)),
+                     std::istreambuf_iterator<char>());
     if (src.empty()) return;
+
+    // Strip preprocessor directives (#include, #define simple macros, #ifdef etc.)
+    // but keep typedef/struct/function declarations.
+    // We do a lightweight strip: remove #include lines, and skip #if/#ifdef
+    // blocks by tracking nesting depth.
+    {
+      std::string filtered;
+      filtered.reserve(src.size());
+      std::istringstream ss2(src);
+      std::string ln;
+
+      while (std::getline(ss2, ln)) {
+        // Handle line-continuations for #define — skip multi-line macros
+        std::string tln = ln;
+        { size_t f = tln.find_first_not_of(" \t"); if (f != std::string::npos) tln = tln.substr(f); }
+        if (!tln.empty() && tln[0] == '#') {
+          while (!ln.empty() && ln.back() == '\\') {
+            if (!std::getline(ss2, ln)) break;
+          }
+          // Silently drop all preprocessor lines; preserve line count.
+          filtered += '\n';
+          continue;
+        }
+        filtered += ln + '\n';
+      }
+      src = std::move(filtered);
+    }
 
     // ── 2. Tokenise preprocessed text into logical lines ──────────────────
     // Collapse multi-line constructs (struct bodies etc.) into single logical
@@ -7544,7 +11146,7 @@ private:
     {
       std::string cur;
       int brace = 0;
-      bool in_str = false, in_char = false, in_lc = false, in_bc = false;
+      bool in_str = false, in_char = false, in_bc = false;
       for (size_t i = 0; i < src.size(); i++) {
         char c = src[i];
         // line comments (from -dD macros)
@@ -7880,6 +11482,8 @@ private:
     lh._handle_declared = _handle_declared;
     lh._memory_safe = _memory_safe;
     lh._unsafe_functions = _unsafe_functions;
+    lh._used_modules = _used_modules;
+    lh._module_funcs_loaded = _module_funcs_loaded;
 
     while (lh.current().type != TT::TEOF) {
       Token &lt = lh.current();
@@ -8052,11 +11656,16 @@ private:
       this->_xen_imported_types.insert(tn);
     for (const auto &en : lh._enum_names)
       this->_enum_names.insert(en);
+    // Merge module state
+    for (const auto &m : lh._used_modules)
+      this->_used_modules.insert(m);
+    for (const auto &m : lh._module_funcs_loaded)
+      this->_module_funcs_loaded.insert(m);
   }
 
 public:
-  explicit CTranspiler(std::vector<Token> toks, bool tcc_mode_ = false, bool memory_safe_ = true)
-      : tcc_mode(tcc_mode_), tokens(std::move(toks)), _memory_safe(memory_safe_) {
+  explicit CTranspiler(std::vector<Token> toks, bool tcc_mode_ = false, bool memory_safe_ = true, bool borrow_check_ = true, bool suppress_warnings_ = false)
+      : tcc_mode(tcc_mode_), tokens(std::move(toks)), _memory_safe(memory_safe_), _borrow_check(borrow_check_), suppress_warnings(suppress_warnings_) {
     // build default headers block
     if (!isSubTranspiler) {
       if (tcc_mode) {
@@ -8073,6 +11682,7 @@ public:
         // TCC runtime: only _lb_throw is needed (for try/except/throw).
         // No _lb_ print helpers, no TO_STR — print/println emit plain printf directly.
         headers.push_back(
+          "/* generated by Xenon compiler v3.1.2 */\n"
             "#ifndef __XENON_RUNTIME__\n"
             "#define __XENON_RUNTIME__\n"
             "static jmp_buf* _lb_exc_active = NULL;\n"
@@ -8088,7 +11698,8 @@ public:
             "#endif /* __XENON_RUNTIME__ */\n");
       } else {
         // Default (clang/gcc): full C11 preamble with _Generic and AVX
-        headers.push_back("#include <stdio.h>\n"
+        headers.push_back("/* generated by Xenon compiler v3.1.2 */\n"
+                          "#include <stdio.h>\n"
                           "#include <stdbool.h>\n"
                           "#include <stdlib.h>\n"
                           "#include <math.h>\n"
@@ -8156,12 +11767,77 @@ public:
             "#endif /* __XENON_RUNTIME__ */\n");
       }
     }
+    // ── Seed well-known C stdlib/math function return types ──────────────────
+    // Many standard functions are declared via macro magic in system headers
+    // (e.g. fabsf via __MATHCALL in math.h) and are invisible to our direct
+    // header parser.  We hardcode their signatures here — they're part of the
+    // C standard and will never change.
+    // Format: { "name", "return_type" }
+    // emplace() so user forward-decls (or .h scan results) win over these.
+    static const std::pair<const char*, const char*> builtins[] = {
+      // <math.h> — float variants
+      {"fabsf","float"},{"sqrtf","float"},{"cbrtf","float"},
+      {"sinf","float"},{"cosf","float"},{"tanf","float"},
+      {"asinf","float"},{"acosf","float"},{"atanf","float"},{"atan2f","float"},
+      {"sinhf","float"},{"coshf","float"},{"tanhf","float"},
+      {"expf","float"},{"exp2f","float"},{"logf","float"},{"log2f","float"},{"log10f","float"},
+      {"powf","float"},{"fmodf","float"},{"remainderf","float"},
+      {"ceilf","float"},{"floorf","float"},{"roundf","float"},{"truncf","float"},
+      {"fminf","float"},{"fmaxf","float"},{"fmaf","float"},
+      {"hypotf","float"},{"copysignf","float"},{"ldexpf","float"},
+      {"frexpf","float"},  // actually returns float; exponent via int* param
+      {"modff","float"},
+      // <math.h> — double variants
+      {"fabs","double"},{"sqrt","double"},{"cbrt","double"},
+      {"sin","double"},{"cos","double"},{"tan","double"},
+      {"asin","double"},{"acos","double"},{"atan","double"},{"atan2","double"},
+      {"sinh","double"},{"cosh","double"},{"tanh","double"},
+      {"exp","double"},{"exp2","double"},{"log","double"},{"log2","double"},{"log10","double"},
+      {"pow","double"},{"fmod","double"},{"remainder","double"},
+      {"ceil","double"},{"floor","double"},{"round","double"},{"trunc","double"},
+      {"fmin","double"},{"fmax","double"},{"fma","double"},
+      {"hypot","double"},{"copysign","double"},{"ldexp","double"},
+      // <math.h> — int-returning
+      {"abs","int"},{"isinf","int"},{"isnan","int"},{"isfinite","int"},
+      {"fpclassify","int"},
+      // <stdlib.h>
+      {"malloc","void*"},{"calloc","void*"},{"realloc","void*"},
+      {"atoi","int"},{"atol","long"},{"atof","double"},
+      {"strtol","long"},{"strtoul","unsigned long"},{"strtod","double"},
+      {"rand","int"},{"system","int"},{"abs","int"},
+      {"getenv","char*"},
+      // <string.h>
+      {"strlen","int"},{"strcmp","int"},{"strncmp","int"},
+      {"strchr","char*"},{"strrchr","char*"},{"strstr","char*"},
+      {"strcpy","char*"},{"strncpy","char*"},{"strcat","char*"},{"strncat","char*"},
+      {"memcpy","void*"},{"memmove","void*"},{"memset","void*"},{"memcmp","int"},
+      {"strdup","char*"},{"strndup","char*"},{"strtok","char*"},
+      // <stdio.h>
+      {"printf","int"},{"fprintf","int"},{"sprintf","int"},{"snprintf","int"},
+      {"scanf","int"},{"fscanf","int"},{"sscanf","int"},
+      {"fopen","void*"},{"fclose","int"},{"fread","int"},{"fwrite","int"},
+      {"fgets","char*"},{"fputs","int"},{"fputc","int"},{"fgetc","int"},
+      {"feof","int"},{"ferror","int"},{"fflush","int"},{"ftell","long"},
+      {"fseek","int"},{"rewind","void"},{"remove","int"},{"rename","int"},
+      {"puts","int"},{"putchar","int"},{"getchar","int"},{"getc","int"},
+      // <time.h>
+      {"time","long"},{"clock","long"},{"difftime","double"},
+      // <ctype.h>
+      {"isalpha","int"},{"isdigit","int"},{"isalnum","int"},{"isspace","int"},
+      {"isupper","int"},{"islower","int"},{"toupper","int"},{"tolower","int"},
+      // <unistd.h>
+      {"sleep","int"},{"usleep","int"},{"getpid","int"},{"getppid","int"},
+      {"fork","int"},{"exec","int"},{"read","long"},{"write","long"},{"close","int"},
+    };
+    for (auto &[name, ret] : builtins)
+      func_return_types.emplace(name, ret); // emplace: user decls win
   }
 
   std::string transpile(const std::string &source_dir,
                         const std::string &source_file, bool manual_main,
                         const std::vector<std::string> &include_paths = {},
-                        bool emit_line_dirs = true) {
+                        bool emit_line_dirs = true,
+                        bool emit_binary = true) {
     _source_dir = source_dir;
     _source_file = source_file;
     _include_paths = include_paths;
@@ -8196,6 +11872,11 @@ public:
           advance();
           std::string def = parse_alias(tok);
           headers.push_back(def + "\n");
+        } else if (tok.type == TT::USE_KW) {
+          // use module::something — handled by parse_statement
+          tok = current();
+          std::string stmt = parse_statement();
+          (void)stmt; // no C output for use declarations
         } else if (tok.type == TT::UNSAFE_KW) {
           if (pos + 1 < tokens.size() && tokens[pos + 1].type == TT::LBRACE) {
             tok = current();
@@ -8316,6 +11997,31 @@ public:
       }
     }
 
+    // ── -main mode: require user to declare a main function ─────────────────
+    // When -main is active AND we are compiling to a binary (not -c emit-only),
+    // the user must supply an explicit  function int main(...)  definition.
+    // Without it the linker would fail with a cryptic "symbol main not found";
+    // we catch it here and emit a clear compile-time error instead.
+    if (manual_main && emit_binary) {
+      bool found_main = func_return_types.count("main") > 0;
+      if (!found_main) {
+        int err_line = (!tokens.empty()) ? tokens[0].line : 1;
+        int err_col  = (!tokens.empty()) ? tokens[0].col  : 1;
+        std::string first_snip;
+        if (!g_current_source.empty())
+          first_snip = extract_line_from_source(g_current_source, err_line);
+        transpile_errors.push_back(
+          XenonError("EntryPointError",
+            "-main flag is set but no 'main' function was declared.\n"
+            "  In -main mode the program entry point must be written explicitly:\n"
+            "    function int main(int argc, ptr str argv) { ... }\n"
+            "  or a no-arg variant:\n"
+            "    function int main() { ... }\n"
+            "  Without it the linker cannot find the program entry point.",
+            err_line, err_col, first_snip).what());
+      }
+    }
+
     std::string body_str = join(main_body, "\n    ");
 
     std::string res = join(headers, "\n") + "\n";
@@ -8372,6 +12078,8 @@ int main(int argc, char **argv) {
   bool dbuild = false;
   bool emit_line_dirs = true;
   bool no_check = false;
+  bool no_check_borrow = false;
+  bool suppress_warnings = false;
   CCBackend cc_backend = CCBackend::CLANG;
   auto log = [&](const std::string &s) {
     if (!shut)
@@ -8386,7 +12094,20 @@ int main(int argc, char **argv) {
     return code;
   };
 
+  // Step 1: scan for -o <name>
+  std::string explicit_output;
+  int o_value_index = -1;
   for (int i = 1; i < argc; i++) {
+    std::string a = argv[i];
+    if (a == "-o" && i + 1 < argc) {
+      explicit_output = argv[i + 1];
+      o_value_index = i + 1;
+      break;
+    }
+  }
+
+  for (int i = 1; i < argc; i++) {
+    if (i == o_value_index) continue;
     std::string a = argv[i];
     if (a == "--shut" || a == "-s")
       shut = true;
@@ -8400,6 +12121,12 @@ int main(int argc, char **argv) {
       emit_line_dirs = false;
     if (a == "-no-check" || a == "--no-check")
       no_check = true;
+    if (a == "-no-check:borrow" || a == "--no-check:borrow")
+      no_check_borrow = true;
+    if (a == "-suppress:warnings" || a == "--suppress:warnings")
+      suppress_warnings = true;
+    if (a == "-help" || a == "--help" || a == "-h")
+      log("Usage for xenc:\n  basic CLI:\n    xenc file.xen -o file\n  options:\n    -s: do not emit [*] Messages.\n    -asm: Emit assembly.\n    -main: require manual main\n    -sCMD: show the c compiler command.\n    -noLine: do not emit #line directives.\n    -no-check: disable safety and borrow checks.\n      -no-check:borrow: disable only borrow checking.\n    -suppress:warnings: suppress warnings.\n    -cc:[cc/clang/gcc/tcc]: choose the c compiler.\n    -help: show this message.\n    -c: emit raw C. (compile only)"); exit(0);
     // -cc:gcc / -cc:clang / -cc:tcc / -cc:cc
     if (a.size() > 4 && a.substr(0, 4) == "-cc:") {
       std::string choice = a.substr(4);
@@ -8420,10 +12147,10 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (argc < 3) {
+  if (argc < 2) {
     log("xenc version 3.1.2");
-    die("Usage: xenc <in.xen> <out> [extra.c] [-lPATH] [-gLIB] [-wLIBDIR] "
-        "[-c] [-s] [--asm] [--main] [-no-check] [-cc:gcc|clang|tcc|cc]",
+    die("Usage: xenc <in.xen> [-o <out>] [extra.c] [-lPATH] [-gLIB] [-wLIBDIR] "
+        "[-c] [-s] [--asm] [--main] [-no-check] [-no-check:borrow] [-suppress:warnings] [-cc:gcc|clang|tcc|cc]",
         1);
   }
 
@@ -8432,7 +12159,25 @@ int main(int argc, char **argv) {
     std::cout << "xenc compiler version 3.1.2.";
     return 0;
   }
-  std::string out_bin = argv[2];
+
+  std::string base = fs::path(inf).stem().string();
+
+  // Step 2: resolve output binary name
+  std::string out_bin;
+  if (!explicit_output.empty()) {
+    out_bin = explicit_output;
+  } else if (argc >= 3 && o_value_index == -1) {
+    // Backwards compat: if argv[2] looks like an output name, use it
+    std::string candidate = argv[2];
+    bool looks_like_output = !candidate.empty()
+      && candidate[0] != '-'
+      && !ends_with(candidate, ".xen")
+      && !ends_with(candidate, ".c")
+      && !ends_with(candidate, ".o");
+    out_bin = looks_like_output ? candidate : base;
+  } else {
+    out_bin = base;
+  }
 
   if (!fs::exists(inf))
     die("Input file not found: '" + inf + "'", 1);
@@ -8443,14 +12188,14 @@ int main(int argc, char **argv) {
         + ansi::bcyan() + ".xen" + ansi::reset()
         + ansi::yellow() + " extension" + ansi::reset());
 
-  std::string base = fs::path(inf).stem().string();
-
   std::vector<std::string> custom_includes;
   std::vector<std::string> extra_c_files;
   std::vector<std::string> include_paths;
 
   for (int i = 3; i < argc; i++) {
+    if (i == o_value_index) continue;
     std::string arg = argv[i];
+    if (arg == "-o") continue;
     if (arg.size() > 2 && arg.substr(0, 2) == "-l") {
       std::string path = arg.substr(2);
       std::string folder = fs::path(path).parent_path().string();
@@ -8513,9 +12258,9 @@ int main(int argc, char **argv) {
   std::string c_code;
   try {
     bool tcc_mode = (cc_backend == CCBackend::TCC);
-    CTranspiler tr(tokens, tcc_mode, !no_check);
+    CTranspiler tr(tokens, tcc_mode, !no_check, !(no_check || no_check_borrow), suppress_warnings);
     c_code = tr.transpile(source_dir, source_file, manual_main, include_paths,
-                          emit_line_dirs);
+                          emit_line_dirs, !debug);
     if (!tr.transpile_errors.empty()) {
       for (const auto &err : tr.transpile_errors)
         std::cerr << err;

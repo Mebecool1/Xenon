@@ -3,89 +3,97 @@ type String {
     int size
     int capacity
     bool isHeap
-}
-unsafe function void StrAppend(ptr String s, String extra) {
-    int extra_len = extra.size
-    if extra_len == 0 then
-        return
-    end
-
-    int new_size = s.size + extra_len
-
-    if not s.isHeap then
-        // Transition from literal/stack data to heap.
-        // Pick next power-of-two capacity >= new_size + 1.
-        int new_cap = 8
-        while new_cap < new_size + 1 do
-            new_cap = new_cap * 2
+    function void Print() {
+        if data != null then 
+            printfmt("%s\n", data)
         end
-        ptr char new_data = cast(ptr char, malloc(new_cap))
-        memcpy(new_data, s.data, s.size)
-        memcpy(new_data + s.size, extra.data, extra_len)
-        ptr char term = new_data + new_size
-        term[0] = 0
-        s.data     = new_data
-        s.isHeap   = true
-        s.size     = new_size
-        s.capacity = new_cap
-    else
-        // Already on heap — only realloc if outgrown capacity.
-        if new_size + 1 > s.capacity then
-            int new_cap = s.capacity * 2
-            while new_cap < new_size + 1 do
-                new_cap = new_cap * 2
-            end
-            s.data     = realloc(s.data, new_cap)
-            s.capacity = new_cap
-        end
-        memcpy(s.data + s.size, extra.data, extra_len)
-        ptr char term = s.data + new_size
-        term[0] = 0
-        s.size = new_size
-    end
-}
-
-unsafe function bool StrEq(ptr String a, ptr String b) {
-    if a.size != b.size then
-        return false
-    end
-    if a.data == b.data then
-        return true
-    end
-    int result = memcmp(a.data, b.data, a.size)
-    return result == 0
-}
-in namespace std are {
-    in namespace string are {
-        unsafe function String New(ptr char literal) {
-            String s
-            s.data     = cast(ptr char, literal)
-            s.isHeap   = false
-            s.size     = strlen(literal)
-            s.capacity = 0
-            return s
-        }
-
-        unsafe function void Free(ptr String s) {
-            if s.isHeap == true then
-                free(s.data)
-                s.data     = 0
-                s.isHeap   = false
-                s.size     = 0
-                s.capacity = 0
-            end
-        }
-
-        function void Print(ptr String a) {
-            if (a && a.data) then
-                printfmt("%s\n", a.data)
-            end
-        }
-
-        
     }
 }
 
+    unsafe function void StrAppend(ptr String s, String extra) {
+        unsafe {
+        int extra_len = extra.size
+        if extra_len == 0 then
+            return
+        end
+
+        int new_size = s.size + extra_len
+
+        if not s.isHeap then
+            // Transition from literal/stack data to heap.
+            // Pick next power-of-two capacity >= new_size + 1.
+            int new_cap = 8
+            while new_cap < new_size + 1 do
+                new_cap = new_cap * 2
+            end
+            ptr char new_data = cast(ptr char, malloc(new_cap))
+            memcpy(new_data, s.data, s.size)
+            memcpy(new_data + s.size, extra.data, extra_len)
+            ptr char term = new_data + new_size
+            term[0] = 0
+            s.data     = new_data
+            s.isHeap   = true
+            s.size     = new_size
+            s.capacity = new_cap
+        else
+            // Already on heap — only realloc if outgrown capacity.
+            if new_size + 1 > s.capacity then
+                int new_cap = s.capacity * 2
+                while new_cap < new_size + 1 do
+                    new_cap = new_cap * 2
+                end
+                s.data     = realloc(s.data, new_cap)
+                s.capacity = new_cap
+            end
+            memcpy(s.data + s.size, extra.data, extra_len)
+            ptr char term = s.data + new_size
+            term[0] = 0
+            s.size = new_size
+        end
+        }
+    }
+
+    unsafe function bool StrEq(ptr String a, ptr String b) {
+        if a.size != b.size then
+            return false
+        end
+        if a.data == b.data then
+            return true
+        end
+        int result = memcmp(a.data, b.data, a.size)
+        return result == 0
+    }
+    in namespace std are {
+        in namespace string are {
+            unsafe function String New(str literal) {
+                String s
+                s.data     = cast(ptr char, literal)
+                s.isHeap   = false
+                s.size     = strlen(literal)
+                s.capacity = 0
+                return s
+            }
+
+            unsafe function void Free(ptr String s) {
+                if s.isHeap == true then
+                    free(s.data)
+                    s.data     = 0
+                    s.isHeap   = false
+                    s.size     = 0
+                    s.capacity = 0
+                end
+            }
+
+            function void Print(ptr String a) {
+                if (a && a.data) then
+                    printfmt("%s\n", a.data)
+                end
+            }
+
+            
+        }
+    }
+}
 
 
 
