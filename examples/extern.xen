@@ -1,0 +1,12 @@
+link "stdio.h"
+
+function int main() {
+    ptr double p = malloc(10 * sizeof(double));
+    ptr double x = p 
+    ptr double y = x 
+    free(p)
+    if y != null then 
+    y[50] = 100
+    end
+    return 0
+}

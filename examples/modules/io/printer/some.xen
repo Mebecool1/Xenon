@@ -1,0 +1,7 @@
+in namespace io are {
+    in namespace printer are {
+        function void some() {
+            println("some")
+        }
+    }
+}
